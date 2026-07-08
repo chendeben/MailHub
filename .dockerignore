@@ -1,0 +1,13 @@
+.git
+.DS_Store
+node_modules
+npm-debug.log
+data
+postfix-spool
+certs
+tmp
+logs
+*.sqlite
+*.sqlite-*
+.env
+docs/superpowers

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible problem in MailHub.
+title: "fix: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please remove secrets, tokens, private keys, real customer data, and production-only identifiers before submitting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal reproduction.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      placeholder: "24.x"
+  - type: input
+    id: docker
+    attributes:
+      label: Docker version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste only sanitized logs.
+      render: shell

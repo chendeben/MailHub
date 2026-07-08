@@ -1,0 +1,240 @@
+:root {
+  color-scheme: light;
+  --bg: #eef2f6;
+  --panel: #ffffff;
+  --ink: #19212b;
+  --muted: #667286;
+  --line: #d8dee7;
+  --blue: #1d5fd1;
+  --teal: #087f8c;
+  --green: #16834c;
+  --shadow: 0 22px 60px rgba(24, 33, 43, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  align-items: center;
+  background:
+    linear-gradient(135deg, rgba(8, 127, 140, 0.08), rgba(22, 131, 76, 0.05)),
+    var(--bg);
+  color: var(--ink);
+  display: grid;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.45;
+  margin: 0;
+  min-height: 100vh;
+  padding: 22px;
+}
+
+.login-shell {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  display: grid;
+  grid-template-columns: minmax(320px, 0.85fr) minmax(340px, 1fr);
+  margin: 0 auto;
+  max-width: 980px;
+  min-height: 560px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.brand-pane {
+  background: #12352f;
+  color: #fff;
+  display: grid;
+  gap: 26px;
+  grid-template-rows: auto auto 1fr;
+  padding: 42px;
+}
+
+.brand-mark {
+  align-items: center;
+  background: #e9f3ff;
+  border-radius: 8px;
+  color: #173b78;
+  display: flex;
+  font-weight: 800;
+  height: 56px;
+  justify-content: center;
+  letter-spacing: 0;
+  width: 56px;
+}
+
+.brand-copy {
+  display: grid;
+  gap: 8px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 36px;
+  letter-spacing: 0;
+}
+
+h2 {
+  font-size: 26px;
+  letter-spacing: 0;
+}
+
+.brand-copy p,
+.login-heading .eyebrow,
+label,
+.login-message {
+  color: var(--muted);
+}
+
+.brand-copy p {
+  color: #b7c8dc;
+  font-size: 15px;
+}
+
+.signal-grid {
+  align-self: end;
+  display: grid;
+  gap: 12px;
+}
+
+.signal-grid div {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  padding: 14px;
+}
+
+.signal-grid span {
+  color: #a7bbd1;
+  font-size: 12px;
+}
+
+.signal-grid strong {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.login-card {
+  align-content: center;
+  display: grid;
+  gap: 22px;
+  padding: 48px;
+}
+
+.login-heading {
+  display: grid;
+  gap: 7px;
+}
+
+.eyebrow {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.login-form {
+  display: grid;
+  gap: 16px;
+}
+
+.auth-tabs {
+  background: #eef3fb;
+  border: 1px solid #d4deed;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  grid-template-columns: 1fr 1fr;
+  padding: 4px;
+}
+
+.auth-tabs button {
+  background: transparent;
+  color: #38516f;
+  min-height: 38px;
+}
+
+.auth-tabs button.active {
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(24, 33, 43, 0.08);
+  color: var(--ink);
+}
+
+label {
+  display: grid;
+  font-size: 13px;
+  gap: 7px;
+}
+
+input {
+  background: #fff;
+  border: 1px solid #c6cfdb;
+  border-radius: 6px;
+  color: var(--ink);
+  font: inherit;
+  min-height: 44px;
+  padding: 10px 12px;
+  width: 100%;
+}
+
+input:focus {
+  border-color: var(--blue);
+  outline: 3px solid rgba(29, 95, 209, 0.16);
+}
+
+button {
+  background: var(--blue);
+  border: 0;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  min-height: 46px;
+  padding: 0 14px;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.login-message {
+  min-height: 20px;
+  font-size: 13px;
+}
+
+.login-message.error {
+  color: #b3261e;
+}
+
+.hidden {
+  display: none;
+}
+
+@media (max-width: 780px) {
+  body {
+    padding: 14px;
+  }
+
+  .login-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .brand-pane {
+    padding: 28px;
+  }
+
+  .login-card {
+    padding: 30px;
+  }
+}
