@@ -1,0 +1,1054 @@
+import { mkdirSync } from 'node:fs';
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { dkimPublicFromPrivateKey } from './dkim.js';
+
+let db;
+let secretKey = '';
+
+export function initDatabase(dataDir, secret = '') {
+  secretKey = String(secret || process.env.SESSION_SECRET || process.env.API_TOKEN || process.env.ADMIN_PASSWORD || '');
+  mkdirSync(dataDir, { recursive: true });
+  db = new DatabaseSync(path.join(dataDir, 'mailhub.sqlite'));
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  migrateLegacySmtpTable();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS domains (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      dns_credential_id INTEGER,
+      domain TEXT NOT NULL UNIQUE,
+      selector TEXT NOT NULL,
+      verification_token TEXT NOT NULL,
+      dkim_public TEXT NOT NULL,
+      dkim_private TEXT NOT NULL,
+      sender_host TEXT NOT NULL,
+      sending_ip TEXT NOT NULL,
+      spf_extra TEXT NOT NULL DEFAULT '',
+      dmarc_policy TEXT NOT NULL DEFAULT 'none',
+      dmarc_rua TEXT NOT NULL DEFAULT '',
+      status_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS send_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      domain_id INTEGER,
+      sender TEXT NOT NULL,
+      recipients TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      status TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '',
+      queue_id TEXT NOT NULL DEFAULT '',
+      delivery_log_json TEXT NOT NULL DEFAULT '[]',
+      delivery_attempts_json TEXT NOT NULL DEFAULT '[]',
+      delivered_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS smtp_credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL UNIQUE,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      password_secret TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      token_prefix TEXT NOT NULL,
+      last_used_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS dns_credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      zone_name TEXT NOT NULL DEFAULT '',
+      default_ttl INTEGER NOT NULL DEFAULT 600,
+      credentials_secret TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON api_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_dns_credentials_user_id ON dns_credentials(user_id);
+  `);
+  ensureColumn('domains', 'user_id', 'INTEGER');
+  ensureColumn('domains', 'dns_credential_id', 'INTEGER');
+  ensureColumn('send_events', 'user_id', 'INTEGER');
+  ensureColumn('send_events', 'queue_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('send_events', 'delivery_log_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('send_events', 'delivery_attempts_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('send_events', 'delivered_at', 'TEXT');
+  ensureColumn('smtp_credentials', 'password_secret', "TEXT NOT NULL DEFAULT ''");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_domains_user_id ON domains(user_id);
+    CREATE INDEX IF NOT EXISTS idx_events_user_id ON send_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_events_queue_id ON send_events(queue_id);
+  `);
+  normalizeSendEventQueueIds();
+  normalizeDkimPublicKeys();
+  return db;
+}
+
+export function seedAdminUser({ username, password, email }) {
+  const normalizedUsername = normalizeUsername(username || 'admin');
+  const normalizedEmail = normalizeEmail(email || `${normalizedUsername}@mailhub.local`);
+  const existing = getUserByLogin(normalizedUsername) || getUserByLogin(normalizedEmail);
+  if (existing) {
+    requireDb()
+      .prepare('UPDATE users SET role = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run('admin', 'active', now(), existing.id);
+    return getUser(existing.id);
+  }
+  return createUser({
+    username: normalizedUsername,
+    email: normalizedEmail,
+    password,
+    role: 'admin'
+  });
+}
+
+export function claimLegacyData(userId) {
+  requireDb().prepare('UPDATE domains SET user_id = ? WHERE user_id IS NULL').run(userId);
+  requireDb().prepare(`
+    UPDATE send_events
+    SET user_id = COALESCE((SELECT user_id FROM domains WHERE domains.id = send_events.domain_id), ?)
+    WHERE user_id IS NULL
+  `).run(userId);
+  if (!tableExists('smtp_credentials_legacy') || getSmtpCredential(userId)) return;
+  const legacy = requireDb().prepare('SELECT * FROM smtp_credentials_legacy WHERE id = 1').get();
+  if (!legacy?.username || !legacy?.password_hash) return;
+  const createdAt = now();
+  requireDb()
+    .prepare(`
+      INSERT INTO smtp_credentials (user_id, username, password_hash, password_secret, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    .run(userId, legacy.username, legacy.password_hash, legacy.password_secret || '', createdAt, createdAt);
+}
+
+export function seedSmtpCredential(userId, username, password) {
+  if (!userId || !username || !password || getSmtpCredential(userId)) return null;
+  return saveSmtpCredential(userId, { username, password });
+}
+
+export function createUser({ username, email, password, role = 'user' }) {
+  const cleanUsername = normalizeUsername(username);
+  const cleanEmail = normalizeEmail(email);
+  if (!cleanUsername) throw new Error('用户名格式不正确。');
+  if (!cleanEmail) throw new Error('邮箱格式不正确。');
+  if (String(password || '').length < 8) throw new Error('密码至少需要 8 位。');
+  const createdAt = now();
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO users (username, email, password_hash, role, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'active', ?, ?)
+    `)
+    .run(cleanUsername, cleanEmail, hashPassword(password), role === 'admin' ? 'admin' : 'user', createdAt, createdAt);
+  return getUser(result.lastInsertRowid);
+}
+
+export function authenticateUser(login, password) {
+  const user = getUserByLogin(login, { includeHash: true });
+  if (!user || user.status !== 'active' || !verifyPassword(password, user.passwordHash)) return null;
+  return publicUser(user);
+}
+
+export function listUsers() {
+  return requireDb()
+    .prepare('SELECT * FROM users ORDER BY created_at DESC')
+    .all()
+    .map(publicUser);
+}
+
+export function getUser(id, { includeHash = false } = {}) {
+  const row = requireDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+  return includeHash ? privateUser(row) : publicUser(row);
+}
+
+export function getUserByLogin(login, { includeHash = false } = {}) {
+  const value = String(login || '').trim().toLowerCase();
+  if (!value) return null;
+  const row = requireDb()
+    .prepare('SELECT * FROM users WHERE lower(username) = ? OR lower(email) = ?')
+    .get(value, value);
+  return includeHash ? privateUser(row) : publicUser(row);
+}
+
+export function updateUser(id, patch) {
+  const current = getUser(id, { includeHash: true });
+  if (!current) return null;
+  const next = {
+    role: patch.role === 'admin' ? 'admin' : current.role,
+    status: ['active', 'disabled'].includes(patch.status) ? patch.status : current.status,
+    passwordHash: patch.password ? hashPassword(patch.password) : current.passwordHash,
+    updatedAt: now()
+  };
+  requireDb()
+    .prepare('UPDATE users SET role = ?, status = ?, password_hash = ?, updated_at = ? WHERE id = ?')
+    .run(next.role, next.status, next.passwordHash, next.updatedAt, id);
+  return getUser(id);
+}
+
+export function getAdminUser() {
+  const row = requireDb()
+    .prepare("SELECT * FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id LIMIT 1")
+    .get();
+  return publicUser(row);
+}
+
+export function listDomains(userId) {
+  return requireDb()
+    .prepare('SELECT * FROM domains WHERE user_id = ? ORDER BY created_at DESC')
+    .all(userId)
+    .map(publicDomainRow);
+}
+
+export function getDomain(id, { userId, includePrivate = false } = {}) {
+  const row = requireDb()
+    .prepare('SELECT * FROM domains WHERE id = ? AND (? IS NULL OR user_id = ?)')
+    .get(id, userId ?? null, userId ?? null);
+  return includePrivate ? privateDomainRow(row) : publicDomainRow(row);
+}
+
+export function getDomainByName(domain, { userId, includePrivate = false } = {}) {
+  const row = requireDb()
+    .prepare('SELECT * FROM domains WHERE domain = ? AND (? IS NULL OR user_id = ?)')
+    .get(String(domain || '').toLowerCase(), userId ?? null, userId ?? null);
+  return includePrivate ? privateDomainRow(row) : publicDomainRow(row);
+}
+
+export function createDomain(userId, domain) {
+  const createdAt = now();
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO domains (
+        user_id, dns_credential_id, domain, selector, verification_token,
+        dkim_public, dkim_private, sender_host, sending_ip, spf_extra,
+        dmarc_policy, dmarc_rua, status_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+    `)
+    .run(
+      userId,
+      domain.dnsCredentialId || null,
+      domain.domain,
+      domain.selector,
+      domain.verificationToken,
+      domain.dkimPublic,
+      domain.dkimPrivate,
+      domain.senderHost,
+      domain.sendingIp,
+      domain.spfExtra,
+      domain.dmarcPolicy,
+      domain.dmarcRua,
+      createdAt,
+      createdAt
+    );
+  return getDomain(result.lastInsertRowid, { userId });
+}
+
+export function updateDomain(id, userId, patch) {
+  const current = getDomain(id, { userId, includePrivate: true });
+  if (!current) return null;
+  const next = {
+    selector: patch.selector ?? current.selector,
+    dnsCredentialId: patch.dnsCredentialId === undefined ? current.dnsCredentialId : (patch.dnsCredentialId || null),
+    senderHost: patch.senderHost ?? current.senderHost,
+    sendingIp: patch.sendingIp ?? current.sendingIp,
+    spfExtra: patch.spfExtra ?? current.spfExtra,
+    dmarcPolicy: patch.dmarcPolicy ?? current.dmarcPolicy,
+    dmarcRua: patch.dmarcRua ?? current.dmarcRua,
+    updatedAt: now()
+  };
+  requireDb()
+    .prepare(`
+      UPDATE domains
+      SET selector = ?, dns_credential_id = ?, sender_host = ?, sending_ip = ?, spf_extra = ?,
+          dmarc_policy = ?, dmarc_rua = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `)
+    .run(
+      next.selector,
+      next.dnsCredentialId,
+      next.senderHost,
+      next.sendingIp,
+      next.spfExtra,
+      next.dmarcPolicy,
+      next.dmarcRua,
+      next.updatedAt,
+      id,
+      userId
+    );
+  return getDomain(id, { userId });
+}
+
+export function updateDkim(id, userId, keys, selector) {
+  requireDb()
+    .prepare('UPDATE domains SET selector = ?, dkim_public = ?, dkim_private = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+    .run(selector, keys.publicKey, keys.privateKey, now(), id, userId);
+  return getDomain(id, { userId });
+}
+
+export function saveDomainStatus(id, userId, status) {
+  requireDb()
+    .prepare('UPDATE domains SET status_json = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+    .run(JSON.stringify(status), now(), id, userId);
+}
+
+export function deleteDomain(id, userId) {
+  const result = requireDb().prepare('DELETE FROM domains WHERE id = ? AND user_id = ?').run(id, userId);
+  return result.changes > 0;
+}
+
+export function logSendEvent(event) {
+  const queueId = normalizeQueueId(event.queueId || extractQueueIdFromText(event.detail));
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO send_events (
+        user_id, domain_id, sender, recipients, subject, status, detail, queue_id,
+        delivery_log_json, delivery_attempts_json, delivered_at, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      event.userId ?? null,
+      event.domainId ?? null,
+      event.sender,
+      JSON.stringify(event.recipients),
+      event.subject,
+      event.status,
+      event.detail ?? '',
+      queueId,
+      JSON.stringify(Array.isArray(event.deliveryLog) ? event.deliveryLog : []),
+      JSON.stringify(Array.isArray(event.deliveryAttempts) ? event.deliveryAttempts : []),
+      event.deliveredAt ?? null,
+      now()
+    );
+  return result.lastInsertRowid;
+}
+
+export function updateSendEventDelivery(queueId, attempt) {
+  const cleanQueueId = normalizeQueueId(queueId || attempt?.queueId);
+  if (!cleanQueueId) return false;
+  const row = requireDb().prepare('SELECT * FROM send_events WHERE queue_id = ? ORDER BY id DESC LIMIT 1').get(cleanQueueId);
+  if (!row) return false;
+  const normalizedAttempt = normalizeDeliveryAttempt(attempt, cleanQueueId);
+  const attempts = safeJson(row.delivery_attempts_json, []);
+  if (attempts.some((item) => deliveryAttemptKey(item) === deliveryAttemptKey(normalizedAttempt))) return true;
+  const nextAttempts = [...attempts, normalizedAttempt];
+  const recipients = safeJson(row.recipients, []);
+  const nextStatus = deliveryStatusForEvent(recipients, nextAttempts, row.status);
+  const deliveredAt = nextStatus === 'sent' ? normalizedAttempt.at : row.delivered_at;
+  requireDb()
+    .prepare(`
+      UPDATE send_events
+      SET status = ?, detail = ?, delivery_attempts_json = ?, delivered_at = ?
+      WHERE id = ?
+    `)
+    .run(nextStatus, deliveryAttemptDetail(normalizedAttempt), JSON.stringify(nextAttempts), deliveredAt, row.id);
+  return true;
+}
+
+export function listSendEvents(userId, limit = 30) {
+  return requireDb()
+    .prepare(`
+      SELECT e.*, d.domain
+      FROM send_events e
+      LEFT JOIN domains d ON d.id = e.domain_id
+      WHERE e.user_id = ?
+      ORDER BY e.created_at DESC
+      LIMIT ?
+    `)
+    .all(userId, limit)
+    .map((row) => ({
+      id: row.id,
+      userId: row.user_id,
+      domainId: row.domain_id,
+      domain: row.domain,
+      sender: row.sender,
+      recipients: safeJson(row.recipients, []),
+      subject: row.subject,
+      status: row.status,
+      detail: row.detail,
+      queueId: row.queue_id,
+      deliveryLog: safeJson(row.delivery_log_json, []),
+      deliveryAttempts: safeJson(row.delivery_attempts_json, []),
+      deliveredAt: row.delivered_at,
+      createdAt: row.created_at
+    }));
+}
+
+export function getSendAnalytics(userId, { days = 30 } = {}) {
+  const windowDays = clampAnalyticsDays(days);
+  const since = new Date();
+  since.setUTCHours(0, 0, 0, 0);
+  since.setUTCDate(since.getUTCDate() - (windowDays - 1));
+  const rows = requireDb()
+    .prepare(`
+      SELECT e.*, d.domain
+      FROM send_events e
+      LEFT JOIN domains d ON d.id = e.domain_id
+      WHERE e.user_id = ? AND e.created_at >= ?
+      ORDER BY e.created_at ASC
+      LIMIT 5000
+    `)
+    .all(userId, since.toISOString());
+  const domains = listDomains(userId);
+  const dayBuckets = buildDayBuckets(windowDays);
+  const byStatus = {};
+  const byDomain = new Map();
+  const hourly = Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    total: 0,
+    queued: 0,
+    failed: 0
+  }));
+  let recipients = 0;
+  let queued = 0;
+  let failed = 0;
+  let today = 0;
+  let last7Days = 0;
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const weekStart = new Date();
+  weekStart.setUTCHours(0, 0, 0, 0);
+  weekStart.setUTCDate(weekStart.getUTCDate() - 6);
+
+  for (const row of rows) {
+    const status = row.status || 'unknown';
+    const recipientList = safeJson(row.recipients, []);
+    const recipientCount = Array.isArray(recipientList) ? recipientList.length : 0;
+    const domainName = row.domain || (String(row.sender || '').split('@')[1] || 'unknown');
+    const createdAt = new Date(row.created_at);
+    const dayKey = row.created_at.slice(0, 10);
+    const hour = Number.isInteger(createdAt.getUTCHours()) ? createdAt.getUTCHours() : 0;
+    const isQueued = ['queued', 'sent'].includes(status);
+
+    recipients += recipientCount;
+    queued += isQueued ? 1 : 0;
+    failed += isQueued ? 0 : 1;
+    today += dayKey === todayKey ? 1 : 0;
+    last7Days += createdAt >= weekStart ? 1 : 0;
+    byStatus[status] = (byStatus[status] || 0) + 1;
+
+    if (dayBuckets.has(dayKey)) {
+      const bucket = dayBuckets.get(dayKey);
+      bucket.total += 1;
+      bucket.queued += isQueued ? 1 : 0;
+      bucket.failed += isQueued ? 0 : 1;
+      bucket.recipients += recipientCount;
+    }
+
+    const domainBucket = byDomain.get(domainName) || {
+      domain: domainName,
+      total: 0,
+      queued: 0,
+      failed: 0,
+      recipients: 0
+    };
+    domainBucket.total += 1;
+    domainBucket.queued += isQueued ? 1 : 0;
+    domainBucket.failed += isQueued ? 0 : 1;
+    domainBucket.recipients += recipientCount;
+    byDomain.set(domainName, domainBucket);
+
+    hourly[hour].total += 1;
+    hourly[hour].queued += isQueued ? 1 : 0;
+    hourly[hour].failed += isQueued ? 0 : 1;
+  }
+
+  const recentFailures = [...rows]
+    .reverse()
+    .filter((row) => isDeliveryFailureStatus(row.status))
+    .slice(0, 8)
+    .map((row) => ({
+      id: row.id,
+      domain: row.domain || '',
+      sender: row.sender,
+      subject: row.subject,
+      detail: row.detail,
+      createdAt: row.created_at
+    }));
+
+  return {
+    windowDays,
+    summary: {
+      total: rows.length,
+      queued,
+      failed,
+      recipients,
+      today,
+      last7Days,
+      successRate: rows.length ? Math.round((queued / rows.length) * 1000) / 10 : 0,
+      domains: domains.length,
+      verifiedDomains: domains.filter((domain) => domain.status?.verified).length
+    },
+    byDay: [...dayBuckets.values()],
+    byDomain: [...byDomain.values()].sort((a, b) => b.total - a.total).slice(0, 10),
+    byStatus: Object.entries(byStatus).map(([status, total]) => ({ status, total })),
+    hourly,
+    recentFailures
+  };
+}
+
+export function getSmtpCredential(userId, { includeHash = false, includePassword = false, includeSecret = false } = {}) {
+  const row = requireDb()
+    .prepare('SELECT * FROM smtp_credentials WHERE user_id = ?')
+    .get(userId);
+  if (!row) return null;
+  return publicSmtpCredential(row, { includeHash, includePassword, includeSecret });
+}
+
+export function saveSmtpCredential(userId, { username, password }) {
+  const current = getSmtpCredential(userId, { includeHash: true, includeSecret: true });
+  const nextUsername = String(username || current?.username || '').trim();
+  if (!nextUsername) throw new Error('SMTP 用户名不能为空。');
+  const nextHash = password ? hashPassword(password) : current?.passwordHash;
+  if (!nextHash) throw new Error('SMTP 密码不能为空。');
+  const nextSecret = password ? encryptSecret(password) : current?.passwordSecret || '';
+  const updatedAt = now();
+  if (current) {
+    requireDb()
+      .prepare('UPDATE smtp_credentials SET username = ?, password_hash = ?, password_secret = ?, updated_at = ? WHERE user_id = ?')
+      .run(nextUsername, nextHash, nextSecret, updatedAt, userId);
+  } else {
+    requireDb()
+      .prepare(`
+        INSERT INTO smtp_credentials (user_id, username, password_hash, password_secret, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `)
+      .run(userId, nextUsername, nextHash, nextSecret, updatedAt, updatedAt);
+  }
+  return getSmtpCredential(userId);
+}
+
+export function verifySmtpCredential(username, password) {
+  const row = requireDb()
+    .prepare(`
+      SELECT c.*, u.id AS auth_user_id, u.username AS auth_username, u.email, u.role, u.status
+      FROM smtp_credentials c
+      JOIN users u ON u.id = c.user_id
+      WHERE c.username = ?
+    `)
+    .get(String(username || '').trim());
+  if (!row || row.status !== 'active' || !verifyPassword(password, row.password_hash)) return null;
+  return {
+    user: {
+      id: row.auth_user_id,
+      username: row.auth_username,
+      email: row.email,
+      role: row.role,
+      status: row.status
+    },
+    credential: publicSmtpCredential(row)
+  };
+}
+
+export function createApiToken(userId, name) {
+  const token = `mh_${crypto.randomBytes(32).toString('base64url')}`;
+  const createdAt = now();
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    .run(userId, String(name || 'API Token').trim() || 'API Token', tokenHash(token), token.slice(0, 12), createdAt);
+  return {
+    ...getApiToken(result.lastInsertRowid, userId),
+    token
+  };
+}
+
+export function listApiTokens(userId) {
+  return requireDb()
+    .prepare('SELECT * FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC')
+    .all(userId)
+    .map(publicApiToken);
+}
+
+export function getApiToken(id, userId) {
+  const row = requireDb()
+    .prepare('SELECT * FROM api_tokens WHERE id = ? AND user_id = ?')
+    .get(id, userId);
+  return publicApiToken(row);
+}
+
+export function deleteApiToken(id, userId) {
+  const result = requireDb().prepare('DELETE FROM api_tokens WHERE id = ? AND user_id = ?').run(id, userId);
+  return result.changes > 0;
+}
+
+export function verifyApiToken(token) {
+  const hash = tokenHash(token);
+  const row = requireDb()
+    .prepare(`
+      SELECT t.*, u.id AS auth_user_id, u.username, u.email, u.role, u.status
+      FROM api_tokens t
+      JOIN users u ON u.id = t.user_id
+      WHERE t.token_hash = ?
+    `)
+    .get(hash);
+  if (!row || row.status !== 'active') return null;
+  requireDb().prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?').run(now(), row.id);
+  return {
+    id: row.auth_user_id,
+    username: row.username,
+    email: row.email,
+    role: row.role,
+    status: row.status
+  };
+}
+
+export function listDnsCredentials(userId) {
+  return requireDb()
+    .prepare('SELECT * FROM dns_credentials WHERE user_id = ? ORDER BY created_at DESC')
+    .all(userId)
+    .map(publicDnsCredential);
+}
+
+export function getDnsCredential(id, userId, { includeCredentials = false } = {}) {
+  const row = requireDb()
+    .prepare('SELECT * FROM dns_credentials WHERE id = ? AND user_id = ?')
+    .get(id, userId);
+  if (!row) return null;
+  const publicRow = publicDnsCredential(row);
+  if (!includeCredentials) return publicRow;
+  return {
+    ...publicRow,
+    credentials: safeJson(decryptSecret(row.credentials_secret), {})
+  };
+}
+
+export function saveDnsCredential(userId, credential) {
+  const provider = normalizeProvider(credential.provider);
+  if (!provider) throw new Error('DNS 服务商不支持。');
+  const name = String(credential.name || provider).trim();
+  const zoneName = String(credential.zoneName || credential.zone || '').trim().toLowerCase();
+  const defaultTtl = clampTtl(credential.defaultTtl);
+  const credentials = credential.credentials || pickCredentialFields(credential);
+  const updatedAt = now();
+  if (credential.id) {
+    const current = getDnsCredential(credential.id, userId, { includeCredentials: true });
+    if (!current) return null;
+    const nextCredentials = Object.keys(credentials).length ? credentials : current.credentials;
+    requireDb()
+      .prepare(`
+        UPDATE dns_credentials
+        SET name = ?, provider = ?, zone_name = ?, default_ttl = ?, credentials_secret = ?, updated_at = ?
+        WHERE id = ? AND user_id = ?
+      `)
+      .run(name, provider, zoneName, defaultTtl, encryptSecret(JSON.stringify(nextCredentials)), updatedAt, credential.id, userId);
+    return getDnsCredential(credential.id, userId);
+  }
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO dns_credentials (user_id, name, provider, zone_name, default_ttl, credentials_secret, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(userId, name, provider, zoneName, defaultTtl, encryptSecret(JSON.stringify(credentials)), updatedAt, updatedAt);
+  return getDnsCredential(result.lastInsertRowid, userId);
+}
+
+export function deleteDnsCredential(id, userId) {
+  requireDb().prepare('UPDATE domains SET dns_credential_id = NULL WHERE dns_credential_id = ? AND user_id = ?').run(id, userId);
+  const result = requireDb().prepare('DELETE FROM dns_credentials WHERE id = ? AND user_id = ?').run(id, userId);
+  return result.changes > 0;
+}
+
+export function getSettings(defaults = {}) {
+  const rows = requireDb().prepare('SELECT * FROM app_settings').all();
+  const values = { ...defaults };
+  for (const row of rows) values[row.key] = row.value;
+  return values;
+}
+
+export function saveSettings(patch) {
+  const allowed = new Set([
+    'appBaseUrl',
+    'mailHostname',
+    'sendingIp',
+    'defaultSpfMechanisms',
+    'dmarcPolicy',
+    'dmarcRua',
+    'sendRequiresVerified'
+  ]);
+  const updatedAt = now();
+  for (const [key, value] of Object.entries(patch)) {
+    if (!allowed.has(key)) continue;
+    requireDb()
+      .prepare(`
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `)
+      .run(key, String(value ?? ''), updatedAt);
+  }
+  return getSettings();
+}
+
+function migrateLegacySmtpTable() {
+  if (!tableExists('smtp_credentials') || columnExists('smtp_credentials', 'user_id')) return;
+  if (!tableExists('smtp_credentials_legacy')) {
+    requireDb().exec('ALTER TABLE smtp_credentials RENAME TO smtp_credentials_legacy;');
+  } else {
+    requireDb().exec('DROP TABLE smtp_credentials;');
+  }
+}
+
+function requireDb() {
+  if (!db) throw new Error('Database is not initialized.');
+  return db;
+}
+
+function tableExists(table) {
+  return Boolean(requireDb().prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+}
+
+function columnExists(table, column) {
+  if (!tableExists(table)) return false;
+  return requireDb()
+    .prepare(`PRAGMA table_info(${table})`)
+    .all()
+    .some((row) => row.name === column);
+}
+
+function ensureColumn(table, column, definition) {
+  if (!columnExists(table, column)) requireDb().exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function normalizeDkimPublicKeys() {
+  if (!tableExists('domains') || !columnExists('domains', 'dkim_private') || !columnExists('domains', 'dkim_public')) return;
+  const rows = requireDb().prepare('SELECT id, dkim_public, dkim_private FROM domains').all();
+  const update = requireDb().prepare('UPDATE domains SET dkim_public = ?, updated_at = ? WHERE id = ?');
+  for (const row of rows) {
+    if (!row.dkim_private) continue;
+    try {
+      const publicKey = dkimPublicFromPrivateKey(row.dkim_private);
+      if (publicKey && publicKey !== row.dkim_public) update.run(publicKey, now(), row.id);
+    } catch {
+      // Leave legacy or malformed rows untouched; rotating DKIM from the UI can repair them.
+    }
+  }
+}
+
+function normalizeSendEventQueueIds() {
+  if (!tableExists('send_events') || !columnExists('send_events', 'queue_id')) return;
+  const rows = requireDb()
+    .prepare("SELECT id, detail FROM send_events WHERE queue_id = '' OR queue_id IS NULL")
+    .all();
+  const update = requireDb().prepare('UPDATE send_events SET queue_id = ? WHERE id = ?');
+  for (const row of rows) {
+    const queueId = extractQueueIdFromText(row.detail);
+    if (queueId) update.run(queueId, row.id);
+  }
+}
+
+function publicUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    role: row.role,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function privateUser(row) {
+  const user = publicUser(row);
+  return user ? { ...user, passwordHash: row.password_hash } : null;
+}
+
+function publicDomainRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    dnsCredentialId: row.dns_credential_id,
+    domain: row.domain,
+    selector: row.selector,
+    verificationToken: row.verification_token,
+    dkimPublic: row.dkim_public,
+    senderHost: row.sender_host,
+    sendingIp: row.sending_ip,
+    spfExtra: row.spf_extra,
+    dmarcPolicy: row.dmarc_policy,
+    dmarcRua: row.dmarc_rua,
+    status: safeJson(row.status_json, {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function privateDomainRow(row) {
+  const publicRow = publicDomainRow(row);
+  return publicRow ? { ...publicRow, dkimPrivate: row.dkim_private } : null;
+}
+
+function publicSmtpCredential(row, { includeHash = false, includePassword = false, includeSecret = false } = {}) {
+  if (!row) return null;
+  const password = includePassword ? decryptSecret(row.password_secret) : '';
+  const passwordRecoverable = Boolean(row.password_secret && (password || decryptSecret(row.password_secret)));
+  return {
+    id: row.id,
+    userId: row.user_id,
+    username: row.username,
+    passwordSet: Boolean(row.password_hash),
+    passwordRecoverable,
+    ...(includePassword ? { password } : {}),
+    ...(includeHash ? { passwordHash: row.password_hash } : {}),
+    ...(includeSecret ? { passwordSecret: row.password_secret } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function publicApiToken(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    tokenPrefix: row.token_prefix,
+    lastUsedAt: row.last_used_at,
+    createdAt: row.created_at
+  };
+}
+
+function publicDnsCredential(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    provider: row.provider,
+    zoneName: row.zone_name,
+    defaultTtl: row.default_ttl,
+    credentialSet: Boolean(row.credentials_secret),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function normalizeUsername(value) {
+  const username = String(value || '').trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_.-]{2,31}$/.test(username) ? username : '';
+}
+
+function normalizeEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+}
+
+function normalizeProvider(value) {
+  const provider = String(value || '').trim().toLowerCase();
+  return ['cloudflare', 'aliyun', 'dnspod'].includes(provider) ? provider : '';
+}
+
+function pickCredentialFields(source) {
+  const output = {};
+  for (const key of ['apiToken', 'zoneId', 'accessKeyId', 'accessKeySecret', 'secretId', 'secretKey']) {
+    if (source[key]) output[key] = String(source[key]).trim();
+  }
+  return output;
+}
+
+function clampTtl(value) {
+  const ttl = Number(value || 600);
+  if (!Number.isInteger(ttl) || ttl < 60) return 600;
+  if (ttl > 86400) return 86400;
+  return ttl;
+}
+
+function clampAnalyticsDays(value) {
+  const days = Number(value || 30);
+  if (!Number.isInteger(days) || days < 7) return 30;
+  if (days > 90) return 90;
+  return days;
+}
+
+function buildDayBuckets(days) {
+  const buckets = new Map();
+  const cursor = new Date();
+  cursor.setUTCHours(0, 0, 0, 0);
+  cursor.setUTCDate(cursor.getUTCDate() - (days - 1));
+  for (let index = 0; index < days; index += 1) {
+    const date = new Date(cursor);
+    date.setUTCDate(cursor.getUTCDate() + index);
+    const day = date.toISOString().slice(0, 10);
+    buckets.set(day, {
+      day,
+      total: 0,
+      queued: 0,
+      failed: 0,
+      recipients: 0
+    });
+  }
+  return buckets;
+}
+
+function safeJson(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeQueueId(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function extractQueueIdFromText(value) {
+  return String(value || '').match(/\bqueued as\s+([A-Z0-9]{5,})\b/i)?.[1]?.toUpperCase() || '';
+}
+
+function normalizeDeliveryAttempt(attempt, queueId) {
+  return {
+    at: attempt?.at || now(),
+    source: attempt?.source || 'postfix',
+    queueId,
+    recipient: String(attempt?.recipient || '').toLowerCase(),
+    relay: String(attempt?.relay || ''),
+    dsn: String(attempt?.dsn || ''),
+    status: String(attempt?.status || 'unknown').toLowerCase(),
+    response: String(attempt?.response || ''),
+    raw: String(attempt?.raw || '')
+  };
+}
+
+function deliveryAttemptKey(attempt) {
+  return attempt.raw || [
+    attempt.queueId,
+    attempt.recipient,
+    attempt.status,
+    attempt.dsn,
+    attempt.response
+  ].join('|');
+}
+
+function deliveryStatusForEvent(recipients, attempts, currentStatus) {
+  const byRecipient = new Map();
+  for (const attempt of attempts) {
+    if (attempt.recipient) byRecipient.set(String(attempt.recipient).toLowerCase(), attempt.status);
+  }
+  const normalizedRecipients = recipients.map((recipient) => String(recipient || '').toLowerCase()).filter(Boolean);
+  const statuses = normalizedRecipients.map((recipient) => byRecipient.get(recipient)).filter(Boolean);
+  if (normalizedRecipients.length && statuses.length === normalizedRecipients.length && statuses.every((status) => status === 'sent')) {
+    return 'sent';
+  }
+  if (statuses.includes('deferred')) return 'deferred';
+  if (statuses.includes('bounced')) return 'bounced';
+  return currentStatus || attempts.at(-1)?.status || 'queued';
+}
+
+function deliveryAttemptDetail(attempt) {
+  const parts = [
+    attempt.status,
+    attempt.recipient ? `to ${attempt.recipient}` : '',
+    attempt.relay ? `via ${attempt.relay}` : '',
+    attempt.dsn ? `dsn=${attempt.dsn}` : ''
+  ].filter(Boolean);
+  return `${parts.join(' ')}${attempt.response ? `; ${attempt.response}` : ''}`;
+}
+
+function isDeliveryFailureStatus(status) {
+  return ['deferred', 'bounced', 'failed'].includes(String(status || '').toLowerCase());
+}
+
+function now() {
+  return new Date().toISOString();
+}
+
+function tokenHash(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `scrypt$${salt}$${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [scheme, salt, hash] = String(stored || '').split('$');
+  if (scheme !== 'scrypt' || !salt || !hash) return false;
+  const actual = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return safeEqual(actual, hash);
+}
+
+function encryptSecret(value) {
+  if (!value) return '';
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
+  return [
+    'v1',
+    iv.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+    encrypted.toString('base64url')
+  ].join('$');
+}
+
+function decryptSecret(secret) {
+  const [version, ivRaw, tagRaw, encryptedRaw] = String(secret || '').split('$');
+  if (version !== 'v1' || !ivRaw || !tagRaw || !encryptedRaw) return '';
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), Buffer.from(ivRaw, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tagRaw, 'base64url'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(encryptedRaw, 'base64url')),
+      decipher.final()
+    ]).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+function encryptionKey() {
+  return crypto
+    .createHash('sha256')
+    .update(secretKey || 'mailhub-local-secret')
+    .digest();
+}
+
+function safeEqual(actual, expected) {
+  const a = Buffer.from(String(actual || ''));
+  const b = Buffer.from(String(expected || ''));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}

@@ -1,0 +1,52 @@
+{
+  "name": "mailhub",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Dockerized outbound mail control panel with DNS guidance and DKIM signing.",
+  "license": "MIT",
+  "author": "MailHub contributors",
+  "keywords": [
+    "email",
+    "smtp",
+    "dkim",
+    "dns",
+    "mail",
+    "postfix",
+    "self-hosted"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/chendeben/MailHub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chendeben/MailHub/issues"
+  },
+  "homepage": "https://github.com/chendeben/MailHub#readme",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node src/server.js",
+    "dev:ui": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "preview:ui": "vite preview --host 0.0.0.0",
+    "test": "node --test",
+    "release:check": "npm test && npm run build",
+    "deploy:remote": "bash scripts/deploy-remote.sh"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^6.3.2",
+    "@ant-design/plots": "^2.6.8",
+    "antd": "^5.29.3",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.3"
+  }
+}
