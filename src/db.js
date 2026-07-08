@@ -6,6 +6,13 @@ import { dkimPublicFromPrivateKey } from './dkim.js';
 
 let db;
 let secretKey = '';
+export const USER_STATUSES = new Set(['pending_email', 'pending_review', 'active', 'disabled']);
+const auditSecretKeyPattern = /password|secret|token|key|credential|dkim[_-]?private|authorization/i;
+const auditDescriptorKeyPattern = /^(field|name|path|key|header)$/i;
+const auditDescriptorValuePattern = /password|secret|token|key|credential|dkim[_-]?private|authorization/i;
+const auditDescriptorWrapperKeyPattern = /^(change|context|descriptor|meta)$/i;
+const auditValueLikeKeyPattern = /^(value|from|to|old|new|old_?value|new_?value|before|after)$/i;
+const maxAccountTokenTtlMinutes = 7 * 24 * 60;
 
 export function initDatabase(dataDir, secret = '') {
   secretKey = String(secret || process.env.SESSION_SECRET || process.env.API_TOKEN || process.env.ADMIN_PASSWORD || '');
@@ -61,6 +68,17 @@ export function initDatabase(dataDir, secret = '') {
       FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor_user_id INTEGER,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL DEFAULT '',
+      target_user_id INTEGER,
+      summary_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS smtp_credentials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL UNIQUE,
@@ -79,6 +97,17 @@ export function initDatabase(dataDir, secret = '') {
       token_hash TEXT NOT NULL UNIQUE,
       token_prefix TEXT NOT NULL,
       last_used_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS account_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      purpose TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
       created_at TEXT NOT NULL,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -103,7 +132,13 @@ export function initDatabase(dataDir, secret = '') {
     );
 
     CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON api_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_account_tokens_user_purpose ON account_tokens(user_id, purpose);
+    CREATE INDEX IF NOT EXISTS idx_account_tokens_expires_at ON account_tokens(expires_at);
     CREATE INDEX IF NOT EXISTS idx_dns_credentials_user_id ON dns_credentials(user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_user_id ON audit_logs(actor_user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_target_user_id ON audit_logs(target_user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
   `);
   ensureColumn('domains', 'user_id', 'INTEGER');
   ensureColumn('domains', 'dns_credential_id', 'INTEGER');
@@ -137,7 +172,8 @@ export function seedAdminUser({ username, password, email }) {
     username: normalizedUsername,
     email: normalizedEmail,
     password,
-    role: 'admin'
+    role: 'admin',
+    status: 'active'
   });
 }
 
@@ -165,9 +201,10 @@ export function seedSmtpCredential(userId, username, password) {
   return saveSmtpCredential(userId, { username, password });
 }
 
-export function createUser({ username, email, password, role = 'user' }) {
+export function createUser({ username, email, password, role = 'user', status = 'active' }) {
   const cleanUsername = normalizeUsername(username);
   const cleanEmail = normalizeEmail(email);
+  const cleanStatus = normalizeUserStatus(status);
   if (!cleanUsername) throw new Error('用户名格式不正确。');
   if (!cleanEmail) throw new Error('邮箱格式不正确。');
   if (String(password || '').length < 8) throw new Error('密码至少需要 8 位。');
@@ -175,15 +212,34 @@ export function createUser({ username, email, password, role = 'user' }) {
   const result = requireDb()
     .prepare(`
       INSERT INTO users (username, email, password_hash, role, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'active', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
-    .run(cleanUsername, cleanEmail, hashPassword(password), role === 'admin' ? 'admin' : 'user', createdAt, createdAt);
+    .run(cleanUsername, cleanEmail, hashPassword(password), role === 'admin' ? 'admin' : 'user', cleanStatus, createdAt, createdAt);
   return getUser(result.lastInsertRowid);
 }
 
+export function createUserWithAccountToken(userInput, tokenPurpose, { ttlMinutes } = {}) {
+  const database = requireDb();
+  database.exec('BEGIN');
+  try {
+    const user = createUser(userInput);
+    const accountToken = createAccountToken(user.id, tokenPurpose, { ttlMinutes });
+    database.exec('COMMIT');
+    return { user, accountToken };
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function authenticateUser(login, password) {
+  const user = verifyUserCredentials(login, password);
+  return user?.status === 'active' ? user : null;
+}
+
+export function verifyUserCredentials(login, password) {
   const user = getUserByLogin(login, { includeHash: true });
-  if (!user || user.status !== 'active' || !verifyPassword(password, user.passwordHash)) return null;
+  if (!user || !verifyPassword(password, user.passwordHash)) return null;
   return publicUser(user);
 }
 
@@ -192,6 +248,272 @@ export function listUsers() {
     .prepare('SELECT * FROM users ORDER BY created_at DESC')
     .all()
     .map(publicUser);
+}
+
+export function listUsersWithResourceCounts() {
+  return requireDb()
+    .prepare(`
+      SELECT
+        users.*,
+        (SELECT COUNT(*) FROM domains WHERE domains.user_id = users.id) AS domains_count,
+        (SELECT COUNT(*) FROM dns_credentials WHERE dns_credentials.user_id = users.id) AS dns_credentials_count,
+        (SELECT COUNT(*) FROM api_tokens WHERE api_tokens.user_id = users.id) AS api_tokens_count,
+        (SELECT COUNT(*) FROM send_events WHERE send_events.user_id = users.id) AS send_events_count,
+        (SELECT COUNT(*) FROM smtp_credentials WHERE smtp_credentials.user_id = users.id) AS smtp_credentials_count
+      FROM users
+      ORDER BY users.created_at DESC
+    `)
+    .all()
+    .map((row) => ({
+      ...publicUser(row),
+      resourceCounts: {
+        domains: Number(row.domains_count || 0),
+        dnsCredentials: Number(row.dns_credentials_count || 0),
+        apiTokens: Number(row.api_tokens_count || 0),
+        sendEvents: Number(row.send_events_count || 0),
+        smtpCredential: Number(row.smtp_credentials_count || 0) > 0 ? 1 : 0
+      }
+    }));
+}
+
+export function getAdminResourceInventory() {
+  const users = listUsersWithResourceCounts();
+  const domains = requireDb()
+    .prepare('SELECT * FROM domains ORDER BY user_id, created_at DESC')
+    .all()
+    .map(publicDomainRow);
+  const dnsCredentials = requireDb()
+    .prepare('SELECT * FROM dns_credentials ORDER BY user_id, created_at DESC')
+    .all()
+    .map(publicDnsCredential);
+  const smtpCredentials = requireDb()
+    .prepare('SELECT * FROM smtp_credentials ORDER BY user_id')
+    .all()
+    .map(publicSmtpCredential);
+  const apiTokens = requireDb()
+    .prepare('SELECT * FROM api_tokens ORDER BY user_id, created_at DESC')
+    .all()
+    .map(publicApiToken);
+  const sendEventCounts = new Map(
+    requireDb()
+      .prepare('SELECT user_id, COUNT(*) AS count FROM send_events GROUP BY user_id')
+      .all()
+      .map((row) => [row.user_id, Number(row.count || 0)])
+  );
+  const dnsCredentialById = new Map(dnsCredentials.map((credential) => [credential.id, credential]));
+
+  return {
+    users: users.map((user) => ({
+      user,
+      domains: domains.filter((domain) => domain.userId === user.id),
+      dnsCredentials: dnsCredentials.filter((credential) => credential.userId === user.id),
+      smtpCredential: smtpCredentials.find((credential) => credential.userId === user.id) || null,
+      apiTokens: apiTokens.filter((token) => token.userId === user.id),
+      sendEventCount: sendEventCounts.get(user.id) || 0
+    })),
+    warnings: domains.flatMap((domain) => {
+      if (!domain.dnsCredentialId) return [];
+      const credential = dnsCredentialById.get(domain.dnsCredentialId);
+      if (!credential || credential.userId === domain.userId) return [];
+      return [{
+        type: 'domain_dns_credential_owner_mismatch',
+        domainId: domain.id,
+        domain: domain.domain,
+        domainUserId: domain.userId,
+        dnsCredentialId: credential.id,
+        dnsCredentialUserId: credential.userId
+      }];
+    })
+  };
+}
+
+export function transferDomain({ actorUserId, domainId, targetUserId, dnsCredentialMode = 'domain_only' }) {
+  return withTransaction(() => {
+    const target = requireTransferTargetUser(targetUserId);
+    const domain = requireDomainRow(domainId);
+    const mode = normalizeDnsCredentialTransferMode(dnsCredentialMode);
+    const nextDnsCredentialId = mode === 'clear_dns_credential' ? null : domain.dns_credential_id;
+    requireDb()
+      .prepare('UPDATE domains SET user_id = ?, dns_credential_id = ?, updated_at = ? WHERE id = ?')
+      .run(target.id, nextDnsCredentialId, now(), domain.id);
+    if (mode === 'with_dns_credential' && domain.dns_credential_id) {
+      const credential = requireDnsCredentialRow(domain.dns_credential_id);
+      if (credential.user_id !== domain.user_id) throw new Error('DNS 凭据归属不一致。');
+      requireDb()
+        .prepare('UPDATE dns_credentials SET user_id = ?, updated_at = ? WHERE id = ?')
+        .run(target.id, now(), domain.dns_credential_id);
+    }
+    const updated = getDomain(domain.id);
+    logAudit({
+      actorUserId,
+      action: 'admin.transfer_domain',
+      targetType: 'domain',
+      targetId: String(domain.id),
+      targetUserId: target.id,
+      summary: {
+        domain: domain.domain,
+        fromUserId: domain.user_id,
+        toUserId: target.id,
+        dnsCredentialMode: mode,
+        dnsCredentialId: domain.dns_credential_id || null
+      }
+    });
+    return updated;
+  });
+}
+
+export function transferDnsCredential({ actorUserId, credentialId, targetUserId }) {
+  return withTransaction(() => {
+    const target = requireTransferTargetUser(targetUserId);
+    const credential = requireDnsCredentialRow(credentialId);
+    requireDb()
+      .prepare('UPDATE dns_credentials SET user_id = ?, updated_at = ? WHERE id = ?')
+      .run(target.id, now(), credential.id);
+    const updated = publicDnsCredential(requireDnsCredentialRow(credential.id));
+    logAudit({
+      actorUserId,
+      action: 'admin.transfer_dns_credential',
+      targetType: 'dns_credential',
+      targetId: String(credential.id),
+      targetUserId: target.id,
+      summary: {
+        name: credential.name,
+        provider: credential.provider,
+        fromUserId: credential.user_id,
+        toUserId: target.id
+      }
+    });
+    return updated;
+  });
+}
+
+export function transferApiTokens({ actorUserId, tokenIds, targetUserId }) {
+  return withTransaction(() => {
+    const target = requireTransferTargetUser(targetUserId);
+    const ids = uniquePositiveIds(tokenIds);
+    if (!ids.length) throw new Error('API Token 不存在。');
+    const placeholders = ids.map(() => '?').join(', ');
+    const tokens = requireDb()
+      .prepare(`SELECT * FROM api_tokens WHERE id IN (${placeholders})`)
+      .all(...ids);
+    if (tokens.length !== ids.length) throw new Error('API Token 不存在。');
+    requireDb()
+      .prepare(`UPDATE api_tokens SET user_id = ? WHERE id IN (${placeholders})`)
+      .run(target.id, ...ids);
+    const updated = requireDb()
+      .prepare(`SELECT * FROM api_tokens WHERE id IN (${placeholders}) ORDER BY created_at DESC`)
+      .all(...ids)
+      .map(publicApiToken);
+    logAudit({
+      actorUserId,
+      action: 'admin.transfer_api_tokens',
+      targetType: 'api_token',
+      targetId: ids.join(','),
+      targetUserId: target.id,
+      summary: {
+        tokenIds: ids,
+        count: ids.length,
+        fromUserIds: [...new Set(tokens.map((token) => token.user_id))],
+        toUserId: target.id
+      }
+    });
+    return updated;
+  });
+}
+
+export function previewUserMerge({ sourceUserId, targetUserId }) {
+  const { source, target } = requireMergeUsers(sourceUserId, targetUserId);
+  const sourceSmtp = getSmtpCredential(source.id);
+  const targetSmtp = getSmtpCredential(target.id);
+  const counts = {
+    domains: countRows('domains', source.id),
+    dnsCredentials: countRows('dns_credentials', source.id),
+    apiTokens: countRows('api_tokens', source.id),
+    sendEvents: countRows('send_events', source.id),
+    smtpCredential: sourceSmtp ? 1 : 0
+  };
+  const smtpConflict = Boolean(sourceSmtp && targetSmtp);
+  const defaultOptions = {
+    transferDomains: true,
+    transferDnsCredentials: true,
+    transferApiTokens: true,
+    transferSendEvents: true,
+    transferSmtpCredential: Boolean(sourceSmtp && !targetSmtp),
+    disableSource: true
+  };
+  const selectedCounts = {
+    domains: counts.domains,
+    dnsCredentials: counts.dnsCredentials,
+    apiTokens: counts.apiTokens,
+    sendEvents: counts.sendEvents,
+    smtpCredential: defaultOptions.transferSmtpCredential ? counts.smtpCredential : 0
+  };
+  return {
+    sourceUser: source,
+    targetUser: target,
+    confirmationText: `MERGE ${source.username} INTO ${target.username}`,
+    counts,
+    selectedCounts,
+    defaultOptions,
+    resources: {
+      source: mergeResourcesForUser(source.id),
+      target: mergeResourcesForUser(target.id)
+    },
+    smtp: {
+      sourceCredential: sourceSmtp,
+      targetCredential: targetSmtp,
+      conflict: smtpConflict
+    },
+    warnings: smtpConflict ? [{
+      type: 'smtp_credential_conflict',
+      message: '目标用户已有 SMTP 凭据，源用户 SMTP 凭据需要手动处理。'
+    }] : []
+  };
+}
+
+export function executeUserMerge({ actorUserId, sourceUserId, targetUserId, options = {}, confirmation }) {
+  return withTransaction(() => {
+    const preview = previewUserMerge({ sourceUserId, targetUserId });
+    if (confirmation !== preview.confirmationText) throw new Error('确认文本不匹配。');
+    const sourceId = preview.sourceUser.id;
+    const targetId = preview.targetUser.id;
+    const counts = {
+      domains: options.transferDomains === false ? 0 : moveRows('domains', sourceId, targetId),
+      dnsCredentials: options.transferDnsCredentials === false ? 0 : moveRows('dns_credentials', sourceId, targetId),
+      apiTokens: options.transferApiTokens === false ? 0 : moveRows('api_tokens', sourceId, targetId),
+      sendEvents: options.transferSendEvents === false ? 0 : moveRows('send_events', sourceId, targetId),
+      smtpCredential: 0
+    };
+    if (options.transferSmtpCredential !== false && preview.smtp.sourceCredential && !preview.smtp.targetCredential) {
+      counts.smtpCredential = moveRows('smtp_credentials', sourceId, targetId);
+    }
+    if (options.disableSource !== false) {
+      requireDb()
+        .prepare("UPDATE users SET status = 'disabled', updated_at = ? WHERE id = ?")
+        .run(now(), sourceId);
+    }
+    logAudit({
+      actorUserId,
+      action: 'admin.user_merge',
+      targetType: 'user',
+      targetId: String(targetId),
+      targetUserId: targetId,
+      summary: {
+        sourceUserId: sourceId,
+        sourceUsername: preview.sourceUser.username,
+        targetUserId: targetId,
+        targetUsername: preview.targetUser.username,
+        counts,
+        warnings: preview.warnings
+      }
+    });
+    return {
+      sourceUser: getUser(sourceId),
+      targetUser: getUser(targetId),
+      counts,
+      warnings: preview.warnings
+    };
+  });
 }
 
 export function getUser(id, { includeHash = false } = {}) {
@@ -211,16 +533,39 @@ export function getUserByLogin(login, { includeHash = false } = {}) {
 export function updateUser(id, patch) {
   const current = getUser(id, { includeHash: true });
   if (!current) return null;
+  const passwordChanged = String(patch.password || '').length > 0;
+  if (passwordChanged && String(patch.password).length < 8) throw new Error('密码至少需要 8 位。');
   const next = {
     role: patch.role === 'admin' ? 'admin' : current.role,
-    status: ['active', 'disabled'].includes(patch.status) ? patch.status : current.status,
-    passwordHash: patch.password ? hashPassword(patch.password) : current.passwordHash,
+    status: patch.status === undefined ? current.status : normalizeUserStatus(patch.status),
+    passwordHash: passwordChanged ? hashPassword(patch.password) : current.passwordHash,
     updatedAt: now()
   };
   requireDb()
     .prepare('UPDATE users SET role = ?, status = ?, password_hash = ?, updated_at = ? WHERE id = ?')
     .run(next.role, next.status, next.passwordHash, next.updatedAt, id);
+  if (passwordChanged) invalidateAccountTokens(id, 'password_reset');
   return getUser(id);
+}
+
+export function updateUserStatus(id, status) {
+  const nextStatus = normalizeUserStatus(status);
+  if (!getUser(id)) return null;
+  requireDb()
+    .prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?')
+    .run(nextStatus, now(), id);
+  return getUser(id);
+}
+
+export function approveUser(id) {
+  return updateUserStatus(id, 'active');
+}
+
+export function markUserEmailVerified(id) {
+  const user = getUser(id);
+  if (!user) return null;
+  if (user.status !== 'pending_email') return user;
+  return updateUserStatus(id, 'pending_review');
 }
 
 export function getAdminUser() {
@@ -331,6 +676,43 @@ export function saveDomainStatus(id, userId, status) {
 export function deleteDomain(id, userId) {
   const result = requireDb().prepare('DELETE FROM domains WHERE id = ? AND user_id = ?').run(id, userId);
   return result.changes > 0;
+}
+
+export function logAudit({ actorUserId, action, targetType, targetId = '', targetUserId = null, summary = {} }) {
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO audit_logs (
+        actor_user_id, action, target_type, target_id, target_user_id, summary_json, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      actorUserId ?? null,
+      String(action || ''),
+      String(targetType || ''),
+      String(targetId ?? ''),
+      targetUserId ?? null,
+      JSON.stringify(sanitizeAuditSummary(summary)),
+      now()
+    );
+  return result.lastInsertRowid;
+}
+
+export function listAuditLogs(filters = {}) {
+  const where = [];
+  const params = [];
+  addAuditFilter(where, params, 'actor_user_id', filters.actorUserId);
+  addAuditFilter(where, params, 'target_user_id', filters.targetUserId);
+  addAuditFilter(where, params, 'action', filters.action);
+  addAuditDateFilter(where, params, 'created_at', '>=', filters.from);
+  addAuditDateFilter(where, params, 'created_at', '<=', filters.to);
+  const query = `
+    SELECT *
+    FROM audit_logs
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+    ORDER BY created_at DESC, id DESC
+  `;
+  return requireDb().prepare(query).all(...params).map(publicAuditLog);
 }
 
 export function logSendEvent(event) {
@@ -631,6 +1013,54 @@ export function verifyApiToken(token) {
   };
 }
 
+export function createAccountToken(userId, purpose, { ttlMinutes } = {}) {
+  const cleanPurpose = normalizeAccountTokenPurpose(purpose);
+  const ttl = Number(ttlMinutes);
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > maxAccountTokenTtlMinutes) throw new Error('令牌有效期不正确。');
+  const token = crypto.randomBytes(32).toString('base64url');
+  const createdAt = now();
+  const expiresAt = new Date(Date.now() + ttl * 60 * 1000).toISOString();
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO account_tokens (user_id, purpose, token_hash, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    .run(userId, cleanPurpose, tokenHash(token), expiresAt, createdAt);
+  return {
+    ...publicAccountToken(getAccountTokenRow(result.lastInsertRowid)),
+    token
+  };
+}
+
+export function consumeAccountToken(token, purpose) {
+  const rawToken = String(token || '');
+  const cleanPurpose = String(purpose || '').trim();
+  if (!rawToken || !cleanPurpose) return null;
+  const tokenDigest = tokenHash(rawToken);
+  const usedAt = now();
+  const result = requireDb()
+    .prepare(`
+      UPDATE account_tokens
+      SET used_at = ?
+      WHERE token_hash = ? AND purpose = ? AND used_at IS NULL AND expires_at > ?
+    `)
+    .run(usedAt, tokenDigest, cleanPurpose, usedAt);
+  if (result.changes === 0) return null;
+  const row = requireDb()
+    .prepare('SELECT * FROM account_tokens WHERE token_hash = ? AND purpose = ?')
+    .get(tokenDigest, cleanPurpose);
+  return publicAccountToken(row);
+}
+
+export function invalidateAccountTokens(userId, purpose) {
+  const cleanPurpose = String(purpose || '').trim();
+  if (!userId || !cleanPurpose) return 0;
+  const result = requireDb()
+    .prepare('UPDATE account_tokens SET used_at = ? WHERE user_id = ? AND purpose = ? AND used_at IS NULL')
+    .run(now(), userId, cleanPurpose);
+  return result.changes;
+}
+
 export function listDnsCredentials(userId) {
   return requireDb()
     .prepare('SELECT * FROM dns_credentials WHERE user_id = ? ORDER BY created_at DESC')
@@ -707,15 +1137,155 @@ export function saveSettings(patch) {
   const updatedAt = now();
   for (const [key, value] of Object.entries(patch)) {
     if (!allowed.has(key)) continue;
-    requireDb()
-      .prepare(`
-        INSERT INTO app_settings (key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-      `)
-      .run(key, String(value ?? ''), updatedAt);
+    saveAppSetting(key, String(value ?? ''), updatedAt);
   }
   return getSettings();
+}
+
+export function getSystemEmailSettings({ includeSecret = false } = {}) {
+  const rows = requireDb()
+    .prepare("SELECT key, value FROM app_settings WHERE key LIKE 'systemEmail.%'")
+    .all();
+  const values = Object.fromEntries(
+    rows.map((row) => [String(row.key).replace(/^systemEmail\./, ''), row.value])
+  );
+  const passwordSecret = values.passwordSecret || '';
+  const settings = {
+    host: values.host || '',
+    port: normalizePort(values.port, 587),
+    secure: values.secure === 'true',
+    username: values.username || '',
+    helo: values.helo || '',
+    fromEmail: values.fromEmail || '',
+    fromName: values.fromName || '',
+    testRecipient: values.testRecipient || '',
+    passwordSet: Boolean(passwordSecret)
+  };
+  if (includeSecret) settings.password = decryptSecret(passwordSecret);
+  return settings;
+}
+
+export function saveSystemEmailSettings(patch = {}) {
+  const current = getSystemEmailSettings({ includeSecret: true });
+  const next = {
+    host: patch.host ?? current.host,
+    port: patch.port ?? current.port,
+    secure: patch.secure ?? current.secure,
+    username: patch.username ?? current.username,
+    helo: patch.helo ?? current.helo,
+    fromEmail: patch.fromEmail ?? current.fromEmail,
+    fromName: patch.fromName ?? current.fromName,
+    testRecipient: patch.testRecipient ?? current.testRecipient
+  };
+  const passwordSecret = Object.hasOwn(patch, 'password') && String(patch.password || '')
+    ? encryptSecret(patch.password)
+    : requireDb()
+        .prepare("SELECT value FROM app_settings WHERE key = 'systemEmail.passwordSecret'")
+        .get()?.value || '';
+  const updatedAt = now();
+  const values = {
+    host: String(next.host || ''),
+    port: String(normalizePort(next.port, 587)),
+    secure: boolString(next.secure),
+    username: String(next.username || ''),
+    helo: String(next.helo || ''),
+    fromEmail: normalizeEmail(next.fromEmail),
+    fromName: String(next.fromName || ''),
+    testRecipient: normalizeEmail(next.testRecipient),
+    passwordSecret
+  };
+  for (const [key, value] of Object.entries(values)) {
+    saveAppSetting(`systemEmail.${key}`, value, updatedAt);
+  }
+  return getSystemEmailSettings();
+}
+
+function saveAppSetting(key, value, updatedAt = now()) {
+  requireDb()
+    .prepare(`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `)
+    .run(key, String(value ?? ''), updatedAt);
+}
+
+function withTransaction(callback) {
+  const database = requireDb();
+  database.exec('BEGIN');
+  try {
+    const result = callback();
+    database.exec('COMMIT');
+    return result;
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function requireTransferTargetUser(targetUserId) {
+  const target = getUser(Number(targetUserId));
+  if (!target || target.status === 'disabled') throw new Error('目标用户不可用。');
+  return target;
+}
+
+function requireMergeUsers(sourceUserId, targetUserId) {
+  const source = getUser(Number(sourceUserId));
+  const target = requireTransferTargetUser(targetUserId);
+  if (!source) throw new Error('源用户不存在。');
+  if (source.id === target.id) throw new Error('源用户和目标用户不能相同。');
+  return { source, target };
+}
+
+function mergeResourcesForUser(userId) {
+  return {
+    domains: listDomains(userId),
+    dnsCredentials: listDnsCredentials(userId),
+    apiTokens: listApiTokens(userId),
+    sendEventCount: countRows('send_events', userId),
+    smtpCredential: getSmtpCredential(userId)
+  };
+}
+
+function countRows(table, userId) {
+  return Number(requireDb().prepare(`SELECT COUNT(*) AS count FROM ${mergeResourceTable(table)} WHERE user_id = ?`).get(userId).count || 0);
+}
+
+function moveRows(table, sourceUserId, targetUserId) {
+  const result = requireDb()
+    .prepare(`UPDATE ${mergeResourceTable(table)} SET user_id = ? WHERE user_id = ?`)
+    .run(targetUserId, sourceUserId);
+  return result.changes;
+}
+
+function mergeResourceTable(table) {
+  if (!['domains', 'dns_credentials', 'api_tokens', 'send_events', 'smtp_credentials'].includes(table)) {
+    throw new Error('资源类型不正确。');
+  }
+  return table;
+}
+
+function requireDomainRow(domainId) {
+  const domain = requireDb().prepare('SELECT * FROM domains WHERE id = ?').get(Number(domainId));
+  if (!domain) throw new Error('域名不存在。');
+  return domain;
+}
+
+function requireDnsCredentialRow(credentialId) {
+  const credential = requireDb().prepare('SELECT * FROM dns_credentials WHERE id = ?').get(Number(credentialId));
+  if (!credential) throw new Error('DNS 凭据不存在。');
+  return credential;
+}
+
+function normalizeDnsCredentialTransferMode(value) {
+  const mode = String(value || 'domain_only').trim();
+  return ['domain_only', 'with_dns_credential', 'clear_dns_credential'].includes(mode) ? mode : 'domain_only';
+}
+
+function uniquePositiveIds(values) {
+  return [...new Set((Array.isArray(values) ? values : [values])
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value > 0))];
 }
 
 function migrateLegacySmtpTable() {
@@ -849,6 +1419,22 @@ function publicApiToken(row) {
   };
 }
 
+function getAccountTokenRow(id) {
+  return requireDb().prepare('SELECT * FROM account_tokens WHERE id = ?').get(id);
+}
+
+function publicAccountToken(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    purpose: row.purpose,
+    expiresAt: row.expires_at,
+    usedAt: row.used_at,
+    createdAt: row.created_at
+  };
+}
+
 function publicDnsCredential(row) {
   if (!row) return null;
   return {
@@ -864,14 +1450,49 @@ function publicDnsCredential(row) {
   };
 }
 
+function publicAuditLog(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    actorUserId: row.actor_user_id,
+    action: row.action,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    targetUserId: row.target_user_id,
+    summary: safeJson(row.summary_json, {}),
+    createdAt: row.created_at
+  };
+}
+
 function normalizeUsername(value) {
   const username = String(value || '').trim().toLowerCase();
   return /^[a-z0-9][a-z0-9_.-]{2,31}$/.test(username) ? username : '';
 }
 
+function normalizeUserStatus(value) {
+  const status = String(value || '').trim();
+  if (!USER_STATUSES.has(status)) throw new Error('用户状态不正确。');
+  return status;
+}
+
+function normalizeAccountTokenPurpose(value) {
+  const purpose = String(value || '').trim();
+  if (!purpose) throw new Error('账号令牌用途不能为空。');
+  return purpose;
+}
+
 function normalizeEmail(value) {
   const email = String(value || '').trim().toLowerCase();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+}
+
+function normalizePort(value, fallback) {
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : fallback;
+}
+
+function boolString(value) {
+  return value === true || String(value).toLowerCase() === 'true' ? 'true' : 'false';
 }
 
 function normalizeProvider(value) {
@@ -927,6 +1548,61 @@ function safeJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function sanitizeAuditSummary(value, parentKey = '') {
+  if (Array.isArray(value)) return value.map((item) => sanitizeAuditSummary(item, parentKey));
+  if (!value || typeof value !== 'object') return value;
+  const hasSensitiveDescriptor = hasSensitiveAuditDescriptor(value);
+  const output = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (auditSecretKeyPattern.test(key) && !isSafeAuditStateKey(key, child, parentKey)) continue;
+    if (hasSensitiveDescriptor && auditValueLikeKeyPattern.test(key)) continue;
+    output[key] = sanitizeAuditSummary(child, key);
+  }
+  return output;
+}
+
+function isSafeAuditStateKey(key, value, parentKey) {
+  return (key === 'passwordSet' && typeof value === 'boolean') ||
+    (parentKey === 'counts' && typeof value === 'number');
+}
+
+function hasSensitiveAuditDescriptor(value) {
+  return Object.entries(value).some(([key, child]) => (
+    auditDescriptorKeyPattern.test(key) && isSensitiveAuditDescriptorValue(child)
+  )) || Object.entries(value).some(([key, child]) => (
+    auditDescriptorWrapperKeyPattern.test(key) && hasDirectSensitiveAuditDescriptor(child)
+  ));
+}
+
+function hasDirectSensitiveAuditDescriptor(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.entries(value).some(([key, child]) => (
+    auditDescriptorKeyPattern.test(key) && isSensitiveAuditDescriptorValue(child)
+  ));
+}
+
+function isSensitiveAuditDescriptorValue(value) {
+  if (Array.isArray(value)) return value.some(isSensitiveAuditDescriptorValue);
+  if (value && typeof value === 'object') return Object.values(value).some(isSensitiveAuditDescriptorValue);
+  return auditDescriptorValuePattern.test(String(value ?? ''));
+}
+
+function addAuditFilter(where, params, column, value) {
+  if (value === undefined) return;
+  if (value === null) {
+    where.push(`${column} IS NULL`);
+    return;
+  }
+  where.push(`${column} = ?`);
+  params.push(value);
+}
+
+function addAuditDateFilter(where, params, column, operator, value) {
+  if (value === undefined || value === null || value === '') return;
+  where.push(`${column} ${operator} ?`);
+  params.push(value);
 }
 
 function normalizeQueueId(value) {

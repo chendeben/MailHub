@@ -7,6 +7,7 @@ import {
   KeyOutlined,
   MailOutlined,
   ReloadOutlined,
+  SafetyCertificateOutlined,
   SendOutlined,
   SettingOutlined,
   UserOutlined
@@ -27,6 +28,7 @@ const navItems: Array<{ key: ViewKey; labelKey: string; icon: ReactNode }> = [
   { key: 'tokens', labelKey: 'nav.tokens', icon: <KeyOutlined /> },
   { key: 'logs', labelKey: 'nav.logs', icon: <SendOutlined /> },
   { key: 'webhooks', labelKey: 'nav.webhooks', icon: <ApiOutlined /> },
+  { key: 'admin', labelKey: 'nav.admin', icon: <SafetyCertificateOutlined /> },
   { key: 'settings', labelKey: 'nav.settings', icon: <SettingOutlined /> }
 ];
 
@@ -56,6 +58,7 @@ export function AdminLayout({
   onLogout
 }: AdminLayoutProps) {
   const { locale, locales, setLocale, t } = useI18n();
+  const visibleNavItems = navItems.filter((item) => item.key !== 'admin' || user?.role === 'admin');
 
   return (
     <Layout className="admin-layout">
@@ -71,7 +74,7 @@ export function AdminLayout({
           theme="dark"
           mode="inline"
           selectedKeys={[activeView]}
-          items={navItems.map((item) => ({ key: item.key, icon: item.icon, label: t(item.labelKey) }))}
+          items={visibleNavItems.map((item) => ({ key: item.key, icon: item.icon, label: t(item.labelKey) }))}
           onClick={({ key }) => onViewChange(key as ViewKey)}
         />
       </Sider>

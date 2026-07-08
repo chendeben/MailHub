@@ -1,14 +1,23 @@
 import type {
   AddDomainPayload,
+  AdminResourceInventory,
+  AdminUser,
   ApiToken,
   Analytics,
+  AuditLogEntry,
   DnsCredential,
   Domain,
   DomainPatchPayload,
   RuntimeConfig,
   SendEvent,
   SmtpCredential,
-  User
+  SystemEmailSettings,
+  User,
+  UserMergeOptions,
+  UserMergePreview,
+  UserMergeResult,
+  UserRole,
+  UserStatus
 } from '../types';
 
 interface RequestOptions extends RequestInit {
@@ -112,6 +121,65 @@ export const api = {
   adminSettings: () => request<{ settings: RuntimeConfig }>('/api/admin/settings'),
   saveAdminSettings: (data: Partial<RuntimeConfig>) =>
     request<{ settings: RuntimeConfig }>('/api/admin/settings', { method: 'PATCH', data }),
-  adminUsers: () => request<{ users: User[] }>('/api/admin/users'),
+  adminUsers: () => request<{ users: AdminUser[] }>('/api/admin/users'),
+  updateAdminUser: (id: number, data: { role?: UserRole; status?: UserStatus; password?: string }) =>
+    request<{ user: AdminUser }>(`/api/admin/users/${id}`, { method: 'PATCH', data }),
+  approveAdminUser: (id: number) =>
+    request<{ user: AdminUser }>(`/api/admin/users/${id}/approve`, { method: 'POST' }),
+  resendAdminVerification: (id: number) =>
+    request<{
+      verificationEmailSent?: boolean;
+      message: string;
+      result?: SystemMailActionResult;
+    }>(`/api/admin/users/${id}/resend-verification`, { method: 'POST' }),
+  sendAdminPasswordReset: (id: number) =>
+    request<{ result: SystemMailActionResult }>(`/api/admin/users/${id}/password-reset`, { method: 'POST' }),
+  setAdminTemporaryPassword: (id: number, password: string) =>
+    request<{ user: AdminUser }>(`/api/admin/users/${id}/temporary-password`, {
+      method: 'POST',
+      data: { password }
+    }),
+  adminResources: () => request<{ inventory: AdminResourceInventory }>('/api/admin/resources'),
+  transferAdminDomain: (
+    id: number,
+    data: { targetUserId: number; dnsCredentialMode?: 'domain_only' | 'with_dns_credential' | 'clear_dns_credential' }
+  ) => request<{ domain: Domain }>(`/api/admin/resources/domains/${id}/transfer`, { method: 'POST', data }),
+  transferAdminDnsCredential: (id: number, data: { targetUserId: number }) =>
+    request<{ credential: DnsCredential }>(`/api/admin/resources/dns-credentials/${id}/transfer`, {
+      method: 'POST',
+      data
+    }),
+  transferAdminApiTokens: (data: { tokenIds: number[]; targetUserId: number }) =>
+    request<{ tokens: ApiToken[] }>('/api/admin/resources/api-tokens/transfer', { method: 'POST', data }),
+  previewUserMerge: (data: { sourceUserId: number; targetUserId: number }) =>
+    request<{ preview: UserMergePreview }>('/api/admin/migrations/user-merge/preview', { method: 'POST', data }),
+  executeUserMerge: (data: {
+    sourceUserId: number;
+    targetUserId: number;
+    options: Partial<UserMergeOptions>;
+    confirmation: string;
+  }) => request<{ result: UserMergeResult }>('/api/admin/migrations/user-merge/execute', { method: 'POST', data }),
+  adminSystemEmail: () => request<{ settings: SystemEmailSettings }>('/api/admin/system-email'),
+  saveAdminSystemEmail: (data: Partial<SystemEmailSettings>) =>
+    request<{ settings: SystemEmailSettings }>('/api/admin/system-email', { method: 'PATCH', data }),
+  testAdminSystemEmail: (to?: string) =>
+    request<{ result: SystemMailActionResult }>('/api/admin/system-email/test', {
+      method: 'POST',
+      data: to ? { to } : {}
+    }),
+  adminAuditLogs: (query = '') =>
+    request<{ logs: AuditLogEntry[] }>(`/api/admin/audit-logs${query ? `?${query}` : ''}`),
+  resendVerification: (email: string) =>
+    request<{ message: string }>('/api/auth/resend-verification', { method: 'POST', data: { email } }),
+  forgotPassword: (email: string) =>
+    request<{ message: string }>('/api/auth/forgot-password', { method: 'POST', data: { email } }),
+  resetPassword: (token: string, password: string) =>
+    request<{ message: string }>('/api/auth/reset-password', { method: 'POST', data: { token, password } }),
   logout: () => request<{ ok: boolean }>('/api/logout', { method: 'POST' })
 };
+
+interface SystemMailActionResult {
+  ok: boolean;
+  message: string;
+  queueId?: string;
+}

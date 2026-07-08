@@ -6,13 +6,17 @@ import path from 'node:path';
 import { fileURLToPath, domainToASCII } from 'node:url';
 import {
   authenticateUser,
+  approveUser,
   claimLegacyData,
   createApiToken,
+  createAccountToken,
   createDomain,
-  createUser,
+  createUserWithAccountToken,
+  consumeAccountToken,
   deleteApiToken,
   deleteDnsCredential,
   deleteDomain,
+  getAdminResourceInventory,
   getAdminUser,
   getDnsCredential,
   getDomain,
@@ -20,24 +24,37 @@ import {
   getSendAnalytics,
   getSettings,
   getSmtpCredential,
+  getSystemEmailSettings,
   getUser,
+  getUserByLogin,
   initDatabase,
+  invalidateAccountTokens,
   listApiTokens,
+  listAuditLogs,
   listDnsCredentials,
   listDomains,
   listSendEvents,
-  listUsers,
+  listUsersWithResourceCounts,
+  logAudit,
   logSendEvent,
+  markUserEmailVerified,
+  previewUserMerge,
   saveDnsCredential,
   saveDomainStatus,
   saveSettings,
   saveSmtpCredential,
+  saveSystemEmailSettings,
   seedAdminUser,
   seedSmtpCredential,
+  transferApiTokens,
+  transferDnsCredential,
+  transferDomain,
   updateDkim,
   updateDomain,
   updateUser,
-  verifyApiToken
+  executeUserMerge,
+  verifyApiToken,
+  verifyUserCredentials
 } from './db.js';
 import { applyDnsSetup, testDnsCredential } from './dns-providers.js';
 import { startPostfixDeliveryTracker } from './delivery-tracker.js';
@@ -56,6 +73,11 @@ import {
   publicSubmissionListeners,
   startSubmissionServer
 } from './submission.js';
+import {
+  buildPasswordResetEmail,
+  buildVerificationEmail,
+  sendSystemEmail
+} from './system-mail.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadDotEnv();
@@ -100,6 +122,9 @@ const defaultSettings = {
   sendRequiresVerified: String(process.env.SEND_REQUIRES_VERIFIED || '').toLowerCase() === 'true' ? 'true' : 'false'
 };
 
+const emailVerificationPurpose = 'email_verification';
+const passwordResetPurpose = 'password_reset';
+
 initDatabase(envConfig.dataDir, envConfig.sessionSecret);
 const admin = seedAdminUser({
   username: envConfig.adminUser,
@@ -124,12 +149,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (url.pathname === '/api/register' || url.pathname === '/register')) return await handleRegister(req, res);
     if (req.method === 'POST' && (url.pathname === '/api/login' || url.pathname === '/login')) return await handleLogin(req, res);
     if (req.method === 'POST' && url.pathname === '/api/logout') return handleLogout(res);
+    if (url.pathname === '/api/auth/verify-email') return await handleVerifyEmail(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/api/auth/resend-verification') return await handleResendVerification(req, res);
+    if (req.method === 'POST' && url.pathname === '/api/auth/forgot-password') return await handleForgotPassword(req, res);
+    if (req.method === 'POST' && url.pathname === '/api/auth/reset-password') return await handleResetPassword(req, res);
 
     const user = getRequestUser(req, url.pathname);
     if (isLoginAsset(url.pathname)) {
-      if ((url.pathname === '/login' || url.pathname === '/register') && url.search) {
-        return redirect(res, url.pathname);
-      }
       if ((url.pathname === '/login' || url.pathname === '/register') && user) return redirect(res, '/');
       return await serveStatic(req, res, url);
     }
@@ -282,7 +308,7 @@ async function handleApi(req, res, url, user) {
   }
 
   if (pathname.startsWith('/api/admin/')) {
-    return await handleAdminApi(req, res, pathname, method, user);
+    return await handleAdminApi(req, res, url, user);
   }
 
   const domainMatch = pathname.match(/^\/api\/domains\/(\d+)(?:\/([a-z-]+))?$/);
@@ -366,11 +392,137 @@ async function handleApi(req, res, url, user) {
   return sendJson(res, 404, { error: 'Not found.' });
 }
 
-async function handleAdminApi(req, res, pathname, method, user) {
+async function handleAdminApi(req, res, url, user) {
+  const method = req.method || 'GET';
+  const pathname = url.pathname;
   if (!pathname.startsWith('/api/admin/')) return null;
   if (user.role !== 'admin') return sendJson(res, 403, { error: '需要管理员权限。' });
   if (method === 'GET' && pathname === '/api/admin/settings') {
     return sendJson(res, 200, { settings: runtimeSettings() });
+  }
+  if (method === 'GET' && pathname === '/api/admin/system-email') {
+    return sendJson(res, 200, { settings: getSystemEmailSettings() });
+  }
+  if (method === 'GET' && pathname === '/api/admin/audit-logs') {
+    return sendJson(res, 200, { logs: listAuditLogs(adminAuditFilters(url.searchParams)) });
+  }
+  if (method === 'GET' && pathname === '/api/admin/resources') {
+    return sendJson(res, 200, { inventory: getAdminResourceInventory() });
+  }
+  const transferDomainMatch = pathname.match(/^\/api\/admin\/resources\/domains\/(\d+)\/transfer$/);
+  if (transferDomainMatch && method === 'POST') {
+    const body = await readJson(req);
+    try {
+      const domain = transferDomain({
+        actorUserId: user.id,
+        domainId: Number(transferDomainMatch[1]),
+        targetUserId: body.targetUserId,
+        dnsCredentialMode: body.dnsCredentialMode
+      });
+      return sendJson(res, 200, { domain });
+    } catch (error) {
+      return sendAdminTransferError(res, error);
+    }
+  }
+  const transferDnsCredentialMatch = pathname.match(/^\/api\/admin\/resources\/dns-credentials\/(\d+)\/transfer$/);
+  if (transferDnsCredentialMatch && method === 'POST') {
+    const body = await readJson(req);
+    try {
+      const credential = transferDnsCredential({
+        actorUserId: user.id,
+        credentialId: Number(transferDnsCredentialMatch[1]),
+        targetUserId: body.targetUserId
+      });
+      return sendJson(res, 200, { credential });
+    } catch (error) {
+      return sendAdminTransferError(res, error);
+    }
+  }
+  if (method === 'POST' && pathname === '/api/admin/resources/api-tokens/transfer') {
+    const body = await readJson(req);
+    try {
+      const tokens = transferApiTokens({
+        actorUserId: user.id,
+        tokenIds: body.tokenIds,
+        targetUserId: body.targetUserId
+      });
+      return sendJson(res, 200, { tokens });
+    } catch (error) {
+      return sendAdminTransferError(res, error);
+    }
+  }
+  if (method === 'POST' && pathname === '/api/admin/migrations/user-merge/preview') {
+    const body = await readJson(req);
+    try {
+      const preview = previewUserMerge({
+        sourceUserId: body.sourceUserId,
+        targetUserId: body.targetUserId
+      });
+      return sendJson(res, 200, { preview });
+    } catch (error) {
+      return sendAdminMigrationError(res, error);
+    }
+  }
+  if (method === 'POST' && pathname === '/api/admin/migrations/user-merge/execute') {
+    const body = await readJson(req);
+    try {
+      const result = executeUserMerge({
+        actorUserId: user.id,
+        sourceUserId: body.sourceUserId,
+        targetUserId: body.targetUserId,
+        options: body.options,
+        confirmation: body.confirmation
+      });
+      return sendJson(res, 200, { result });
+    } catch (error) {
+      return sendAdminMigrationError(res, error);
+    }
+  }
+  if ((method === 'PATCH' || method === 'PUT') && pathname === '/api/admin/system-email') {
+    const body = await readJson(req);
+    const settings = saveSystemEmailSettings({
+      host: body.host,
+      port: body.port,
+      secure: body.secure,
+      username: body.username,
+      password: body.password,
+      helo: body.helo,
+      fromEmail: body.fromEmail,
+      fromName: body.fromName,
+      testRecipient: body.testRecipient
+    });
+    logAudit({
+      actorUserId: user.id,
+      action: 'admin.update_system_email',
+      targetType: 'system_email',
+      targetId: 'default',
+      summary: settings
+    });
+    return sendJson(res, 200, { settings });
+  }
+  if (method === 'POST' && pathname === '/api/admin/system-email/test') {
+    const body = await readJson(req).catch(() => ({}));
+    const settings = systemMailSettingsForSend();
+    const to = extractAddress(body.to || settings.testRecipient);
+    if (!to) return sendJson(res, 400, { error: '测试收件人地址格式不正确。' });
+    const result = await sendSystemEmail(settings, {
+      to,
+      subject: 'MailHub 系统邮件测试',
+      text: '这是一封 MailHub 系统邮件测试。'
+    });
+    logAudit({
+      actorUserId: user.id,
+      action: 'admin.test_system_email',
+      targetType: 'system_email',
+      targetId: 'default',
+      summary: {
+        to,
+        ok: result.ok,
+        message: result.message,
+        queueId: result.queueId
+      }
+    });
+    return sendJson(res, result.ok ? 202 : 502, { result });
   }
   if ((method === 'PATCH' || method === 'PUT') && pathname === '/api/admin/settings') {
     const body = await readJson(req);
@@ -386,19 +538,190 @@ async function handleAdminApi(req, res, pathname, method, user) {
     return sendJson(res, 200, { settings: runtimeSettings() });
   }
   if (method === 'GET' && pathname === '/api/admin/users') {
-    return sendJson(res, 200, { users: listUsers() });
+    return sendJson(res, 200, { users: listUsersWithResourceCounts() });
+  }
+  const approveMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/approve$/);
+  if (approveMatch && method === 'POST') {
+    const current = getUser(Number(approveMatch[1]));
+    if (!current) return sendJson(res, 404, { error: '用户不存在。' });
+    if (current.status === 'pending_email') return sendJson(res, 400, { error: '用户尚未验证邮箱。' });
+    if (current.status !== 'pending_review') return sendJson(res, 400, { error: '只能审批等待审核的用户。' });
+    const target = approveUser(current.id);
+    if (!target) return sendJson(res, 404, { error: '用户不存在。' });
+    logAudit({
+      actorUserId: user.id,
+      action: 'admin.approve_user',
+      targetType: 'user',
+      targetId: String(target.id),
+      targetUserId: target.id,
+      summary: {
+        username: target.username,
+        status: target.status
+      }
+    });
+    return sendJson(res, 200, { user: target });
+  }
+  const resendVerificationMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/resend-verification$/);
+  if (resendVerificationMatch && method === 'POST') {
+    const target = getUser(Number(resendVerificationMatch[1]));
+    if (!target) return sendJson(res, 404, { error: '用户不存在。' });
+    if (target.status !== 'pending_email') return sendJson(res, 400, { error: '用户不需要重新发送验证邮件。' });
+    const result = await createAndSendVerificationEmail(target);
+    logAudit({
+      actorUserId: user.id,
+      action: 'admin.resend_verification',
+      targetType: 'user',
+      targetId: String(target.id),
+      targetUserId: target.id,
+      summary: {
+        username: target.username,
+        email: target.email,
+        verificationEmailSent: result.ok,
+        message: result.message,
+        queueId: result.queueId
+      }
+    });
+    return sendJson(res, 202, verificationEmailResponse(result));
+  }
+  const passwordResetMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/password-reset$/);
+  if (passwordResetMatch && method === 'POST') {
+    const target = getUser(Number(passwordResetMatch[1]));
+    if (!target) return sendJson(res, 404, { error: '用户不存在。' });
+    const result = await createAndSendPasswordResetEmail(target);
+    logAudit({
+      actorUserId: user.id,
+      action: 'admin.password_reset',
+      targetType: 'user',
+      targetId: String(target.id),
+      targetUserId: target.id,
+      summary: {
+        username: target.username,
+        email: target.email,
+        ok: result.ok,
+        message: result.message,
+        queueId: result.queueId
+      }
+    });
+    return sendJson(res, result.ok ? 202 : 502, { result });
+  }
+  const temporaryPasswordMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/temporary-password$/);
+  if (temporaryPasswordMatch && method === 'POST') {
+    const target = getUser(Number(temporaryPasswordMatch[1]));
+    if (!target) return sendJson(res, 404, { error: '用户不存在。' });
+    const body = await readJson(req);
+    let updated;
+    try {
+      updated = updateUser(target.id, { password: body.password });
+    } catch (error) {
+      if (error?.message === '密码至少需要 8 位。') return sendJson(res, 400, { error: error.message });
+      throw error;
+    }
+    logAudit({
+      actorUserId: user.id,
+      action: 'admin.temporary_password',
+      targetType: 'user',
+      targetId: String(target.id),
+      targetUserId: target.id,
+      summary: {
+        username: target.username,
+        email: target.email,
+        passwordSet: true
+      }
+    });
+    return sendJson(res, 200, { user: updated });
   }
   const userMatch = pathname.match(/^\/api\/admin\/users\/(\d+)$/);
   if (userMatch && method === 'PATCH') {
     const body = await readJson(req);
-    const updated = updateUser(Number(userMatch[1]), {
-      role: body.role,
-      status: body.status,
-      password: body.password
-    });
+    let updated;
+    try {
+      updated = updateUser(Number(userMatch[1]), {
+        role: body.role,
+        status: body.status,
+        password: body.password
+      });
+    } catch (error) {
+      if (['用户状态不正确。', '密码至少需要 8 位。'].includes(error?.message)) {
+        return sendJson(res, 400, { error: error.message });
+      }
+      throw error;
+    }
     return sendJson(res, updated ? 200 : 404, { user: updated });
   }
   return sendJson(res, 404, { error: 'Not found.' });
+}
+
+function adminAuditFilters(searchParams) {
+  const requested = {
+    actorUserId: auditUserIdParam(searchParams.get('actorUserId'), { allowSystem: true }),
+    targetUserId: auditUserIdParam(searchParams.get('targetUserId')),
+    action: auditTextParam(searchParams.get('action')),
+    from: auditDateParam(searchParams.get('from')),
+    to: auditDateParam(searchParams.get('to'))
+  };
+  return Object.fromEntries(
+    ['actorUserId', 'targetUserId', 'action', 'from', 'to']
+      .filter((key) => requested[key] !== undefined)
+      .map((key) => [key, requested[key]])
+  );
+}
+
+function sendAdminTransferError(res, error) {
+  if (['域名不存在。', 'DNS 凭据不存在。', 'API Token 不存在。'].includes(error?.message)) {
+    return sendJson(res, 404, { error: error.message });
+  }
+  if (['目标用户不可用。', 'DNS 凭据归属不一致。'].includes(error?.message)) {
+    return sendJson(res, 400, { error: error.message });
+  }
+  throw error;
+}
+
+function sendAdminMigrationError(res, error) {
+  if (['源用户不存在。'].includes(error?.message)) return sendJson(res, 404, { error: error.message });
+  if ([
+    '目标用户不可用。',
+    '源用户和目标用户不能相同。',
+    '确认文本不匹配。'
+  ].includes(error?.message)) {
+    return sendJson(res, 400, { error: error.message });
+  }
+  throw error;
+}
+
+function auditUserIdParam(value, { allowSystem = false } = {}) {
+  if (value === null) return undefined;
+  const text = String(value).trim();
+  if (!text) return undefined;
+  if (allowSystem && ['system', 'null'].includes(text.toLowerCase())) return null;
+  return /^[1-9]\d*$/.test(text) ? Number(text) : undefined;
+}
+
+function auditTextParam(value) {
+  const text = String(value || '').trim();
+  return text || undefined;
+}
+
+function auditDateParam(value) {
+  const text = String(value || '').trim();
+  if (!text) return undefined;
+  const dateOnly = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnly) {
+    const year = Number(dateOnly[1]);
+    const month = Number(dateOnly[2]);
+    const day = Number(dateOnly[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (
+      date.getUTCFullYear() === year &&
+      date.getUTCMonth() === month - 1 &&
+      date.getUTCDate() === day
+    ) {
+      return date.toISOString();
+    }
+    return undefined;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(text)) return undefined;
+  const date = new Date(text);
+  return !Number.isNaN(date.getTime()) && date.toISOString() === text ? text : undefined;
 }
 
 async function sendMailFromBody(body, user) {
@@ -473,26 +796,163 @@ function deliveryLogFromError(error) {
   }];
 }
 
+function runBackground(promise) {
+  promise.catch((error) => console.error(error));
+}
+
 async function handleRegister(req, res) {
   const body = await readJson(req);
   try {
-    const user = createUser({
+    const { user, accountToken } = createUserWithAccountToken({
       username: body.username,
       email: body.email,
-      password: body.password
-    });
-    return sendAuthSuccess(req, res, 201, user);
+      password: body.password,
+      status: 'pending_email'
+    }, emailVerificationPurpose, { ttlMinutes: 24 * 60 });
+    const emailResult = await sendVerificationEmail(user, accountToken.token);
+    return sendRegisterSuccess(req, res, user, emailResult);
   } catch (error) {
     if (isUniqueError(error)) return sendAuthError(req, res, 409, '用户名或邮箱已被注册。', '/register');
     return sendAuthError(req, res, 400, error.message || '注册失败。', '/register');
   }
 }
 
+async function handleResendVerification(req, res) {
+  const body = await readJson(req);
+  const user = getUserByLogin(body.email);
+  if (user?.status === 'pending_email') {
+    runBackground(createAndSendVerificationEmail(user));
+  }
+  return sendJson(res, 202, publicVerificationResendResponse());
+}
+
+async function handleForgotPassword(req, res) {
+  const body = await readJson(req);
+  const user = getUserByLogin(body.email);
+  if (user) runBackground(createAndSendPasswordResetEmail(user));
+  return sendJson(res, 202, publicForgotPasswordResponse());
+}
+
+async function handleResetPassword(req, res) {
+  const body = await readJson(req);
+  if (String(body.password || '').length < 8) return sendJson(res, 400, { error: '密码至少需要 8 位。' });
+  const consumed = consumeAccountToken(body.token, passwordResetPurpose);
+  if (!consumed) return sendJson(res, 400, { error: '重置链接无效或已过期。' });
+  updateUser(consumed.userId, { password: body.password });
+  return sendJson(res, 200, { message: '密码已重置，请使用新密码登录。' });
+}
+
+async function handleVerifyEmail(req, res, url) {
+  if ((req.method || 'GET') !== 'GET') return sendJson(res, 404, { error: 'Not found.' });
+  const token = String(url.searchParams.get('token') || '').trim();
+  if (!token) return sendJson(res, 400, { error: '验证链接无效或已过期。' });
+  const consumed = consumeAccountToken(token, emailVerificationPurpose);
+  if (!consumed) return sendJson(res, 400, { error: '验证链接无效或已过期。' });
+  const user = markUserEmailVerified(consumed.userId);
+  if (!user) return sendJson(res, 400, { error: '验证链接无效或已过期。' });
+  return sendJson(res, 200, {
+    user,
+    message: '邮箱验证成功，请等待管理员审核。'
+  });
+}
+
+async function createAndSendVerificationEmail(user) {
+  const settings = systemMailSettingsForSend();
+  if (!systemMailConfigured(settings)) return { ok: false, message: '系统邮件未配置。' };
+  invalidateAccountTokens(user.id, emailVerificationPurpose);
+  const accountToken = createAccountToken(user.id, emailVerificationPurpose, { ttlMinutes: 24 * 60 });
+  const result = await sendVerificationEmailWithSettings(user, accountToken.token, settings);
+  if (!result.ok) invalidateAccountTokens(user.id, emailVerificationPurpose);
+  return result;
+}
+
+async function createAndSendPasswordResetEmail(user) {
+  const settings = systemMailSettingsForSend();
+  if (!systemMailConfigured(settings)) return { ok: false, message: '系统邮件未配置。' };
+  invalidateAccountTokens(user.id, passwordResetPurpose);
+  const accountToken = createAccountToken(user.id, passwordResetPurpose, { ttlMinutes: 60 });
+  const result = await sendSystemEmail(settings, buildPasswordResetEmail({
+    appBaseUrl: settings.appBaseUrl,
+    to: user.email,
+    token: accountToken.token,
+    fromEmail: settings.fromEmail,
+    fromName: settings.fromName
+  }));
+  if (!result.ok) invalidateAccountTokens(user.id, passwordResetPurpose);
+  return result;
+}
+
+async function sendVerificationEmail(user, token) {
+  const settings = systemMailSettingsForSend();
+  if (!systemMailConfigured(settings)) {
+    return { ok: false, message: '系统邮件未配置。' };
+  }
+  return await sendVerificationEmailWithSettings(user, token, settings);
+}
+
+async function sendVerificationEmailWithSettings(user, token, settings) {
+  return await sendSystemEmail(settings, buildVerificationEmail({
+    appBaseUrl: settings.appBaseUrl,
+    to: user.email,
+    token,
+    fromEmail: settings.fromEmail,
+    fromName: settings.fromName
+  }));
+}
+
+function systemMailConfigured(settings) {
+  return Boolean(settings.host && extractAddress(settings.fromEmail));
+}
+
+function systemMailSettingsForSend() {
+  return {
+    ...getSystemEmailSettings({ includeSecret: true }),
+    appBaseUrl: runtimeSettings().appBaseUrl
+  };
+}
+
+function publicVerificationResendResponse() {
+  return {
+    message: '如果账号需要验证，我们会发送验证邮件。'
+  };
+}
+
+function publicForgotPasswordResponse() {
+  return {
+    message: '如果邮箱存在，我们会发送密码重置邮件。'
+  };
+}
+
+function verificationEmailResponse(result) {
+  return {
+    verificationEmailSent: Boolean(result.ok),
+    message: result.ok ? '验证邮件已发送。' : '验证邮件暂未发送，请稍后重试或联系管理员。',
+    result: {
+      ok: Boolean(result.ok),
+      message: result.message || '',
+      queueId: result.queueId || ''
+    }
+  };
+}
+
 async function handleLogin(req, res) {
   const body = await readJson(req);
-  const user = authenticateUser(body.username || body.email, body.password);
+  const user = verifyUserCredentials(body.username || body.email, body.password);
   if (!user) return sendAuthError(req, res, 401, '账号或密码不正确。', '/login');
+  if (user.status !== 'active') return sendAuthError(req, res, 403, loginStatusMessage(user.status), '/login');
   return sendAuthSuccess(req, res, 200, user);
+}
+
+function sendRegisterSuccess(req, res, user, emailResult = { ok: false }) {
+  const message = emailResult.ok
+    ? '注册成功，验证邮件已发送，请先验证邮箱，验证后等待管理员审核。'
+    : '注册成功，请先验证邮箱；验证邮件暂未发送，请联系管理员或稍后重试。';
+  if (wantsHtmlRedirect(req)) return redirect(res, `/login?error=${encodeURIComponent(message)}`, 303);
+  return sendJson(res, 201, {
+    user,
+    message,
+    verificationEmailSent: Boolean(emailResult.ok)
+  });
 }
 
 function sendAuthSuccess(req, res, status, user) {
@@ -509,6 +969,13 @@ function sendAuthSuccess(req, res, status, user) {
 function sendAuthError(req, res, status, message, fallbackPath) {
   if (wantsHtmlRedirect(req)) return redirect(res, `${fallbackPath}?error=${encodeURIComponent(message)}`, 303);
   return sendJson(res, status, { error: message });
+}
+
+function loginStatusMessage(status) {
+  if (status === 'pending_email') return '请先验证邮箱。';
+  if (status === 'pending_review') return '账号正在等待管理员审核。';
+  if (status === 'disabled') return '账号已被禁用。';
+  return '账号或密码不正确。';
 }
 
 function handleLogout(res) {
@@ -766,12 +1233,21 @@ function isUniqueError(error) {
 
 function isLoginAsset(pathname) {
   return pathname.startsWith('/assets/')
-    || ['/login', '/register', '/login.html', '/login.css', '/login.js'].includes(pathname);
+    || [
+      '/login',
+      '/register',
+      '/forgot-password',
+      '/resend-verification',
+      '/reset-password',
+      '/login.html',
+      '/login.css',
+      '/login.js'
+    ].includes(pathname);
 }
 
 function resolveStaticPathname(pathname) {
   if (pathname === '/') return '/index.html';
-  if (pathname === '/login' || pathname === '/register') return '/login.html';
+  if (['/login', '/register', '/forgot-password', '/resend-verification', '/reset-password'].includes(pathname)) return '/login.html';
   return pathname;
 }
 

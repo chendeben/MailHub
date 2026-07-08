@@ -6,16 +6,34 @@ export type ViewKey =
   | 'tokens'
   | 'logs'
   | 'webhooks'
+  | 'admin'
   | 'settings';
 
 export type DomainMode = 'list' | 'detail';
+export type UserStatus = 'pending_email' | 'pending_review' | 'active' | 'disabled';
+export type UserRole = 'admin' | 'user';
+
+export interface UserResourceCounts {
+  domains: number;
+  dnsCredentials: number;
+  apiTokens: number;
+  sendEvents: number;
+  smtpCredential: number;
+}
 
 export interface User {
   id: number;
   username: string;
   email: string;
-  role: 'admin' | 'user';
-  status: 'active' | 'disabled';
+  role: UserRole;
+  status: UserStatus;
+  createdAt?: string;
+  updatedAt?: string;
+  resourceCounts?: UserResourceCounts;
+}
+
+export interface AdminUser extends User {
+  resourceCounts: UserResourceCounts;
 }
 
 export interface RuntimeConfig {
@@ -92,24 +110,110 @@ export interface Domain {
 
 export interface DnsCredential {
   id: number;
+  userId?: number;
   name: string;
   provider: 'cloudflare' | 'aliyun' | 'dnspod' | string;
   zoneName: string;
   defaultTtl: number;
+  credentialSet?: boolean;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface SmtpCredential {
   id?: number;
+  userId?: number;
   username: string;
   password?: string;
   passwordSet?: boolean;
+  passwordRecoverable?: boolean;
+  createdAt?: string;
   updatedAt?: string;
+}
+
+export interface SystemEmailSettings {
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  password?: string;
+  passwordSet: boolean;
+  helo: string;
+  fromEmail: string;
+  fromName: string;
+  testRecipient: string;
+}
+
+export interface AdminResourceInventory {
+  users: AdminUserResourceGroup[];
+  warnings: Array<{
+    type: 'domain_dns_credential_owner_mismatch' | string;
+    domainId: number;
+    domain: string;
+    domainUserId: number;
+    dnsCredentialId: number;
+    dnsCredentialUserId: number;
+  }>;
+}
+
+export interface AdminUserResourceGroup {
+  user: AdminUser;
+  domains: Domain[];
+  dnsCredentials: DnsCredential[];
+  smtpCredential: SmtpCredential | null;
+  apiTokens: ApiToken[];
+  sendEventCount: number;
+}
+
+export interface UserMergeOptions {
+  transferDomains: boolean;
+  transferDnsCredentials: boolean;
+  transferApiTokens: boolean;
+  transferSendEvents: boolean;
+  transferSmtpCredential: boolean;
+  disableSource: boolean;
+}
+
+export interface UserMergePreview {
+  sourceUser: User;
+  targetUser: User;
+  confirmationText: string;
+  counts: UserResourceCounts;
+  selectedCounts: UserResourceCounts;
+  defaultOptions: UserMergeOptions;
+  resources: {
+    source: Omit<AdminUserResourceGroup, 'user'>;
+    target: Omit<AdminUserResourceGroup, 'user'>;
+  };
+  smtp: {
+    sourceCredential: SmtpCredential | null;
+    targetCredential: SmtpCredential | null;
+    conflict: boolean;
+  };
+  warnings: Array<{ type: string; message?: string }>;
+}
+
+export interface UserMergeResult {
+  sourceUser: User;
+  targetUser: User;
+  counts: UserResourceCounts;
+  warnings: UserMergePreview['warnings'];
+}
+
+export interface AuditLogEntry {
+  id: number;
+  actorUserId: number | null;
+  action: string;
+  targetType: string;
+  targetId: string;
+  targetUserId: number | null;
+  summary: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface ApiToken {
   id: number;
+  userId?: number;
   name: string;
   tokenPrefix: string;
   token?: string;

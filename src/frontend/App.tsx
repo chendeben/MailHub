@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { AddDomainDrawer } from '../components/domain/AddDomainDrawer';
 import { AdminLayout } from '../layouts/AdminLayout';
+import AdminPage from '../pages/Admin';
 import ApiTokens from '../pages/ApiTokens';
 import Dashboard from '../pages/Dashboard';
 import DnsApi from '../pages/DnsApi';
@@ -50,6 +51,7 @@ const viewTitleKeys: Record<ViewKey, string> = {
   tokens: 'nav.tokens',
   logs: 'nav.logs',
   webhooks: 'nav.webhooks',
+  admin: 'nav.admin',
   settings: 'nav.settings'
 };
 
@@ -476,6 +478,9 @@ function MailHubConsole() {
     }
     if (activeView === 'logs') {
       return <SendingLogs events={data.events} domains={data.domains} onCopy={copy} />;
+    }
+    if (activeView === 'admin') {
+      return <AdminPage me={data.me} />;
     }
     if (activeView === 'settings') {
       return (

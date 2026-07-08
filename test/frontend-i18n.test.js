@@ -25,6 +25,8 @@ test('translates known UI keys and falls back safely', () => {
   assert.equal(en('common.refresh'), 'Refresh');
   assert.equal(zh('auth.loginTitle'), '登录控制台');
   assert.equal(en('auth.loginTitle'), 'Sign in to console');
+  assert.equal(zh('auth.forgotPassword'), '忘记密码？');
+  assert.equal(en('auth.resetPasswordTitle'), 'Reset password');
   assert.equal(en('missing.translation.key'), 'missing.translation.key');
 });
 
@@ -38,5 +40,17 @@ test('uses localized Chinese labels for the main navigation', () => {
   assert.equal(zh('nav.tokens'), 'API Token');
   assert.equal(zh('nav.logs'), '发送记录');
   assert.equal(zh('nav.webhooks'), 'Webhooks');
+  assert.equal(zh('nav.admin'), '管理员');
   assert.equal(zh('nav.settings'), '系统设置');
+});
+
+test('translates admin panel labels', () => {
+  const zh = createTranslator('zh-CN');
+  const en = createTranslator('en-US');
+
+  assert.equal(zh('admin.title'), '管理员面板');
+  assert.equal(zh('admin.users'), '用户');
+  assert.equal(zh('admin.resources'), '资源');
+  assert.equal(zh('admin.auditLogs'), '审计日志');
+  assert.equal(en('admin.title'), 'Admin Panel');
 });
