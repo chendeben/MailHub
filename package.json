@@ -38,7 +38,7 @@
   "dependencies": {
     "@ant-design/icons": "^6.3.2",
     "@ant-design/plots": "^2.6.8",
-    "antd": "^5.29.3",
+    "antd": "^6.5.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
