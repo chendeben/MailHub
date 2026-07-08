@@ -133,6 +133,33 @@ test('dnspod provider signs and sends create record actions', async () => {
   assert.ok(actions.includes('CreateRecord'));
 });
 
+test('dnspod provider treats empty record list responses as no existing records', async () => {
+  const actions = [];
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(String(url), 'https://dnspod.tencentcloudapi.com');
+    actions.push(options.headers['X-TC-Action']);
+    if (options.headers['X-TC-Action'] === 'DescribeRecordList') {
+      return json({
+        Response: {
+          Error: {
+            Code: 'FailedOperation.RecordListEmpty',
+            Message: '记录列表为空。'
+          }
+        }
+      });
+    }
+    return json({ Response: { RecordId: 123 } });
+  };
+
+  const result = await applyDnsSetup(domainFixture(), dnspodCredential(), {
+    records: [{ key: 'dkim', host: 'mh._domainkey.example.com', type: 'TXT', value: 'v=DKIM1; k=rsa; p=abc' }]
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].detail, 'created');
+  assert.ok(actions.includes('CreateRecord'));
+});
+
 test('dnspod one-click dns falls back to parent zone for subdomain sending domains', async () => {
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {

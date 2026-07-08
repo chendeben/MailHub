@@ -363,6 +363,9 @@ class DnspodProvider {
     if (!response.ok || data.Response?.Error) {
       const error = new Error(data.Response?.Error?.Message || `Tencent Cloud HTTP ${response.status}`);
       error.code = data.Response?.Error?.Code || '';
+      if (action === 'DescribeRecordList' && isDnsPodEmptyRecordListError(error)) {
+        return { RecordList: [] };
+      }
       throw error;
     }
     return data.Response;
@@ -443,6 +446,13 @@ function isDnsPodZoneMissingError(error) {
   const message = String(error?.message || '');
   return /NoDataOfRecord|ResourceNotFound|DomainNotExists|InvalidParameter\.Domain/i.test(code)
     || /domain not found|domain does not exist|域名.*(不存在|没有)|没有.*域名/i.test(message);
+}
+
+function isDnsPodEmptyRecordListError(error) {
+  const code = String(error?.code || '');
+  const message = String(error?.message || '');
+  return /RecordListEmpty/i.test(code)
+    || /记录列表为空|record list.*empty|empty record list/i.test(message);
 }
 
 function isAliyunZoneMissingError(error) {
