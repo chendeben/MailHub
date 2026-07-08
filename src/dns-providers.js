@@ -114,8 +114,10 @@ class CloudflareProvider {
   async resolveZoneName(record, domain) {
     const host = record?.host || '';
     const domainName = domain?.domain || '';
-    if (this.zoneName && (!host || isHostInZone(host, this.zoneName))) return this.zoneName;
-    const candidates = cloudflareZoneCandidates(domainName || host);
+    const candidates = uniqueZoneCandidates([
+      this.zoneName,
+      ...zoneCandidates(domainName || host)
+    ]).filter((candidate) => !host || isHostInZone(host, candidate));
     for (const candidate of candidates) {
       const zoneId = await this.lookupZoneId(candidate, { optional: true });
       if (zoneId) return candidate;
@@ -172,9 +174,10 @@ class AliyunProvider {
     return response.DomainRecords?.Record?.length >= 0 ? this.zoneName : 'ok';
   }
 
-  async upsert(record) {
-    const rr = relativeName(record.host, this.zoneName);
-    const existing = await this.listRecords(record.type, rr);
+  async upsert(record, domain) {
+    const zoneName = await this.resolveZoneName(record, domain);
+    const rr = relativeName(record.host, zoneName);
+    const existing = await this.listRecords(zoneName, record.type, rr);
     const match = pickExisting(record, existing);
     const params = {
       RR: rr,
@@ -184,23 +187,23 @@ class AliyunProvider {
     };
     if (match) {
       await this.request('UpdateDomainRecord', { ...params, RecordId: match.id });
-      await this.deleteExtras(existing, match, record);
+      await this.deleteExtras(zoneName, existing, match, record);
       return 'updated';
     }
-    await this.request('AddDomainRecord', { DomainName: this.zoneName, ...params });
-    await this.deleteExtras(existing, null, record);
+    await this.request('AddDomainRecord', { DomainName: zoneName, ...params });
+    await this.deleteExtras(zoneName, existing, null, record);
     return 'created';
   }
 
-  async deleteExtras(records, kept, desired) {
+  async deleteExtras(zoneName, records, kept, desired) {
     if (!['spf', 'dmarc'].includes(desired.key)) return;
     const extras = records.filter((record) => record.id !== kept?.id && recordMatchesKind(desired, record.value));
     for (const record of extras) await this.request('DeleteDomainRecord', { RecordId: record.id });
   }
 
-  async listRecords(type, rr) {
+  async listRecords(zoneName, type, rr) {
     const response = await this.request('DescribeDomainRecords', {
-      DomainName: this.zoneName,
+      DomainName: zoneName,
       RRKeyWord: rr === '@' ? '' : rr,
       TypeKeyWord: type,
       PageSize: 100
@@ -213,6 +216,24 @@ class AliyunProvider {
         name: record.RR,
         value: record.Value
       }));
+  }
+
+  async resolveZoneName(record, domain) {
+    const host = record?.host || '';
+    const candidates = uniqueZoneCandidates([
+      this.zoneName,
+      ...zoneCandidates(domain?.domain || host)
+    ]).filter((candidate) => isHostInZone(host, candidate));
+    for (const candidate of candidates) {
+      const rr = relativeName(host, candidate);
+      try {
+        await this.listRecords(candidate, record.type, rr);
+        return candidate;
+      } catch (error) {
+        if (!isAliyunZoneMissingError(error)) throw error;
+      }
+    }
+    return this.zoneName;
   }
 
   async request(action, params) {
@@ -233,7 +254,11 @@ class AliyunProvider {
     const signed = signAliyun({ ...common, ...params }, this.credentials.accessKeySecret);
     const response = await fetch(`${ALIYUN_ENDPOINT}?${signed}`);
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.Code) throw new Error(data.Message || data.Code || `Aliyun HTTP ${response.status}`);
+    if (!response.ok || data.Code) {
+      const error = new Error(data.Message || data.Code || `Aliyun HTTP ${response.status}`);
+      error.code = data.Code || '';
+      throw error;
+    }
     return data;
   }
 }
@@ -251,12 +276,13 @@ class DnspodProvider {
     return this.zoneName;
   }
 
-  async upsert(record) {
-    const subDomain = relativeName(record.host, this.zoneName);
-    const existing = await this.listRecords(record.type, subDomain);
+  async upsert(record, domain) {
+    const zoneName = await this.resolveZoneName(record, domain);
+    const subDomain = relativeName(record.host, zoneName);
+    const existing = await this.listRecords(zoneName, record.type, subDomain);
     const match = pickExisting(record, existing);
     const params = {
-      Domain: this.zoneName,
+      Domain: zoneName,
       SubDomain: subDomain,
       RecordType: record.type,
       RecordLine: '默认',
@@ -265,25 +291,25 @@ class DnspodProvider {
     };
     if (match) {
       await this.request('ModifyRecord', { ...params, RecordId: Number(match.id) });
-      await this.deleteExtras(existing, match, record);
+      await this.deleteExtras(zoneName, existing, match, record);
       return 'updated';
     }
     await this.request('CreateRecord', params);
-    await this.deleteExtras(existing, null, record);
+    await this.deleteExtras(zoneName, existing, null, record);
     return 'created';
   }
 
-  async deleteExtras(records, kept, desired) {
+  async deleteExtras(zoneName, records, kept, desired) {
     if (!['spf', 'dmarc'].includes(desired.key)) return;
     const extras = records.filter((record) => record.id !== kept?.id && recordMatchesKind(desired, record.value));
     for (const record of extras) {
-      await this.request('DeleteRecord', { Domain: this.zoneName, RecordId: Number(record.id) });
+      await this.request('DeleteRecord', { Domain: zoneName, RecordId: Number(record.id) });
     }
   }
 
-  async listRecords(type, subDomain) {
+  async listRecords(zoneName, type, subDomain) {
     const response = await this.request('DescribeRecordList', {
-      Domain: this.zoneName,
+      Domain: zoneName,
       Subdomain: subDomain,
       RecordType: type,
       Limit: 100
@@ -296,6 +322,24 @@ class DnspodProvider {
         name: record.Name,
         value: record.Value
       }));
+  }
+
+  async resolveZoneName(record, domain) {
+    const host = record?.host || '';
+    const candidates = uniqueZoneCandidates([
+      this.zoneName,
+      ...zoneCandidates(domain?.domain || host)
+    ]).filter((candidate) => isHostInZone(host, candidate));
+    for (const candidate of candidates) {
+      const subDomain = relativeName(host, candidate);
+      try {
+        await this.listRecords(candidate, record.type, subDomain);
+        return candidate;
+      } catch (error) {
+        if (!isDnsPodZoneMissingError(error)) throw error;
+      }
+    }
+    return this.zoneName;
   }
 
   async request(action, payload) {
@@ -317,7 +361,9 @@ class DnspodProvider {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.Response?.Error) {
-      throw new Error(data.Response?.Error?.Message || `Tencent Cloud HTTP ${response.status}`);
+      const error = new Error(data.Response?.Error?.Message || `Tencent Cloud HTTP ${response.status}`);
+      error.code = data.Response?.Error?.Code || '';
+      throw error;
     }
     return data.Response;
   }
@@ -370,7 +416,7 @@ function normalizeZoneName(value) {
   return String(value || '').replace(/\.$/, '').toLowerCase();
 }
 
-function cloudflareZoneCandidates(name) {
+function zoneCandidates(name) {
   const clean = normalizeZoneName(name);
   const parts = clean.split('.').filter(Boolean);
   const candidates = [];
@@ -378,6 +424,32 @@ function cloudflareZoneCandidates(name) {
     candidates.push(parts.slice(index).join('.'));
   }
   return candidates;
+}
+
+function uniqueZoneCandidates(candidates) {
+  const seen = new Set();
+  const output = [];
+  for (const candidate of candidates) {
+    const clean = normalizeZoneName(candidate);
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    output.push(clean);
+  }
+  return output;
+}
+
+function isDnsPodZoneMissingError(error) {
+  const code = String(error?.code || '');
+  const message = String(error?.message || '');
+  return /NoDataOfRecord|ResourceNotFound|DomainNotExists|InvalidParameter\.Domain/i.test(code)
+    || /domain not found|domain does not exist|域名.*(不存在|没有)|没有.*域名/i.test(message);
+}
+
+function isAliyunZoneMissingError(error) {
+  const code = String(error?.code || '');
+  const message = String(error?.message || '');
+  return /InvalidDomainName|DomainRecordNotBelongToUser|DomainNotExists|DomainNameNotFound/i.test(code)
+    || /domain not found|domain does not exist|域名.*(不存在|没有)|没有.*域名/i.test(message);
 }
 
 function outOfZoneResult(record, zoneName) {

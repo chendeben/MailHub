@@ -13,6 +13,7 @@ import SendingLogs from '../pages/SendingLogs';
 import Settings from '../pages/Settings';
 import SmtpCredentials from '../pages/SmtpCredentials';
 import { I18nProvider, useI18n } from './i18n/react';
+import { buildDnsApplyFeedback } from './domain-model.js';
 import { api } from './services/api';
 import './styles.css';
 import type {
@@ -201,7 +202,18 @@ function MailHubConsole() {
   }
 
   async function applyDns(domain: Domain) {
-    const result = await runAction(async () => api.applyDns(domain.id), t('actions.dnsApplyCompleted'));
+    const result = await runAction(async () => api.applyDns(domain.id));
+    if (result) {
+      const feedback = buildDnsApplyFeedback(result.apply, {
+        completed: t('actions.dnsApplyCompleted'),
+        partial: t('actions.dnsApplyPartial')
+      });
+      if (feedback.type === 'warning') {
+        message.warning(feedback.message);
+      } else {
+        message.success(feedback.message);
+      }
+    }
     if (result?.domain) {
       replaceDomain(result.domain);
       setInitialDomainTab('dns');

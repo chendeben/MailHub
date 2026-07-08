@@ -65,6 +65,53 @@ test('aliyun provider signs and sends create/update record actions', async () =>
   assert.ok(actions.includes('UpdateDomainRecord'));
 });
 
+test('aliyun one-click dns falls back to parent zone for subdomain sending domains', async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const params = new URL(String(url)).searchParams;
+    calls.push({
+      action: params.get('Action'),
+      domainName: params.get('DomainName'),
+      rr: params.get('RR')
+    });
+    if (params.get('DomainName') === 'notify.example.com') {
+      return json({
+        Code: 'InvalidDomainName.NoExist',
+        Message: 'domain not found'
+      });
+    }
+    if (params.get('Action') === 'DescribeDomainRecords') {
+      return json({ DomainRecords: { Record: [] } });
+    }
+    return json({});
+  };
+
+  const result = await applyDnsSetup(
+    { ...domainFixture(), domain: 'notify.example.com', senderHost: 'smtp.example.com' },
+    { ...aliyunCredential(), zoneName: 'notify.example.com' },
+    {
+      records: [
+        {
+          key: 'verification',
+          host: '_mailhub.notify.example.com',
+          type: 'TXT',
+          value: 'mailhub-verification=token',
+          status: 'missing'
+        }
+      ]
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call.action === 'DescribeDomainRecords' && call.domainName === 'notify.example.com'));
+  assert.ok(calls.some((call) => call.action === 'DescribeDomainRecords' && call.domainName === 'example.com'));
+  assert.ok(calls.some((call) => (
+    call.action === 'AddDomainRecord'
+    && call.domainName === 'example.com'
+    && call.rr === '_mailhub.notify'
+  )));
+});
+
 test('dnspod provider signs and sends create record actions', async () => {
   const actions = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -84,6 +131,54 @@ test('dnspod provider signs and sends create record actions', async () => {
 
   assert.equal(result.ok, true);
   assert.ok(actions.includes('CreateRecord'));
+});
+
+test('dnspod one-click dns falls back to parent zone for subdomain sending domains', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(String(url), 'https://dnspod.tencentcloudapi.com');
+    const payload = JSON.parse(options.body);
+    calls.push({ action: options.headers['X-TC-Action'], payload });
+    if (payload.Domain === 'notify.example.com') {
+      return json({
+        Response: {
+          Error: {
+            Code: 'ResourceNotFound.NoDataOfRecord',
+            Message: 'domain not found'
+          }
+        }
+      });
+    }
+    if (options.headers['X-TC-Action'] === 'DescribeRecordList') {
+      return json({ Response: { RecordList: [] } });
+    }
+    return json({ Response: { RecordId: 123 } });
+  };
+
+  const result = await applyDnsSetup(
+    { ...domainFixture(), domain: 'notify.example.com', senderHost: 'smtp.example.com' },
+    { ...dnspodCredential(), zoneName: 'notify.example.com' },
+    {
+      records: [
+        {
+          key: 'verification',
+          host: '_mailhub.notify.example.com',
+          type: 'TXT',
+          value: 'mailhub-verification=token',
+          status: 'missing'
+        }
+      ]
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call.action === 'DescribeRecordList' && call.payload.Domain === 'notify.example.com'));
+  assert.ok(calls.some((call) => call.action === 'DescribeRecordList' && call.payload.Domain === 'example.com'));
+  assert.ok(calls.some((call) => (
+    call.action === 'CreateRecord'
+    && call.payload.Domain === 'example.com'
+    && call.payload.SubDomain === '_mailhub.notify'
+  )));
 });
 
 test('one-click dns setup only applies records under the user domain zone', async () => {
@@ -186,6 +281,43 @@ test('cloudflare one-click dns discovers the parent zone for subdomain sending d
   assert.equal(result.ok, true);
   assert.equal(result.results[0].ok, true);
   assert.ok(calls.some((call) => call.url.includes('/zones?name=sender.example.com')));
+  assert.ok(calls.some((call) => call.url.includes('/zones?name=example.com')));
+  assert.ok(calls.some((call) => call.method === 'POST' && call.url.includes('/zones/zone-example/dns_records')));
+});
+
+test('cloudflare one-click dns falls back from configured child zone to parent zone', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), method: options.method || 'GET' });
+    if (String(url).includes('/zones?name=notify.example.com')) {
+      return json({ success: true, result: [] });
+    }
+    if (String(url).includes('/zones?name=example.com')) {
+      return json({ success: true, result: [{ id: 'zone-example', name: 'example.com' }] });
+    }
+    if (String(url).includes('/dns_records?')) return json({ success: true, result: [] });
+    return json({ success: true, result: { id: 'ok' } });
+  };
+
+  const result = await applyDnsSetup(
+    { ...domainFixture(), domain: 'notify.example.com', senderHost: 'smtp.example.com' },
+    { ...cloudflareCredential(), zoneName: 'notify.example.com' },
+    {
+      records: [
+        {
+          key: 'verification',
+          host: '_mailhub.notify.example.com',
+          type: 'TXT',
+          value: 'mailhub-verification=token',
+          status: 'missing'
+        }
+      ]
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].ok, true);
+  assert.ok(calls.some((call) => call.url.includes('/zones?name=notify.example.com')));
   assert.ok(calls.some((call) => call.url.includes('/zones?name=example.com')));
   assert.ok(calls.some((call) => call.method === 'POST' && call.url.includes('/zones/zone-example/dns_records')));
 });

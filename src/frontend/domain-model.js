@@ -48,6 +48,19 @@ export function isDomainVerified(domain = {}) {
   return Boolean(domain.status?.verified) || buildDomainHealth(domain).status === 'success';
 }
 
+export function buildDnsApplyFeedback(apply, messages = {}) {
+  const completed = messages.completed || 'DNS 写入请求已完成';
+  const partial = messages.partial || 'DNS 写入部分失败';
+  if (!apply || apply.ok) return { type: 'success', message: completed };
+
+  const failed = Array.isArray(apply.results) ? apply.results.filter((result) => !result.ok) : [];
+  const firstError = failed.find((result) => result.error)?.error || '';
+  return {
+    type: 'warning',
+    message: firstError ? `${partial}：${firstError}` : partial
+  };
+}
+
 export function getDnsRecordOrder() {
   return [...REQUIRED_DNS_KEYS];
 }
