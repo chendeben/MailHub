@@ -1,4 +1,4 @@
-import { App as AntApp, ConfigProvider, Form, Input, Modal } from 'antd';
+import { App as AntApp, ConfigProvider, Form, Input, Modal, Select } from 'antd';
 import { useEffect, useMemo, useState } from 'react';
 
 import { AddDomainDrawer } from '../components/domain/AddDomainDrawer';
@@ -26,6 +26,8 @@ import type {
   DomainMode,
   DomainPatchPayload,
   RuntimeConfig,
+  SmtpRelay,
+  SmtpRelayPayload,
   User,
   ViewKey
 } from './types';
@@ -37,6 +39,7 @@ const emptyData: AppData = {
   events: [],
   analytics: null,
   smtpCredential: null,
+  smtpRelays: [],
   dnsCredentials: [],
   apiTokens: [],
   settings: null,
@@ -109,12 +112,13 @@ function MailHubConsole() {
     setLoading(true);
     try {
       const me = await api.me();
-      const [config, domains, events, analytics, smtpCredential, dnsCredentials, apiTokens] = await Promise.all([
+      const [config, domains, events, analytics, smtpCredential, smtpRelays, dnsCredentials, apiTokens] = await Promise.all([
         api.config(),
         api.domains(),
         api.events(),
         api.analytics(30),
         api.smtpCredential(),
+        api.smtpRelays(),
         api.dnsCredentials(),
         api.apiTokens()
       ]);
@@ -132,6 +136,7 @@ function MailHubConsole() {
         events: events.events || [],
         analytics: analytics.analytics || null,
         smtpCredential: smtpCredential.credential || null,
+        smtpRelays: smtpRelays.relays || [],
         dnsCredentials: dnsCredentials.credentials || [],
         apiTokens: apiTokens.tokens || [],
         settings,
@@ -243,7 +248,8 @@ function MailHubConsole() {
     testForm.setFieldsValue({
       from: `noreply@${domain.domain}`,
       subject: `MailHub test for ${domain.domain}`,
-      text: `This is a MailHub test message from ${domain.domain}.`
+      text: `This is a MailHub test message from ${domain.domain}.`,
+      smtpRelayId: domain.smtpRelayId || undefined
     });
   }
 
@@ -306,6 +312,36 @@ function MailHubConsole() {
     }));
   }
 
+  async function loadSmtpRelay(id: number) {
+    const result = await runAction(async () => api.smtpRelay(id));
+    return result?.relay || null;
+  }
+
+  async function saveSmtpRelay(values: SmtpRelayPayload, id?: number) {
+    const result = await runAction(
+      async () => api.saveSmtpRelay(values, id),
+      id ? t('actions.smtpRelayUpdated') : t('actions.smtpRelayCreated')
+    );
+    if (!result?.relay) return null;
+    setData((current) => ({
+      ...current,
+      smtpRelays: id
+        ? current.smtpRelays.map((item) => item.id === id ? result.relay : item)
+        : [result.relay, ...current.smtpRelays]
+    }));
+    return result.relay;
+  }
+
+  async function deleteSmtpRelay(relay: SmtpRelay) {
+    const result = await runAction(async () => api.deleteSmtpRelay(relay.id), t('actions.smtpRelayDeleted'));
+    if (!result?.deleted) return;
+    setData((current) => ({
+      ...current,
+      smtpRelays: current.smtpRelays.filter((item) => item.id !== relay.id),
+      domains: current.domains.map((domain) => domain.smtpRelayId === relay.id ? { ...domain, smtpRelayId: null } : domain)
+    }));
+  }
+
   async function createApiToken(name: string) {
     const result = await runAction(async () => api.createApiToken(name), t('tokens.createdSuccess'));
     if (!result?.token) return null;
@@ -364,6 +400,7 @@ function MailHubConsole() {
         loading={actionLoading}
         config={data.config}
         dnsCredentials={data.dnsCredentials}
+        smtpRelays={data.smtpRelays}
         onClose={() => setAddOpen(false)}
         onSubmit={createDomain}
       />
@@ -386,6 +423,16 @@ function MailHubConsole() {
           </Form.Item>
           <Form.Item name="text" label="Text">
             <Input.TextArea rows={5} />
+          </Form.Item>
+          <Form.Item name="smtpRelayId" label={t('smtpRelay.domainDefault')}>
+            <Select
+              allowClear
+              placeholder={t('smtpRelay.useResolutionOrder')}
+              options={data.smtpRelays.map((relay) => ({
+                value: relay.id,
+                label: relayLabel(relay, t)
+              }))}
+            />
           </Form.Item>
         </Form>
       </Modal>
@@ -415,6 +462,7 @@ function MailHubConsole() {
             apiTokens={data.apiTokens}
             events={data.events}
             dnsCredentials={data.dnsCredentials}
+            smtpRelays={data.smtpRelays}
             actionLoading={actionLoading}
             initialTab={initialDomainTab}
             onBack={() => setDomainMode('list')}
@@ -458,9 +506,13 @@ function MailHubConsole() {
         <SmtpCredentials
           config={data.config}
           credential={data.smtpCredential}
+          relays={data.smtpRelays}
           loading={actionLoading}
           onCopy={copy}
           onSave={saveSmtpCredential}
+          onLoadRelay={loadSmtpRelay}
+          onSaveRelay={saveSmtpRelay}
+          onDeleteRelay={deleteSmtpRelay}
         />
       );
     }
@@ -495,4 +547,8 @@ function MailHubConsole() {
     }
     return <PlaceholderPage title={t(viewTitleKeys[activeView])} />;
   }
+}
+
+function relayLabel(relay: SmtpRelay, t: (key: string) => string) {
+  return `${relay.name}${relay.isDefault ? ` · ${t('smtpRelay.default')}` : ''} · ${relay.host}:${relay.port}`;
 }

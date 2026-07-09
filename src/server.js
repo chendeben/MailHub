@@ -23,6 +23,8 @@ import {
   getDomainByName,
   getSendAnalytics,
   getSettings,
+  getDefaultSmtpRelay,
+  getSmtpRelay,
   getSmtpCredential,
   getSystemEmailSettings,
   getUser,
@@ -34,6 +36,7 @@ import {
   listDnsCredentials,
   listDomains,
   listSendEvents,
+  listSmtpRelays,
   listUsersWithResourceCounts,
   logAudit,
   logSendEvent,
@@ -42,10 +45,12 @@ import {
   saveDnsCredential,
   saveDomainStatus,
   saveSettings,
+  saveSmtpRelay,
   saveSmtpCredential,
   saveSystemEmailSettings,
   seedAdminUser,
   seedSmtpCredential,
+  deleteSmtpRelay,
   transferApiTokens,
   transferDnsCredential,
   transferDomain,
@@ -216,12 +221,17 @@ async function handleApi(req, res, url, user) {
     if (dnsCredentialId && !getDnsCredential(dnsCredentialId, user.id)) {
       return sendJson(res, 400, { error: 'DNS 凭据不存在。' });
     }
+    const smtpRelayId = Number(body.smtpRelayId || 0) || null;
+    if (smtpRelayId && !getSmtpRelay(smtpRelayId, user.id)) {
+      return sendJson(res, 400, { error: 'SMTP 出口不存在。' });
+    }
     const keys = createDkimKeyPair();
     try {
       const row = createDomain(user.id, {
         domain,
         selector,
         dnsCredentialId,
+        smtpRelayId,
         verificationToken: crypto.randomBytes(18).toString('hex'),
         dkimPublic: keys.publicKey,
         dkimPrivate: keys.privateKey,
@@ -259,8 +269,37 @@ async function handleApi(req, res, url, user) {
     }
     return sendJson(res, 200, { credential: getSmtpCredential(user.id, { includePassword: true }) });
   }
+  if (method === 'GET' && pathname === '/api/smtp-relays') {
+    return sendJson(res, 200, { relays: listSmtpRelays(user.id) });
+  }
+  if (method === 'POST' && pathname === '/api/smtp-relays') {
+    const body = await readJson(req);
+    const relay = saveSmtpRelay(user.id, smtpRelayPatch(body));
+    return sendJson(res, 201, { relay });
+  }
+  const smtpRelayMatch = pathname.match(/^\/api\/smtp-relays\/(\d+)$/);
+  if (smtpRelayMatch) {
+    const id = Number(smtpRelayMatch[1]);
+    if (method === 'GET') {
+      const relay = getSmtpRelay(id, user.id, { includePassword: true });
+      return sendJson(res, relay ? 200 : 404, { relay });
+    }
+    if (method === 'PATCH' || method === 'PUT') {
+      const body = await readJson(req);
+      const relay = saveSmtpRelay(user.id, { ...smtpRelayPatch(body), id });
+      return sendJson(res, relay ? 200 : 404, { relay });
+    }
+    if (method === 'DELETE') {
+      const deleted = deleteSmtpRelay(id, user.id);
+      return sendJson(res, deleted ? 200 : 404, { deleted });
+    }
+  }
   if (method === 'POST' && pathname === '/api/send') {
     const body = await readJson(req);
+    const smtpRelayId = Number(body.smtpRelayId || 0) || null;
+    if (smtpRelayId && !getSmtpRelay(smtpRelayId, user.id)) {
+      return sendJson(res, 400, { error: 'SMTP 出口不存在。' });
+    }
     const result = await sendMailFromBody(body, user);
     return sendJson(res, 202, result);
   }
@@ -326,9 +365,14 @@ async function handleApi(req, res, url, user) {
       if (dnsCredentialId && !getDnsCredential(dnsCredentialId, user.id)) {
         return sendJson(res, 400, { error: 'DNS 凭据不存在。' });
       }
+      const smtpRelayId = body.smtpRelayId !== undefined ? Number(body.smtpRelayId || 0) || null : undefined;
+      if (smtpRelayId && !getSmtpRelay(smtpRelayId, user.id)) {
+        return sendJson(res, 400, { error: 'SMTP 出口不存在。' });
+      }
       const row = updateDomain(id, user.id, {
         selector: body.selector ? normalizeSelector(body.selector) : undefined,
         dnsCredentialId,
+        smtpRelayId,
         senderHost: body.senderHost ? normalizeHostname(body.senderHost) : undefined,
         sendingIp: body.sendingIp !== undefined ? String(body.sendingIp).trim() : undefined,
         spfExtra: body.spfExtra !== undefined ? String(body.spfExtra).trim() : undefined,
@@ -378,12 +422,17 @@ async function handleApi(req, res, url, user) {
       const row = getDomain(id, { userId: user.id });
       if (!row) return sendJson(res, 404, { error: '域名不存在。' });
       const body = await readJson(req);
+      const smtpRelayId = Number(body.smtpRelayId || 0) || null;
+      if (smtpRelayId && !getSmtpRelay(smtpRelayId, user.id)) {
+        return sendJson(res, 400, { error: 'SMTP 出口不存在。' });
+      }
       const from = body.from || `noreply@${row.domain}`;
       const result = await sendMailFromBody({
         from,
         to: body.to,
         subject: body.subject || `MailHub test for ${row.domain}`,
-        text: body.text || `This is a MailHub test message from ${row.domain}.`
+        text: body.text || `This is a MailHub test message from ${row.domain}.`,
+        smtpRelayId: body.smtpRelayId
       }, user);
       return sendJson(res, 202, result);
     }
@@ -746,14 +795,15 @@ async function sendMailFromBody(body, user) {
     baseUrl: settings.appBaseUrl
   });
   const signed = signMessageForDomain(rawMessage, domain);
+  const smtpTransport = smtpTransportForSend(body, domain, user);
   try {
     const smtpResult = await sendViaSmtp({
-      host: envConfig.smtpHost,
-      port: envConfig.smtpPort,
-      secure: envConfig.smtpSecure,
-      username: envConfig.smtpUser,
-      password: envConfig.smtpPassword,
-      helo: envConfig.smtpHelo,
+      host: smtpTransport.host,
+      port: smtpTransport.port,
+      secure: smtpTransport.secure,
+      username: smtpTransport.username,
+      password: smtpTransport.password,
+      helo: smtpTransport.helo,
       mailFrom: from,
       recipients,
       rawMessage: signed
@@ -761,6 +811,7 @@ async function sendMailFromBody(body, user) {
     logSendEvent({
       userId: user.id,
       domainId: domain.id,
+      smtpRelayId: smtpTransport.smtpRelayId,
       sender: from,
       recipients,
       subject: body.subject || '(no subject)',
@@ -769,11 +820,19 @@ async function sendMailFromBody(body, user) {
       queueId: smtpResult.queueId,
       deliveryLog: smtpResult.deliveryLog
     });
-    return { queued: true, domain: domain.domain, recipients, smtp: smtpResult.message, queueId: smtpResult.queueId };
+    return {
+      queued: true,
+      domain: domain.domain,
+      recipients,
+      smtp: smtpResult.message,
+      queueId: smtpResult.queueId,
+      smtpRelayId: smtpTransport.smtpRelayId
+    };
   } catch (error) {
     logSendEvent({
       userId: user.id,
       domainId: domain.id,
+      smtpRelayId: smtpTransport.smtpRelayId,
       sender: from,
       recipients,
       subject: body.subject || '(no subject)',
@@ -794,6 +853,43 @@ function deliveryLogFromError(error) {
     message: error?.message || 'Unknown SMTP delivery error',
     ok: false
   }];
+}
+
+function smtpTransportForSend(body, domain, user) {
+  const requestedRelayId = Number(body.smtpRelayId || 0) || null;
+  if (requestedRelayId) {
+    const relay = getSmtpRelay(requestedRelayId, user.id, { includePassword: true });
+    if (!relay) throw new Error('SMTP 出口不存在。');
+    return smtpTransportFromRelay(relay);
+  }
+  if (domain.smtpRelayId) {
+    const relay = getSmtpRelay(domain.smtpRelayId, user.id, { includePassword: true });
+    if (!relay) throw new Error('SMTP 出口不存在。');
+    return smtpTransportFromRelay(relay);
+  }
+  const defaultRelay = getDefaultSmtpRelay(user.id, { includePassword: true });
+  if (defaultRelay) return smtpTransportFromRelay(defaultRelay);
+  return {
+    smtpRelayId: null,
+    host: envConfig.smtpHost,
+    port: envConfig.smtpPort,
+    secure: envConfig.smtpSecure,
+    username: envConfig.smtpUser,
+    password: envConfig.smtpPassword,
+    helo: envConfig.smtpHelo
+  };
+}
+
+function smtpTransportFromRelay(relay) {
+  return {
+    smtpRelayId: relay.id,
+    host: relay.host,
+    port: relay.port,
+    secure: relay.secure,
+    username: relay.username,
+    password: relay.password || '',
+    helo: relay.helo || envConfig.smtpHelo
+  };
 }
 
 function runBackground(promise) {
@@ -1173,6 +1269,14 @@ function normalizeSelector(input) {
 function normalizeDmarcPolicy(input) {
   const value = String(input || '').trim().toLowerCase();
   return ['none', 'quarantine', 'reject'].includes(value) ? value : 'none';
+}
+
+function smtpRelayPatch(body) {
+  const patch = {};
+  for (const key of ['name', 'host', 'port', 'secure', 'username', 'password', 'helo', 'isDefault']) {
+    if (Object.hasOwn(body, key)) patch[key] = body[key];
+  }
+  return patch;
 }
 
 function boolString(value) {

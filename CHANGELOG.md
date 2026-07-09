@@ -1,9 +1,9 @@
 # Changelog
 
-本项目遵循简洁、面向用户的变更记录格式。
+This project follows a concise, user-facing changelog format.
 
 ## Unreleased
 
-- 准备首次开源发布。
-- 增加社区文档、GitHub 模板和安全说明。
-- 泛化示例配置，移除个人部署信息。
+- Prepare the initial open-source release.
+- Add community documentation, GitHub templates, and security guidance.
+- Generalize example configuration and remove personal deployment details.

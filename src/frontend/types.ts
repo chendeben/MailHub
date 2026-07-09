@@ -94,6 +94,7 @@ export interface Domain {
   id: number;
   userId: number;
   dnsCredentialId: number | null;
+  smtpRelayId: number | null;
   domain: string;
   selector: string;
   verificationToken: string;
@@ -129,6 +130,33 @@ export interface SmtpCredential {
   passwordRecoverable?: boolean;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface SmtpRelay {
+  id: number;
+  userId?: number;
+  name: string;
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  password?: string;
+  passwordSet: boolean;
+  helo: string;
+  isDefault: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface SmtpRelayPayload {
+  name: string;
+  host: string;
+  port: number | string;
+  secure?: boolean;
+  username?: string;
+  password?: string;
+  helo?: string;
+  isDefault?: boolean;
 }
 
 export interface SystemEmailSettings {
@@ -249,6 +277,7 @@ export interface SendEvent {
   id: number;
   userId: number;
   domainId: number | null;
+  smtpRelayId: number | null;
   domain?: string;
   sender: string;
   recipients: string[];
@@ -302,6 +331,7 @@ export interface AppData {
   events: SendEvent[];
   analytics: Analytics | null;
   smtpCredential: SmtpCredential | null;
+  smtpRelays: SmtpRelay[];
   dnsCredentials: DnsCredential[];
   apiTokens: ApiToken[];
   settings: RuntimeConfig | null;
@@ -313,6 +343,7 @@ export interface AddDomainPayload {
   senderHost?: string;
   sendingIp?: string;
   dnsCredentialId?: number | string;
+  smtpRelayId?: number | string | null;
   selector?: string;
   dmarcPolicy?: string;
   spfExtra?: string;
@@ -322,6 +353,7 @@ export interface AddDomainPayload {
 export interface DomainPatchPayload {
   selector?: string;
   dnsCredentialId?: number | string | null;
+  smtpRelayId?: number | string | null;
   senderHost?: string;
   sendingIp?: string;
   spfExtra?: string;

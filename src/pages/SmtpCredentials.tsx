@@ -1,20 +1,44 @@
-import { CopyOutlined, ReloadOutlined } from '@ant-design/icons';
-import { Button, Card, Descriptions, Form, Input, Space, Tag, Typography } from 'antd';
+import { CopyOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Button, Card, Descriptions, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Tag, Typography } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+import { useEffect, useState } from 'react';
 
 import { useI18n } from '../frontend/i18n/react';
-import type { RuntimeConfig, SmtpCredential } from '../frontend/types';
+import type { RuntimeConfig, SmtpCredential, SmtpRelay, SmtpRelayPayload } from '../frontend/types';
 
 interface SmtpCredentialsProps {
   config: RuntimeConfig | null;
   credential: SmtpCredential | null;
+  relays: SmtpRelay[];
   loading?: boolean;
   onCopy: (value: string) => void;
   onSave: (values: { username: string; password?: string }) => Promise<void>;
+  onLoadRelay: (id: number) => Promise<SmtpRelay | null>;
+  onSaveRelay: (values: SmtpRelayPayload, id?: number) => Promise<SmtpRelay | null>;
+  onDeleteRelay: (relay: SmtpRelay) => Promise<void>;
 }
 
-export default function SmtpCredentials({ config, credential, loading, onCopy, onSave }: SmtpCredentialsProps) {
+export default function SmtpCredentials({
+  config,
+  credential,
+  relays,
+  loading,
+  onCopy,
+  onSave,
+  onLoadRelay,
+  onSaveRelay,
+  onDeleteRelay
+}: SmtpCredentialsProps) {
   const { t } = useI18n();
   const [form] = Form.useForm();
+  const [relayForm] = Form.useForm<SmtpRelayPayload>();
+  const [relayOpen, setRelayOpen] = useState(false);
+  const [relayLoading, setRelayLoading] = useState(false);
+  const [editingRelay, setEditingRelay] = useState<SmtpRelay | null>(null);
+
+  useEffect(() => {
+    form.setFieldsValue({ username: credential?.username || config?.submission?.username || '' });
+  }, [config?.submission?.username, credential?.username, form]);
 
   function generatePassword() {
     const bytes = new Uint8Array(24);
@@ -22,6 +46,111 @@ export default function SmtpCredentials({ config, credential, loading, onCopy, o
     const password = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '').slice(0, 28);
     form.setFieldValue('password', password);
   }
+
+  function generateRelayPassword() {
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    const password = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '').slice(0, 28);
+    relayForm.setFieldValue('password', password);
+  }
+
+  function openCreateRelay() {
+    setEditingRelay(null);
+    relayForm.setFieldsValue({
+      name: '',
+      host: '',
+      port: 587,
+      secure: false,
+      username: '',
+      password: '',
+      helo: '',
+      isDefault: relays.length === 0
+    });
+    setRelayOpen(true);
+  }
+
+  async function openEditRelay(relay: SmtpRelay) {
+    setEditingRelay(relay);
+    setRelayOpen(true);
+    setRelayLoading(true);
+    try {
+      const detail = await onLoadRelay(relay.id);
+      if (!detail) {
+        setRelayOpen(false);
+        return;
+      }
+      relayForm.setFieldsValue({
+        name: detail.name,
+        host: detail.host,
+        port: detail.port,
+        secure: detail.secure,
+        username: detail.username,
+        password: detail.password || '',
+        helo: detail.helo,
+        isDefault: detail.isDefault
+      });
+    } finally {
+      setRelayLoading(false);
+    }
+  }
+
+  async function saveRelay() {
+    const values = await relayForm.validateFields();
+    setRelayLoading(true);
+    try {
+      const saved = await onSaveRelay(values, editingRelay?.id);
+      if (!saved) return;
+      setRelayOpen(false);
+      relayForm.resetFields();
+    } finally {
+      setRelayLoading(false);
+    }
+  }
+
+  const relayColumns: ColumnsType<SmtpRelay> = [
+    {
+      title: t('smtpRelay.name'),
+      dataIndex: 'name',
+      width: 190,
+      render: (value, relay) => (
+        <Space wrap>
+          <Typography.Text strong>{value}</Typography.Text>
+          {relay.isDefault ? <Tag color="success">{t('smtpRelay.default')}</Tag> : null}
+        </Space>
+      )
+    },
+    {
+      title: t('smtpRelay.server'),
+      width: 220,
+      render: (_, relay) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text code>{relay.host}:{relay.port}</Typography.Text>
+          <Typography.Text type="secondary">{relay.secure ? 'SSL/TLS' : 'STARTTLS / Plain'}</Typography.Text>
+        </Space>
+      )
+    },
+    { title: t('smtpRelay.username'), dataIndex: 'username', width: 180, render: (value) => value || '-' },
+    {
+      title: t('smtpRelay.password'),
+      dataIndex: 'passwordSet',
+      width: 120,
+      render: (value: boolean) => <Tag color={value ? 'success' : 'default'}>{value ? t('smtpRelay.passwordSet') : t('smtpRelay.passwordEmpty')}</Tag>
+    },
+    { title: 'HELO', dataIndex: 'helo', width: 180, render: (value) => value || '-' },
+    {
+      title: t('domains.actions'),
+      fixed: 'right',
+      width: 150,
+      render: (_, relay) => (
+        <Space>
+          <Button icon={<EditOutlined />} onClick={() => openEditRelay(relay)} />
+          <Popconfirm title={t('smtpRelay.deleteConfirm')} onConfirm={() => onDeleteRelay(relay)}>
+            <Button danger icon={<DeleteOutlined />} />
+          </Popconfirm>
+        </Space>
+      )
+    }
+  ];
 
   return (
     <Space direction="vertical" size={16} className="full-width">
@@ -61,6 +190,63 @@ export default function SmtpCredentials({ config, credential, loading, onCopy, o
           </Space>
         </Form>
       </Card>
+      <Card
+        title={t('smtpRelay.title')}
+        extra={
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreateRelay}>
+            {t('smtpRelay.create')}
+          </Button>
+        }
+      >
+        <Table
+          rowKey="id"
+          columns={relayColumns}
+          dataSource={relays}
+          scroll={{ x: 1040 }}
+          pagination={false}
+        />
+      </Card>
+      <Modal
+        title={editingRelay ? t('smtpRelay.editTitle') : t('smtpRelay.createTitle')}
+        open={relayOpen}
+        confirmLoading={loading || relayLoading}
+        onCancel={() => setRelayOpen(false)}
+        onOk={saveRelay}
+        width={640}
+        destroyOnHidden
+      >
+        <Form form={relayForm} layout="vertical">
+          <Form.Item name="name" label={t('smtpRelay.name')} rules={[{ required: true, message: t('smtpRelay.nameRequired') }]}>
+            <Input autoComplete="off" placeholder="Amazon SES" />
+          </Form.Item>
+          <Form.Item name="host" label="SMTP Host" rules={[{ required: true, message: t('smtpRelay.hostRequired') }]}>
+            <Input autoComplete="off" placeholder="email-smtp.us-east-1.amazonaws.com" />
+          </Form.Item>
+          <Form.Item name="port" label="SMTP Port" rules={[{ required: true, message: t('smtpRelay.portRequired') }]}>
+            <InputNumber min={1} max={65535} className="full-width" />
+          </Form.Item>
+          <Form.Item name="secure" label="SSL/TLS" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="username" label={t('smtpRelay.username')}>
+            <Input autoComplete="off" />
+          </Form.Item>
+          <Form.Item name="password" label={t('smtpRelay.password')} extra={t('smtpRelay.passwordExtra')}>
+            <Input autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item>
+            <Button icon={<ReloadOutlined />} onClick={generateRelayPassword}>
+              {t('smtpRelay.generatePassword')}
+            </Button>
+          </Form.Item>
+          <Form.Item name="helo" label="HELO" extra={t('smtpRelay.heloExtra')}>
+            <Input autoComplete="off" placeholder={config?.mailHostname || 'mail.example.com'} />
+          </Form.Item>
+          <Form.Item name="isDefault" label={t('smtpRelay.default')} valuePropName="checked">
+            <Switch />
+          </Form.Item>
+        </Form>
+      </Modal>
     </Space>
   );
 }

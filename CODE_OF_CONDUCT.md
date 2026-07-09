@@ -2,26 +2,26 @@
 
 ## Our Pledge
 
-我们希望 MailHub 社区保持专业、尊重和包容。参与者应当以建设性的方式沟通，尊重不同经验背景，并围绕项目质量解决问题。
+We want the MailHub community to remain professional, respectful, and inclusive. Participants should communicate constructively, respect different backgrounds and experience levels, and focus on improving project quality.
 
 ## Expected Behavior
 
-- 使用友善、清晰、专业的语言。
-- 尊重不同观点和经验。
-- 聚焦技术事实、复现步骤和可验证结果。
-- 接受建设性反馈，并在讨论中保持耐心。
+- Use friendly, clear, and professional language.
+- Respect different viewpoints and experiences.
+- Focus on technical facts, reproduction steps, and verifiable results.
+- Accept constructive feedback and remain patient in discussions.
 
 ## Unacceptable Behavior
 
-- 人身攻击、骚扰、侮辱或歧视性表达。
-- 公开他人的隐私信息或敏感凭据。
-- 在 issue、PR 或讨论中发布垃圾信息。
-- 明知有安全风险仍引导他人执行危险操作。
+- Personal attacks, harassment, insults, or discriminatory language.
+- Publishing another person's private information or sensitive credentials.
+- Posting spam in issues, pull requests, or discussions.
+- Encouraging dangerous actions while knowingly ignoring security risks.
 
 ## Enforcement
 
-维护者可以编辑、隐藏或删除违反本准则的内容，也可以临时或永久限制相关参与者的互动权限。
+Maintainers may edit, hide, or remove content that violates this code of conduct. They may also temporarily or permanently restrict interactions from participants who violate it.
 
 ## Scope
 
-本准则适用于项目仓库、issue、pull request、讨论区以及与项目相关的公开交流场景。
+This code of conduct applies to the project repository, issues, pull requests, discussions, and public communication related to the project.

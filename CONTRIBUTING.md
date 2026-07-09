@@ -1,8 +1,8 @@
 # Contributing
 
-感谢你愿意参与 MailHub。这个项目优先接受聚焦、可验证、易维护的改动。
+Thank you for contributing to MailHub. The project prefers focused, verifiable, maintainable changes.
 
-## 开发环境
+## Development Setup
 
 ```bash
 npm install
@@ -10,40 +10,40 @@ npm test
 npm run build
 ```
 
-Node.js 版本需满足 `package.json` 中的 `>=24.0.0`。
+Use a Node.js version that satisfies the `>=24.0.0` requirement in `package.json`.
 
-## 工作方式
+## Workflow
 
-- 提交 issue 前先搜索是否已有相同问题。
-- PR 尽量保持单一主题，避免混入无关格式化或重构。
-- 修改行为时补充或更新测试。
-- 修改 UI 或 API 行为时，在 PR 中提供截图、请求示例或验证步骤。
-- 不要提交 `.env`、数据库、证书、私钥、API Token、SMTP 密码或真实生产配置。
+- Search existing issues before opening a new one.
+- Keep pull requests focused on one topic. Avoid unrelated formatting or refactoring.
+- Add or update tests when behavior changes.
+- Include screenshots, request examples, or verification steps when UI or API behavior changes.
+- Do not commit `.env`, databases, certificates, private keys, API tokens, SMTP passwords, or real production configuration.
 
-## 代码风格
+## Code Style
 
-- 使用 ES modules。
-- JavaScript/TypeScript 使用两空格缩进和分号。
-- 默认使用 `const`，仅在需要重新赋值时使用 `let`。
-- 保持文件职责单一，优先选择直观实现。
-- 注释保持简短，只解释不明显的业务约束或安全原因。
+- Use ES modules.
+- Use two-space indentation and semicolons for JavaScript and TypeScript.
+- Prefer `const`; use `let` only when reassignment is required.
+- Keep files focused on a single responsibility and prefer direct implementations.
+- Keep comments short and reserve them for non-obvious business constraints or security reasoning.
 
-## Pull Request 检查清单
+## Pull Request Checklist
 
-- [ ] 已运行 `npm test`。
-- [ ] 已运行 `npm run build`。
-- [ ] 已检查 `git diff`，确认没有个人信息或密钥。
-- [ ] 文档已随行为变化更新。
-- [ ] 新增配置项已同步 `.env.example`。
+- [ ] `npm test` has been run.
+- [ ] `npm run build` has been run.
+- [ ] `git diff` has been reviewed for personal information and secrets.
+- [ ] Documentation has been updated for behavior changes.
+- [ ] New configuration keys have been added to `.env.example`.
 
-## Commit 信息
+## Commit Messages
 
-推荐使用类似 Conventional Commits 的前缀：
+Conventional-Commits-style prefixes are recommended:
 
-- `feat:` 新功能
-- `fix:` 修复
-- `docs:` 文档
-- `test:` 测试
-- `chore:` 维护
+- `feat:` new features
+- `fix:` bug fixes
+- `docs:` documentation
+- `test:` tests
+- `chore:` maintenance
 
-标题应简洁，并聚焦单一变更。
+Keep the subject concise and focused on one change.

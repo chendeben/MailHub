@@ -97,6 +97,250 @@ test('auth pages preserve query messages instead of redirecting them away', asyn
   }
 });
 
+test('users can manage outbound smtp relays with recoverable passwords and send through a selected relay', async () => {
+  const relayServer = await startFakeSmtpServer();
+  const { child, baseUrl } = await startTestServer();
+
+  try {
+    const cookie = await login(baseUrl, 'admin', 'password123');
+    const domainResponse = await fetch(`${baseUrl}/api/domains`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        domain: 'relay.example',
+        selector: 'mh',
+        senderHost: 'mail.relay.example',
+        sendingIp: '127.0.0.1'
+      })
+    });
+    assert.equal(domainResponse.status, 201);
+
+    const createRelay = await fetch(`${baseUrl}/api/smtp-relays`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        name: 'Primary outbound',
+        host: '127.0.0.1',
+        port: relayServer.port,
+        secure: false,
+        username: 'relay-user',
+        password: 'relay-password',
+        helo: 'helo.relay.example',
+        isDefault: true
+      })
+    });
+    assert.equal(createRelay.status, 201);
+    const created = await createRelay.json();
+    assert.equal(created.relay.passwordSet, true);
+    assert.equal('password' in created.relay, false);
+
+    const list = await fetch(`${baseUrl}/api/smtp-relays`, { headers: { Cookie: cookie } });
+    assert.equal(list.status, 200);
+    const listed = await list.json();
+    assert.equal(listed.relays.length, 1);
+    assert.equal('password' in listed.relays[0], false);
+
+    const detail = await fetch(`${baseUrl}/api/smtp-relays/${created.relay.id}`, { headers: { Cookie: cookie } });
+    assert.equal(detail.status, 200);
+    const detailBody = await detail.json();
+    assert.equal(detailBody.relay.password, 'relay-password');
+    assert.equal('passwordSecret' in detailBody.relay, false);
+
+    const missingPatch = await fetch(`${baseUrl}/api/smtp-relays/999999`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        name: 'Missing relay',
+        host: '127.0.0.1',
+        port: relayServer.port,
+        secure: false,
+        username: 'missing-user',
+        password: 'missing-password'
+      })
+    });
+    assert.equal(missingPatch.status, 404);
+
+    const updateWithoutPassword = await fetch(`${baseUrl}/api/smtp-relays/${created.relay.id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        name: 'Primary outbound renamed',
+        host: '127.0.0.1',
+        port: relayServer.port,
+        secure: false,
+        username: 'relay-user'
+      })
+    });
+    assert.equal(updateWithoutPassword.status, 200);
+    assert.equal((await updateWithoutPassword.json()).relay.isDefault, true);
+    const detailAfterPatch = await fetch(`${baseUrl}/api/smtp-relays/${created.relay.id}`, { headers: { Cookie: cookie } });
+    assert.equal((await detailAfterPatch.json()).relay.password, 'relay-password');
+
+    const invalidRelaySend = await fetch(`${baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        from: 'noreply@relay.example',
+        to: 'user@example.com',
+        subject: 'Invalid relay',
+        text: 'hello',
+        smtpRelayId: 999999
+      })
+    });
+    assert.equal(invalidRelaySend.status, 400);
+
+    const send = await fetch(`${baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        from: 'noreply@relay.example',
+        to: 'user@example.com',
+        subject: 'Relay send',
+        text: 'hello',
+        smtpRelayId: created.relay.id
+      })
+    });
+    assert.equal(send.status, 202);
+    assert.equal((await send.json()).smtpRelayId, created.relay.id);
+    await waitForCondition(() => relayServer.messages.length === 1);
+    const authCommand = relayServer.commands.find((command) => command.startsWith('AUTH PLAIN '));
+    assert.ok(authCommand);
+    assert.equal(Buffer.from(authCommand.replace('AUTH PLAIN ', ''), 'base64').toString('utf8'), '\0relay-user\0relay-password');
+
+    const events = await fetch(`${baseUrl}/api/events`, { headers: { Cookie: cookie } });
+    assert.equal(events.status, 200);
+    assert.equal((await events.json()).events[0].smtpRelayId, created.relay.id);
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+    await relayServer.close();
+  }
+});
+
+test('smtp relay selection prefers request relay then domain relay then user default relay', async () => {
+  const requestRelayServer = await startFakeSmtpServer();
+  const domainRelayServer = await startFakeSmtpServer();
+  const defaultRelayServer = await startFakeSmtpServer();
+  const { child, baseUrl } = await startTestServer();
+
+  try {
+    const cookie = await login(baseUrl, 'admin', 'password123');
+    const defaultRelay = await createSmtpRelay(baseUrl, cookie, {
+      name: 'Default relay',
+      host: '127.0.0.1',
+      port: defaultRelayServer.port,
+      username: 'default-user',
+      password: 'default-password',
+      isDefault: true
+    });
+    const domainRelay = await createSmtpRelay(baseUrl, cookie, {
+      name: 'Domain relay',
+      host: '127.0.0.1',
+      port: domainRelayServer.port,
+      username: 'domain-user',
+      password: 'domain-password'
+    });
+    const requestRelay = await createSmtpRelay(baseUrl, cookie, {
+      name: 'Request relay',
+      host: '127.0.0.1',
+      port: requestRelayServer.port,
+      username: 'request-user',
+      password: 'request-password'
+    });
+
+    const domain = await createSendingDomain(baseUrl, cookie, {
+      domain: 'relay-order.example',
+      smtpRelayId: domainRelay.id
+    });
+    assert.equal(domain.smtpRelayId, domainRelay.id);
+
+    const domainSend = await sendApiMail(baseUrl, cookie, {
+      from: 'noreply@relay-order.example',
+      to: 'domain@example.com',
+      subject: 'Domain relay'
+    });
+    assert.equal(domainSend.smtpRelayId, domainRelay.id);
+    await waitForCondition(() => domainRelayServer.messages.length === 1);
+    assertRelayAuth(domainRelayServer, 'domain-user', 'domain-password');
+
+    const requestSend = await sendApiMail(baseUrl, cookie, {
+      from: 'noreply@relay-order.example',
+      to: 'request@example.com',
+      subject: 'Request relay',
+      smtpRelayId: requestRelay.id
+    });
+    assert.equal(requestSend.smtpRelayId, requestRelay.id);
+    await waitForCondition(() => requestRelayServer.messages.length === 1);
+    assertRelayAuth(requestRelayServer, 'request-user', 'request-password');
+
+    const testSend = await fetch(`${baseUrl}/api/domains/${domain.id}/test-send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        to: 'test-send@example.com',
+        subject: 'Selected relay test send',
+        smtpRelayId: requestRelay.id
+      })
+    });
+    assert.equal(testSend.status, 202);
+    assert.equal((await testSend.json()).smtpRelayId, requestRelay.id);
+    await waitForCondition(() => requestRelayServer.messages.length === 2);
+
+    const invalidTestSend = await fetch(`${baseUrl}/api/domains/${domain.id}/test-send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        to: 'invalid-test-send@example.com',
+        smtpRelayId: 999999
+      })
+    });
+    assert.equal(invalidTestSend.status, 400);
+
+    const defaultDomain = await createSendingDomain(baseUrl, cookie, {
+      domain: 'default-relay.example'
+    });
+    assert.equal(defaultDomain.smtpRelayId, null);
+    const defaultSend = await sendApiMail(baseUrl, cookie, {
+      from: 'noreply@default-relay.example',
+      to: 'default@example.com',
+      subject: 'Default relay'
+    });
+    assert.equal(defaultSend.smtpRelayId, defaultRelay.id);
+    await waitForCondition(() => defaultRelayServer.messages.length === 1);
+    assertRelayAuth(defaultRelayServer, 'default-user', 'default-password');
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+    await requestRelayServer.close();
+    await domainRelayServer.close();
+    await defaultRelayServer.close();
+  }
+});
+
 test('admin users can list audit logs', async () => {
   const { child, baseUrl } = await startTestServer();
 
@@ -1334,6 +1578,73 @@ async function saveSystemEmailSettings(baseUrl, cookie, smtpPort) {
     })
   });
   assert.equal(response.status, 200);
+}
+
+async function createSendingDomain(baseUrl, cookie, data = {}) {
+  const domain = data.domain || 'send.example';
+  const response = await fetch(`${baseUrl}/api/domains`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookie
+    },
+    body: JSON.stringify({
+      domain,
+      selector: data.selector || 'mh',
+      senderHost: data.senderHost || `mail.${domain}`,
+      sendingIp: data.sendingIp || '127.0.0.1',
+      smtpRelayId: data.smtpRelayId
+    })
+  });
+  assert.equal(response.status, 201);
+  return (await response.json()).domain;
+}
+
+async function createSmtpRelay(baseUrl, cookie, data = {}) {
+  const response = await fetch(`${baseUrl}/api/smtp-relays`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookie
+    },
+    body: JSON.stringify({
+      name: data.name || 'Relay',
+      host: data.host || '127.0.0.1',
+      port: data.port,
+      secure: data.secure || false,
+      username: data.username || '',
+      password: data.password || '',
+      helo: data.helo || '',
+      isDefault: data.isDefault || false
+    })
+  });
+  assert.equal(response.status, 201);
+  return (await response.json()).relay;
+}
+
+async function sendApiMail(baseUrl, cookie, data) {
+  const response = await fetch(`${baseUrl}/api/send`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookie
+    },
+    body: JSON.stringify({
+      from: data.from,
+      to: data.to,
+      subject: data.subject,
+      text: data.text || 'hello',
+      smtpRelayId: data.smtpRelayId
+    })
+  });
+  assert.equal(response.status, 202);
+  return response.json();
+}
+
+function assertRelayAuth(relayServer, username, password) {
+  const authCommand = relayServer.commands.find((command) => command.startsWith('AUTH PLAIN '));
+  assert.ok(authCommand);
+  assert.equal(Buffer.from(authCommand.replace('AUTH PLAIN ', ''), 'base64').toString('utf8'), `\0${username}\0${password}`);
 }
 
 function startFakeSmtpServer({ responseDelayMs = 0 } = {}) {

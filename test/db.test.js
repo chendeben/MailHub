@@ -14,9 +14,11 @@ import {
   createDomain,
   createUser,
   createUserWithAccountToken,
+  deleteSmtpRelay,
   getDnsCredential,
   getDomain,
   getSendAnalytics,
+  getSmtpRelay,
   getSmtpCredential,
   getAdminResourceInventory,
   getSystemEmailSettings,
@@ -25,6 +27,7 @@ import {
   listAuditLogs,
   listDomains,
   listSendEvents,
+  listSmtpRelays,
   listUsersWithResourceCounts,
   invalidateAccountTokens,
   logAudit,
@@ -33,6 +36,7 @@ import {
   markUserEmailVerified,
   previewUserMerge,
   saveDnsCredential,
+  saveSmtpRelay,
   saveSmtpCredential,
   saveSystemEmailSettings,
   seedAdminUser,
@@ -149,6 +153,89 @@ test('isolates domains, smtp credentials, and api tokens by user', () => {
 
   const token = createApiToken(alice.id, 'send');
   assert.equal(verifyApiToken(token.token).id, alice.id);
+});
+
+test('stores multiple outbound smtp relays with encrypted recoverable passwords', () => {
+  const database = initDatabase(tempDataDir(), 'test-secret');
+  const alice = createUser({ username: 'alice', email: 'alice@example.com', password: 'password123' });
+  const bob = createUser({ username: 'bob', email: 'bob@example.com', password: 'password123' });
+
+  const primary = saveSmtpRelay(alice.id, {
+    name: 'Primary relay',
+    host: 'smtp.primary.example',
+    port: 587,
+    secure: false,
+    username: 'primary-user',
+    password: 'primary-secret',
+    helo: 'mail.alice.example',
+    isDefault: true
+  });
+  const backup = saveSmtpRelay(alice.id, {
+    name: 'Backup relay',
+    host: 'smtp.backup.example',
+    port: 465,
+    secure: true,
+    username: 'backup-user',
+    password: 'backup-secret',
+    isDefault: true
+  });
+  saveSmtpRelay(bob.id, {
+    name: 'Bob relay',
+    host: 'smtp.bob.example',
+    port: 25,
+    secure: false,
+    username: '',
+    password: '',
+    isDefault: true
+  });
+
+  assert.equal(primary.passwordSet, true);
+  assert.equal('password' in primary, false);
+  assert.deepEqual(
+    listSmtpRelays(alice.id).map((relay) => [relay.name, relay.isDefault, 'password' in relay]),
+    [
+      ['Backup relay', true, false],
+      ['Primary relay', false, false]
+    ]
+  );
+  assert.equal(getSmtpRelay(backup.id, alice.id, { includePassword: true }).password, 'backup-secret');
+  assert.equal(getSmtpRelay(backup.id, bob.id), null);
+  assert.equal(JSON.stringify(listSmtpRelays(alice.id)).includes('backup-secret'), false);
+
+  const stored = database.prepare('SELECT password_secret FROM smtp_relays WHERE id = ?').get(backup.id);
+  assert.ok(stored.password_secret);
+  assert.equal(stored.password_secret.includes('backup-secret'), false);
+
+  const updated = saveSmtpRelay(alice.id, {
+    id: backup.id,
+    name: 'Backup relay updated',
+    host: 'smtp.backup.example',
+    port: 2525,
+    secure: false,
+    username: 'backup-user',
+    helo: 'helo.backup.example',
+    isDefault: false
+  });
+  assert.equal(updated.port, 2525);
+  assert.equal(updated.isDefault, false);
+  assert.equal(getSmtpRelay(backup.id, alice.id, { includePassword: true }).password, 'backup-secret');
+  const cleared = saveSmtpRelay(alice.id, {
+    id: backup.id,
+    name: 'Backup relay without auth',
+    host: 'smtp.backup.example',
+    username: '',
+    password: ''
+  });
+  assert.equal(cleared.passwordSet, false);
+  assert.equal(getSmtpRelay(backup.id, alice.id, { includePassword: true }).password, '');
+  assert.equal(saveSmtpRelay(bob.id, {
+    id: backup.id,
+    name: 'Should not create',
+    host: 'smtp.invalid.example'
+  }), null);
+  assert.equal(deleteSmtpRelay(backup.id, bob.id), false);
+  assert.equal(deleteSmtpRelay(backup.id, alice.id), true);
+  assert.equal(getSmtpRelay(backup.id, alice.id), null);
 });
 
 test('stores account tokens as hashes and enforces token lifecycle', () => {

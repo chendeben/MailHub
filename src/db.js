@@ -90,6 +90,22 @@ export function initDatabase(dataDir, secret = '') {
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS smtp_relays (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      host TEXT NOT NULL,
+      port INTEGER NOT NULL DEFAULT 587,
+      secure TEXT NOT NULL DEFAULT 'false',
+      username TEXT NOT NULL DEFAULT '',
+      password_secret TEXT NOT NULL DEFAULT '',
+      helo TEXT NOT NULL DEFAULT '',
+      is_default TEXT NOT NULL DEFAULT 'false',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS api_tokens (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -142,7 +158,9 @@ export function initDatabase(dataDir, secret = '') {
   `);
   ensureColumn('domains', 'user_id', 'INTEGER');
   ensureColumn('domains', 'dns_credential_id', 'INTEGER');
+  ensureColumn('domains', 'smtp_relay_id', 'INTEGER');
   ensureColumn('send_events', 'user_id', 'INTEGER');
+  ensureColumn('send_events', 'smtp_relay_id', 'INTEGER');
   ensureColumn('send_events', 'queue_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('send_events', 'delivery_log_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('send_events', 'delivery_attempts_json', "TEXT NOT NULL DEFAULT '[]'");
@@ -150,8 +168,11 @@ export function initDatabase(dataDir, secret = '') {
   ensureColumn('smtp_credentials', 'password_secret', "TEXT NOT NULL DEFAULT ''");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_domains_user_id ON domains(user_id);
+    CREATE INDEX IF NOT EXISTS idx_domains_smtp_relay_id ON domains(smtp_relay_id);
     CREATE INDEX IF NOT EXISTS idx_events_user_id ON send_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_events_smtp_relay_id ON send_events(smtp_relay_id);
     CREATE INDEX IF NOT EXISTS idx_events_queue_id ON send_events(queue_id);
+    CREATE INDEX IF NOT EXISTS idx_smtp_relays_user_id ON smtp_relays(user_id);
   `);
   normalizeSendEventQueueIds();
   normalizeDkimPublicKeys();
@@ -601,14 +622,15 @@ export function createDomain(userId, domain) {
   const result = requireDb()
     .prepare(`
       INSERT INTO domains (
-        user_id, dns_credential_id, domain, selector, verification_token,
+        user_id, dns_credential_id, smtp_relay_id, domain, selector, verification_token,
         dkim_public, dkim_private, sender_host, sending_ip, spf_extra,
         dmarc_policy, dmarc_rua, status_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
     `)
     .run(
       userId,
       domain.dnsCredentialId || null,
+      domain.smtpRelayId || null,
       domain.domain,
       domain.selector,
       domain.verificationToken,
@@ -631,6 +653,7 @@ export function updateDomain(id, userId, patch) {
   const next = {
     selector: patch.selector ?? current.selector,
     dnsCredentialId: patch.dnsCredentialId === undefined ? current.dnsCredentialId : (patch.dnsCredentialId || null),
+    smtpRelayId: patch.smtpRelayId === undefined ? current.smtpRelayId : (patch.smtpRelayId || null),
     senderHost: patch.senderHost ?? current.senderHost,
     sendingIp: patch.sendingIp ?? current.sendingIp,
     spfExtra: patch.spfExtra ?? current.spfExtra,
@@ -641,13 +664,14 @@ export function updateDomain(id, userId, patch) {
   requireDb()
     .prepare(`
       UPDATE domains
-      SET selector = ?, dns_credential_id = ?, sender_host = ?, sending_ip = ?, spf_extra = ?,
+      SET selector = ?, dns_credential_id = ?, smtp_relay_id = ?, sender_host = ?, sending_ip = ?, spf_extra = ?,
           dmarc_policy = ?, dmarc_rua = ?, updated_at = ?
       WHERE id = ? AND user_id = ?
     `)
     .run(
       next.selector,
       next.dnsCredentialId,
+      next.smtpRelayId,
       next.senderHost,
       next.sendingIp,
       next.spfExtra,
@@ -720,14 +744,15 @@ export function logSendEvent(event) {
   const result = requireDb()
     .prepare(`
       INSERT INTO send_events (
-        user_id, domain_id, sender, recipients, subject, status, detail, queue_id,
+        user_id, domain_id, smtp_relay_id, sender, recipients, subject, status, detail, queue_id,
         delivery_log_json, delivery_attempts_json, delivered_at, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       event.userId ?? null,
       event.domainId ?? null,
+      event.smtpRelayId ?? null,
       event.sender,
       JSON.stringify(event.recipients),
       event.subject,
@@ -779,6 +804,7 @@ export function listSendEvents(userId, limit = 30) {
       id: row.id,
       userId: row.user_id,
       domainId: row.domain_id,
+      smtpRelayId: row.smtp_relay_id,
       domain: row.domain,
       sender: row.sender,
       recipients: safeJson(row.recipients, []),
@@ -934,6 +960,87 @@ export function saveSmtpCredential(userId, { username, password }) {
       .run(userId, nextUsername, nextHash, nextSecret, updatedAt, updatedAt);
   }
   return getSmtpCredential(userId);
+}
+
+export function listSmtpRelays(userId, { includePassword = false, includeSecret = false } = {}) {
+  return requireDb()
+    .prepare('SELECT * FROM smtp_relays WHERE user_id = ? ORDER BY is_default DESC, created_at DESC')
+    .all(userId)
+    .map((row) => publicSmtpRelay(row, { includePassword, includeSecret }));
+}
+
+export function getSmtpRelay(id, userId, { includePassword = false, includeSecret = false } = {}) {
+  const row = requireDb()
+    .prepare('SELECT * FROM smtp_relays WHERE id = ? AND user_id = ?')
+    .get(Number(id), userId);
+  return publicSmtpRelay(row, { includePassword, includeSecret });
+}
+
+export function getDefaultSmtpRelay(userId, { includePassword = false, includeSecret = false } = {}) {
+  const row = requireDb()
+    .prepare("SELECT * FROM smtp_relays WHERE user_id = ? AND is_default = 'true' ORDER BY updated_at DESC LIMIT 1")
+    .get(userId);
+  return publicSmtpRelay(row, { includePassword, includeSecret });
+}
+
+export function saveSmtpRelay(userId, relay = {}) {
+  const current = relay.id ? getSmtpRelay(relay.id, userId, { includeSecret: true }) : null;
+  if (relay.id && !current) return null;
+  const name = String(relay.name ?? current?.name ?? '').trim() || 'SMTP Relay';
+  const host = String(relay.host ?? current?.host ?? '').trim();
+  if (!host) throw new Error('SMTP Host 不能为空。');
+  const port = normalizePort(relay.port ?? current?.port, 587);
+  const secure = boolString(relay.secure ?? current?.secure ?? false);
+  const username = String(relay.username ?? current?.username ?? '').trim();
+  const passwordSecret = Object.hasOwn(relay, 'password')
+    ? encryptSecret(relay.password)
+    : current?.passwordSecret || '';
+  const helo = String(relay.helo ?? current?.helo ?? '').trim();
+  const isDefault = boolString(relay.isDefault ?? current?.isDefault ?? false);
+  const updatedAt = now();
+
+  return withTransaction(() => {
+    if (isDefault === 'true') clearDefaultSmtpRelay(userId);
+    if (current) {
+      requireDb()
+        .prepare(`
+          UPDATE smtp_relays
+          SET name = ?, host = ?, port = ?, secure = ?, username = ?, password_secret = ?,
+              helo = ?, is_default = ?, updated_at = ?
+          WHERE id = ? AND user_id = ?
+        `)
+        .run(name, host, port, secure, username, passwordSecret, helo, isDefault, updatedAt, current.id, userId);
+      return getSmtpRelay(current.id, userId);
+    }
+    const result = requireDb()
+      .prepare(`
+        INSERT INTO smtp_relays (
+          user_id, name, host, port, secure, username, password_secret,
+          helo, is_default, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(userId, name, host, port, secure, username, passwordSecret, helo, isDefault, updatedAt, updatedAt);
+    return getSmtpRelay(result.lastInsertRowid, userId);
+  });
+}
+
+export function deleteSmtpRelay(id, userId) {
+  return withTransaction(() => {
+    requireDb()
+      .prepare('UPDATE domains SET smtp_relay_id = NULL WHERE smtp_relay_id = ? AND user_id = ?')
+      .run(Number(id), userId);
+    const result = requireDb()
+      .prepare('DELETE FROM smtp_relays WHERE id = ? AND user_id = ?')
+      .run(Number(id), userId);
+    return result.changes > 0;
+  });
+}
+
+function clearDefaultSmtpRelay(userId) {
+  requireDb()
+    .prepare("UPDATE smtp_relays SET is_default = 'false', updated_at = ? WHERE user_id = ?")
+    .run(now(), userId);
 }
 
 export function verifySmtpCredential(username, password) {
@@ -1369,6 +1476,7 @@ function publicDomainRow(row) {
     id: row.id,
     userId: row.user_id,
     dnsCredentialId: row.dns_credential_id,
+    smtpRelayId: row.smtp_relay_id,
     domain: row.domain,
     selector: row.selector,
     verificationToken: row.verification_token,
@@ -1401,6 +1509,27 @@ function publicSmtpCredential(row, { includeHash = false, includePassword = fals
     passwordRecoverable,
     ...(includePassword ? { password } : {}),
     ...(includeHash ? { passwordHash: row.password_hash } : {}),
+    ...(includeSecret ? { passwordSecret: row.password_secret } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function publicSmtpRelay(row, { includePassword = false, includeSecret = false } = {}) {
+  if (!row) return null;
+  const password = includePassword ? decryptSecret(row.password_secret) : '';
+  return {
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    host: row.host,
+    port: Number(row.port || 587),
+    secure: row.secure === 'true',
+    username: row.username,
+    passwordSet: Boolean(row.password_secret),
+    helo: row.helo,
+    isDefault: row.is_default === 'true',
+    ...(includePassword ? { password } : {}),
     ...(includeSecret ? { passwordSecret: row.password_secret } : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at

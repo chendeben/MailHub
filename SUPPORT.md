@@ -2,13 +2,13 @@
 
 ## Getting Help
 
-- 使用问题和功能建议：请创建 GitHub issue。
-- 安全问题：请按 [SECURITY.md](SECURITY.md) 私下报告。
-- 部署问题：请附上脱敏后的 `.env` 片段、Docker 日志、Node.js 版本和复现步骤。
+- Usage questions and feature requests: open a GitHub issue.
+- Security issues: report privately according to [SECURITY.md](SECURITY.md).
+- Deployment issues: include a redacted `.env` snippet, Docker logs, Node.js version, and reproduction steps.
 
 ## Before Opening an Issue
 
-- 确认你正在使用受支持的 Node.js 版本。
-- 运行 `npm test` 和 `npm run build`。
-- 检查 DNS、TLS 证书、SMTP 端口和防火墙配置。
-- 移除日志和截图中的 Token、密码、IP 白名单和私钥内容。
+- Confirm that you are using a supported Node.js version.
+- Run `npm test` and `npm run build`.
+- Check DNS, TLS certificates, SMTP ports, and firewall configuration.
+- Remove tokens, passwords, IP allowlists, and private keys from logs and screenshots.

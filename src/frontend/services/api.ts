@@ -11,6 +11,8 @@ import type {
   RuntimeConfig,
   SendEvent,
   SmtpCredential,
+  SmtpRelay,
+  SmtpRelayPayload,
   SystemEmailSettings,
   User,
   UserMergeOptions,
@@ -91,6 +93,15 @@ export const api = {
   smtpCredential: () => request<{ credential: SmtpCredential | null }>('/api/smtp-credential'),
   saveSmtpCredential: (data: { username: string; password?: string }) =>
     request<{ credential: SmtpCredential }>('/api/smtp-credential', { method: 'PUT', data }),
+  smtpRelays: () => request<{ relays: SmtpRelay[] }>('/api/smtp-relays'),
+  smtpRelay: (id: number) => request<{ relay: SmtpRelay }>(`/api/smtp-relays/${id}`),
+  saveSmtpRelay: (data: SmtpRelayPayload, id?: number) =>
+    request<{ relay: SmtpRelay }>(id ? `/api/smtp-relays/${id}` : '/api/smtp-relays', {
+      method: id ? 'PATCH' : 'POST',
+      data
+    }),
+  deleteSmtpRelay: (id: number) =>
+    request<{ deleted: boolean }>(`/api/smtp-relays/${id}`, { method: 'DELETE' }),
   dnsCredentials: () => request<{ credentials: DnsCredential[] }>('/api/dns-credentials'),
   saveDnsCredential: (data: Record<string, unknown>, id?: number) =>
     request<{ credential: DnsCredential }>(id ? `/api/dns-credentials/${id}` : '/api/dns-credentials', {
@@ -115,7 +126,7 @@ export const api = {
     request<{ domain: Domain; apply?: Domain['status']['apply'] }>(`/api/domains/${id}/apply-dns`, { method: 'POST' }),
   rotateDkim: (id: number, selector?: string) =>
     request<{ domain: Domain }>(`/api/domains/${id}/rotate-dkim`, { method: 'POST', data: { selector } }),
-  sendTest: (id: number, data: { from?: string; to: string; subject?: string; text?: string }) =>
+  sendTest: (id: number, data: { from?: string; to: string; subject?: string; text?: string; smtpRelayId?: number | string | null }) =>
     request<{ queued: boolean }>(`/api/domains/${id}/test-send`, { method: 'POST', data }),
   deleteDomain: (id: number) => request<{ deleted: boolean }>(`/api/domains/${id}`, { method: 'DELETE' }),
   adminSettings: () => request<{ settings: RuntimeConfig }>('/api/admin/settings'),

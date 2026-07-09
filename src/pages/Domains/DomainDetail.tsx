@@ -33,7 +33,8 @@ import type {
   DomainPatchPayload,
   RuntimeConfig,
   SendEvent,
-  SmtpCredential
+  SmtpCredential,
+  SmtpRelay
 } from '../../frontend/types';
 
 interface DomainDetailProps {
@@ -43,6 +44,7 @@ interface DomainDetailProps {
   apiTokens: ApiToken[];
   events: SendEvent[];
   dnsCredentials: DnsCredential[];
+  smtpRelays: SmtpRelay[];
   actionLoading?: boolean;
   initialTab?: string;
   onBack: () => void;
@@ -61,6 +63,7 @@ export default function DomainDetail({
   apiTokens,
   events,
   dnsCredentials,
+  smtpRelays,
   actionLoading,
   initialTab,
   onBack,
@@ -76,6 +79,7 @@ export default function DomainDetail({
   const [editOpen, setEditOpen] = useState(false);
   const [form] = Form.useForm<DomainPatchPayload>();
   const dnsApiName = dnsCredentials.find((item) => item.id === domain.dnsCredentialId)?.name;
+  const smtpRelayName = smtpRelays.find((item) => item.id === domain.smtpRelayId)?.name;
   const domainEvents = events.filter((event) => event.domain === domain.domain);
   const records = useMemo(() => orderedRecords(domain.status?.records || []), [domain.status?.records]);
 
@@ -83,6 +87,7 @@ export default function DomainDetail({
     form.setFieldsValue({
       selector: domain.selector,
       dnsCredentialId: domain.dnsCredentialId,
+      smtpRelayId: domain.smtpRelayId,
       senderHost: domain.senderHost,
       sendingIp: domain.sendingIp,
       spfExtra: domain.spfExtra,
@@ -94,7 +99,11 @@ export default function DomainDetail({
 
   async function saveEdit() {
     const values = await form.validateFields();
-    await onPatchDomain(domain, values);
+    await onPatchDomain(domain, {
+      ...values,
+      dnsCredentialId: values.dnsCredentialId ?? null,
+      smtpRelayId: values.smtpRelayId ?? null
+    });
     setEditOpen(false);
   }
 
@@ -117,7 +126,7 @@ export default function DomainDetail({
         activeKey={activeTab}
         onChange={setActiveTab}
         items={[
-          { key: 'overview', label: 'Overview', children: <OverviewTab domain={domain} events={domainEvents} onDelete={() => onDelete(domain)} /> },
+          { key: 'overview', label: 'Overview', children: <OverviewTab domain={domain} events={domainEvents} smtpRelayName={smtpRelayName} onDelete={() => onDelete(domain)} /> },
           {
             key: 'dns',
             label: 'DNS Records',
@@ -161,6 +170,16 @@ export default function DomainDetail({
               }))}
             />
           </Form.Item>
+          <Form.Item name="smtpRelayId" label={t('smtpRelay.domainDefault')}>
+            <Select
+              allowClear
+              placeholder={t('smtpRelay.useResolutionOrder')}
+              options={smtpRelays.map((relay) => ({
+                value: relay.id,
+                label: relayLabel(relay, t)
+              }))}
+            />
+          </Form.Item>
           <Form.Item name="selector" label="DKIM selector" rules={[{ required: true, message: t('addDomain.selectorRequired') }]}>
             <Input />
           </Form.Item>
@@ -185,7 +204,17 @@ export default function DomainDetail({
   );
 }
 
-function OverviewTab({ domain, events, onDelete }: { domain: Domain; events: SendEvent[]; onDelete: () => void }) {
+function OverviewTab({
+  domain,
+  events,
+  smtpRelayName,
+  onDelete
+}: {
+  domain: Domain;
+  events: SendEvent[];
+  smtpRelayName?: string;
+  onDelete: () => void;
+}) {
   const { t } = useI18n();
   return (
     <Row gutter={[16, 16]}>
@@ -195,6 +224,7 @@ function OverviewTab({ domain, events, onDelete }: { domain: Domain; events: Sen
             <Descriptions.Item label={t('domains.domain')}>{domain.domain}</Descriptions.Item>
             <Descriptions.Item label={t('domains.senderHost')}>{domain.senderHost}</Descriptions.Item>
             <Descriptions.Item label={t('domains.sendingIp')}>{domain.sendingIp}</Descriptions.Item>
+            <Descriptions.Item label={t('smtpRelay.domainDefault')}>{smtpRelayName || t('smtpRelay.useResolutionOrder')}</Descriptions.Item>
             <Descriptions.Item label="DKIM selector">{domain.selector}</Descriptions.Item>
             <Descriptions.Item label={t('domains.lastSent')}>{events[0] ? new Date(events[0].createdAt).toLocaleString() : t('common.notFound')}</Descriptions.Item>
           </Descriptions>
@@ -416,6 +446,10 @@ function liveLabel(key: string, t: (key: string) => string) {
     senderA: t('dnsRecord.senderA'),
     ptr: t('dnsRecord.ptr')
   }[key] || key;
+}
+
+function relayLabel(relay: SmtpRelay, t: (key: string) => string) {
+  return `${relay.name}${relay.isDefault ? ` · ${t('smtpRelay.default')}` : ''} · ${relay.host}:${relay.port}`;
 }
 
 function copyable(value: string, onCopy: (value: string) => void) {

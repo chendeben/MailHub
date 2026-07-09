@@ -3,13 +3,14 @@ import { Button, Checkbox, Drawer, Form, Input, Select, Space, Steps, Typography
 import { useEffect, useState } from 'react';
 
 import { useI18n } from '../../frontend/i18n/react';
-import type { AddDomainPayload, DnsCredential, RuntimeConfig } from '../../frontend/types';
+import type { AddDomainPayload, DnsCredential, RuntimeConfig, SmtpRelay } from '../../frontend/types';
 
 interface AddDomainDrawerProps {
   open: boolean;
   loading?: boolean;
   config: RuntimeConfig | null;
   dnsCredentials: DnsCredential[];
+  smtpRelays: SmtpRelay[];
   onClose: () => void;
   onSubmit: (values: AddDomainPayload) => Promise<void>;
 }
@@ -19,6 +20,7 @@ export function AddDomainDrawer({
   loading,
   config,
   dnsCredentials,
+  smtpRelays,
   onClose,
   onSubmit
 }: AddDomainDrawerProps) {
@@ -116,6 +118,20 @@ export function AddDomainDrawer({
             <Typography.Paragraph type="secondary">
               {t('addDomain.dnsHint')}
             </Typography.Paragraph>
+            <Form.Item
+              name="smtpRelayId"
+              label={t('smtpRelay.domainDefault')}
+              extra={t('smtpRelay.domainDefaultExtra')}
+            >
+              <Select
+                allowClear
+                placeholder={t('smtpRelay.useResolutionOrder')}
+                options={smtpRelays.map((relay) => ({
+                  value: relay.id,
+                  label: relayLabel(relay, t)
+                }))}
+              />
+            </Form.Item>
           </div>
           <div hidden={current !== 2}>
             <Form.Item name="selector" label="DKIM selector" rules={[{ required: true, message: t('addDomain.selectorRequired') }]}>
@@ -156,7 +172,7 @@ export function AddDomainDrawer({
 
 function stepFields(step: number): Array<keyof AddDomainPayload> {
   if (step === 0) return ['domain', 'senderHost', 'sendingIp'];
-  if (step === 1) return ['dnsCredentialId'];
+  if (step === 1) return ['dnsCredentialId', 'smtpRelayId'];
   if (step === 2) return ['selector', 'dmarcPolicy', 'spfExtra'];
   return [];
 }
@@ -172,4 +188,8 @@ function providerLabel(provider: string) {
     aliyun: 'Aliyun DNS',
     dnspod: 'Tencent DNSPod'
   }[provider] || provider;
+}
+
+function relayLabel(relay: SmtpRelay, t: (key: string) => string) {
+  return `${relay.name}${relay.isDefault ? ` · ${t('smtpRelay.default')}` : ''} · ${relay.host}:${relay.port}`;
 }
