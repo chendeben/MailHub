@@ -87,6 +87,44 @@ test('cloudflare provider paginates exact record lookups before creating SPF rec
   assert.equal(calls.some((call) => call.method === 'POST'), false);
 });
 
+test('cloudflare provider matches quoted TXT SPF content returned by the API', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const urlText = String(url);
+    calls.push({ url: urlText, method: options.method || 'GET', body: options.body });
+    if (urlText.includes('/zones?name=example.com')) {
+      return json({ success: true, result: [{ id: 'zone-1', name: 'example.com' }] });
+    }
+    if (urlText.includes('/dns_records?')) {
+      return json({
+        success: true,
+        result: [
+          { id: 'spf-1', type: 'TXT', name: 'example.com', content: '"v=spf1 include:spf.mailjet.com +include:spf.97admin.com -all"' },
+          { id: 'spf-2', type: 'TXT', name: 'example.com', content: '"v=spf1 include:spf.mailjet.com include:spf.97admin.com ip4:192.0.2.10 a:in.example.com -all"' }
+        ],
+        result_info: { page: 1, total_pages: 1 }
+      });
+    }
+    return json({ success: true, result: { id: 'ok' } });
+  };
+
+  const result = await applyDnsSetup(domainFixture(), cloudflareCredential(), {
+    records: [
+      {
+        key: 'spf',
+        host: 'example.com',
+        type: 'TXT',
+        value: 'v=spf1 include:spf.mailjet.com include:spf.97admin.com ip4:192.0.2.10 a:in.example.com -all'
+      }
+    ]
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call.method === 'PUT' && call.url.includes('/dns_records/spf-1')));
+  assert.ok(calls.some((call) => call.method === 'DELETE' && call.url.includes('/dns_records/spf-2')));
+  assert.equal(calls.some((call) => call.method === 'POST'), false);
+});
+
 test('aliyun provider signs and sends create/update record actions', async () => {
   const actions = [];
   globalThis.fetch = async (url) => {

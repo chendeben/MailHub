@@ -396,13 +396,19 @@ function pickExisting(desired, existing) {
 }
 
 function recordMatchesKind(desired, value) {
-  if (desired.key === 'spf') return /^v=spf1(?:\s|$)/i.test(String(value || '').trim());
-  if (desired.key === 'dmarc') return /^v=DMARC1(?:;|\s|$)/i.test(String(value || '').trim());
+  const normalized = normalizeValue(value);
+  if (desired.key === 'spf') return /^v=spf1(?:\s|$)/i.test(normalized);
+  if (desired.key === 'dmarc') return /^v=DMARC1(?:;|\s|$)/i.test(normalized);
   return normalizeValue(value) === normalizeValue(desired.value);
 }
 
 function normalizeValue(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
+  return unquoteTxtValue(String(value || '').replace(/\s+/g, ' ').trim());
+}
+
+function unquoteTxtValue(value) {
+  if (value.length < 2 || !value.startsWith('"') || !value.endsWith('"')) return value;
+  return value.slice(1, -1).replace(/\\"/g, '"');
 }
 
 function sameDnsName(left, right) {
