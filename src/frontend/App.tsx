@@ -13,6 +13,7 @@ import PlaceholderPage from '../pages/PlaceholderPage';
 import SendingLogs from '../pages/SendingLogs';
 import Settings from '../pages/Settings';
 import SmtpCredentials from '../pages/SmtpCredentials';
+import Webhooks from '../pages/Webhooks';
 import { I18nProvider, useI18n } from './i18n/react';
 import { buildDnsApplyFeedback } from './domain-model.js';
 import { api } from './services/api';
@@ -560,6 +561,9 @@ function MailHubConsole() {
     }
     if (activeView === 'logs') {
       return <SendingLogs events={data.events} domains={data.domains} onCopy={copy} />;
+    }
+    if (activeView === 'webhooks') {
+      return <Webhooks domains={data.domains} onCopy={copy} />;
     }
     if (activeView === 'admin') {
       return <AdminPage me={data.me} />;

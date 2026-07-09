@@ -12,11 +12,14 @@ import {
   createAccountToken,
   createDomain,
   createUserWithAccountToken,
+  createWebhook,
   consumeAccountToken,
   deleteApiToken,
   deleteDnsCredential,
   deleteDomain,
   deleteSmtpCredential,
+  deleteWebhook,
+  enqueueWebhookTestDelivery,
   getAdminResourceInventory,
   getAdminUser,
   getDnsCredential,
@@ -40,10 +43,14 @@ import {
   listSmtpCredentials,
   listSmtpRelays,
   listUsersWithResourceCounts,
+  listWebhookDeliveries,
+  listWebhooks,
   logAudit,
   logSendEvent,
   markUserEmailVerified,
   previewUserMerge,
+  replayWebhookDelivery,
+  rotateWebhookSecret,
   saveDnsCredential,
   saveDomainStatus,
   saveSettings,
@@ -59,6 +66,7 @@ import {
   updateDkim,
   updateDomain,
   updateUser,
+  updateWebhook,
   executeUserMerge,
   verifyApiToken,
   verifyUserCredentials
@@ -66,6 +74,7 @@ import {
 import { applyDnsSetup, testDnsCredential } from './dns-providers.js';
 import { startDnsAutoChecker } from './dns-auto-checker.js';
 import { startPostfixDeliveryTracker } from './delivery-tracker.js';
+import { assertSafeWebhookUrl, startWebhookWorker } from './webhook-dispatcher.js';
 import { buildDnsGuide, buildSystemDnsChecks } from './dns-guide.js';
 import { createDkimKeyPair } from './dkim.js';
 import {
@@ -109,6 +118,11 @@ const envConfig = {
   dnsAutoCheckEnabled: String(process.env.DNS_AUTO_CHECK_ENABLED || 'true').toLowerCase() !== 'false',
   dnsAutoCheckIntervalMs: Number(process.env.DNS_AUTO_CHECK_INTERVAL_MS || 60000),
   dnsAutoCheckLimit: Number(process.env.DNS_AUTO_CHECK_LIMIT || 25),
+  webhookWorkerEnabled:
+    String(process.env.WEBHOOK_WORKER_ENABLED || 'true').toLowerCase() !== 'false' &&
+    String(process.env.WEBHOOK_WORKER_ENABLED || '') !== '0',
+  webhookWorkerIntervalMs: Number(process.env.WEBHOOK_WORKER_INTERVAL_MS || 10000),
+  webhookWorkerBatchSize: Number(process.env.WEBHOOK_WORKER_BATCH_SIZE || 3),
   submissionEnabled: String(process.env.SUBMISSION_ENABLED || 'true').toLowerCase() !== 'false',
   submissionHost: process.env.SUBMISSION_HOST || process.env.APP_BASE_URL?.replace(/^https?:\/\//, '') || 'localhost',
   submissionListeners: parseSubmissionListeners(process.env.SUBMISSION_PORTS),
@@ -155,6 +169,12 @@ startDnsAutoChecker({
   enabled: envConfig.dnsAutoCheckEnabled,
   intervalMs: envConfig.dnsAutoCheckIntervalMs,
   limit: envConfig.dnsAutoCheckLimit
+});
+
+startWebhookWorker({
+  enabled: envConfig.webhookWorkerEnabled,
+  intervalMs: envConfig.webhookWorkerIntervalMs,
+  batchSize: envConfig.webhookWorkerBatchSize
 });
 
 const server = http.createServer(async (req, res) => {
@@ -401,6 +421,99 @@ async function handleApi(req, res, url, user) {
       if (!credential) return sendJson(res, 404, { error: 'DNS 凭据不存在。' });
       const result = await testDnsCredential(credential);
       return sendJson(res, result.ok ? 200 : 400, result);
+    }
+  }
+
+  if (method === 'GET' && pathname === '/api/webhooks') {
+    let domainId;
+    if (url.searchParams.has('domainId')) {
+      const raw = url.searchParams.get('domainId');
+      if (raw === '' || raw === 'null') {
+        domainId = null;
+      } else {
+        domainId = Number(raw);
+        if (!Number.isInteger(domainId) || domainId <= 0) {
+          return sendJson(res, 400, { error: 'domainId 无效。' });
+        }
+      }
+    }
+    return sendJson(res, 200, { webhooks: listWebhooks(user.id, { domainId }) });
+  }
+  if (method === 'POST' && pathname === '/api/webhooks') {
+    const body = await readJson(req);
+    try {
+      await assertSafeWebhookUrl(String(body.url || '').trim());
+      const webhook = createWebhook(user.id, {
+        name: body.name,
+        url: body.url,
+        events: body.events,
+        domainId: body.domainId === undefined ? null : body.domainId,
+        enabled: body.enabled
+      });
+      return sendJson(res, 201, { webhook });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message || 'Webhook 创建失败。' });
+    }
+  }
+  const webhookMatch = pathname.match(/^\/api\/webhooks\/(\d+)(?:\/(rotate-secret|test))?$/);
+  if (webhookMatch) {
+    const id = Number(webhookMatch[1]);
+    const action = webhookMatch[2] || '';
+    if (method === 'PATCH' && !action) {
+      const body = await readJson(req);
+      try {
+        if (body.url !== undefined) {
+          await assertSafeWebhookUrl(String(body.url || '').trim());
+        }
+        const patch = {};
+        if (body.name !== undefined) patch.name = body.name;
+        if (body.url !== undefined) patch.url = body.url;
+        if (body.events !== undefined) patch.events = body.events;
+        if (body.domainId !== undefined) patch.domainId = body.domainId;
+        if (body.enabled !== undefined) patch.enabled = body.enabled;
+        const webhook = updateWebhook(user.id, id, patch);
+        if (!webhook) return sendJson(res, 404, { error: 'Webhook 不存在。' });
+        return sendJson(res, 200, { webhook });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || 'Webhook 更新失败。' });
+      }
+    }
+    if (method === 'DELETE' && !action) {
+      const deleted = deleteWebhook(user.id, id);
+      return sendJson(res, deleted ? 200 : 404, { deleted });
+    }
+    if (method === 'POST' && action === 'rotate-secret') {
+      const webhook = rotateWebhookSecret(user.id, id);
+      if (!webhook) return sendJson(res, 404, { error: 'Webhook 不存在。' });
+      return sendJson(res, 200, { webhook });
+    }
+    if (method === 'POST' && action === 'test') {
+      try {
+        const delivery = enqueueWebhookTestDelivery(user.id, id);
+        if (!delivery) return sendJson(res, 404, { error: 'Webhook 不存在。' });
+        return sendJson(res, 202, { delivery });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message || 'Webhook 测试失败。' });
+      }
+    }
+  }
+
+  if (method === 'GET' && pathname === '/api/webhook-deliveries') {
+    const filters = {};
+    if (url.searchParams.has('status')) filters.status = url.searchParams.get('status');
+    if (url.searchParams.has('webhookId')) filters.webhookId = Number(url.searchParams.get('webhookId'));
+    if (url.searchParams.has('eventType')) filters.eventType = url.searchParams.get('eventType');
+    if (url.searchParams.has('limit')) filters.limit = url.searchParams.get('limit');
+    return sendJson(res, 200, { deliveries: listWebhookDeliveries(user.id, filters) });
+  }
+  const webhookDeliveryReplayMatch = pathname.match(/^\/api\/webhook-deliveries\/(\d+)\/replay$/);
+  if (webhookDeliveryReplayMatch && method === 'POST') {
+    try {
+      const delivery = replayWebhookDelivery(user.id, Number(webhookDeliveryReplayMatch[1]));
+      if (!delivery) return sendJson(res, 404, { error: 'Webhook 投递记录不存在。' });
+      return sendJson(res, 200, { delivery });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message || 'Webhook 重放失败。' });
     }
   }
 

@@ -3,6 +3,17 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { dkimPublicFromPrivateKey } from './dkim.js';
+import {
+  MAX_WEBHOOK_ATTEMPTS,
+  WEBHOOK_LEASE_MS,
+  buildWebhookPayload,
+  eventTypeForStatus,
+  isTerminalWebhookStatus,
+  nextBackoffMs,
+  normalizeWebhookEvents,
+  parseWebhookEventsJson,
+  resolveWebhooksForEvent
+} from './webhook-model.js';
 
 let db;
 let secretKey = '';
@@ -147,6 +158,40 @@ export function initDatabase(dataDir, secret = '') {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS webhooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      domain_id INTEGER,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      secret_ciphertext TEXT NOT NULL,
+      secret_prefix TEXT NOT NULL,
+      events_json TEXT NOT NULL,
+      enabled TEXT NOT NULL DEFAULT 'true',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      webhook_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      send_event_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_attempt_at TEXT,
+      response_status INTEGER,
+      response_body_preview TEXT NOT NULL DEFAULT '',
+      error TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE,
+      UNIQUE(webhook_id, send_event_id, event_type)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON api_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_account_tokens_user_purpose ON account_tokens(user_id, purpose);
     CREATE INDEX IF NOT EXISTS idx_account_tokens_expires_at ON account_tokens(expires_at);
@@ -155,6 +200,10 @@ export function initDatabase(dataDir, secret = '') {
     CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_user_id ON audit_logs(actor_user_id);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_target_user_id ON audit_logs(target_user_id);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+    CREATE INDEX IF NOT EXISTS idx_webhooks_user_id ON webhooks(user_id);
+    CREATE INDEX IF NOT EXISTS idx_webhooks_user_domain ON webhooks(user_id, domain_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next ON webhook_deliveries(status, next_attempt_at);
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_user_created ON webhook_deliveries(user_id, created_at);
   `);
   ensureColumn('domains', 'user_id', 'INTEGER');
   ensureColumn('domains', 'dns_credential_id', 'INTEGER');
@@ -748,6 +797,7 @@ export function listAuditLogs(filters = {}) {
 
 export function logSendEvent(event) {
   const queueId = normalizeQueueId(event.queueId || extractQueueIdFromText(event.detail));
+  const recipients = Array.isArray(event.recipients) ? event.recipients : [];
   const result = requireDb()
     .prepare(`
       INSERT INTO send_events (
@@ -761,7 +811,7 @@ export function logSendEvent(event) {
       event.domainId ?? null,
       event.smtpRelayId ?? null,
       event.sender,
-      JSON.stringify(event.recipients),
+      JSON.stringify(recipients),
       event.subject,
       event.status,
       event.detail ?? '',
@@ -771,7 +821,27 @@ export function logSendEvent(event) {
       event.deliveredAt ?? null,
       now()
     );
-  return result.lastInsertRowid;
+  const id = result.lastInsertRowid;
+  if (isTerminalWebhookStatus(event.status)) {
+    try {
+      enqueueWebhookDeliveries({
+        id,
+        userId: event.userId,
+        domainId: event.domainId ?? null,
+        domain: event.domain,
+        status: event.status,
+        sender: event.sender,
+        recipients,
+        subject: event.subject,
+        detail: event.detail ?? '',
+        queueId,
+        deliveredAt: event.deliveredAt ?? null
+      });
+    } catch (error) {
+      console.error('webhook enqueue after logSendEvent failed', error);
+    }
+  }
+  return id;
 }
 
 export function updateSendEventDelivery(queueId, attempt) {
@@ -784,15 +854,35 @@ export function updateSendEventDelivery(queueId, attempt) {
   if (attempts.some((item) => deliveryAttemptKey(item) === deliveryAttemptKey(normalizedAttempt))) return true;
   const nextAttempts = [...attempts, normalizedAttempt];
   const recipients = safeJson(row.recipients, []);
+  const previousStatus = row.status;
   const nextStatus = deliveryStatusForEvent(recipients, nextAttempts, row.status);
   const deliveredAt = nextStatus === 'sent' ? normalizedAttempt.at : row.delivered_at;
+  const detail = deliveryAttemptDetail(normalizedAttempt);
   requireDb()
     .prepare(`
       UPDATE send_events
       SET status = ?, detail = ?, delivery_attempts_json = ?, delivered_at = ?
       WHERE id = ?
     `)
-    .run(nextStatus, deliveryAttemptDetail(normalizedAttempt), JSON.stringify(nextAttempts), deliveredAt, row.id);
+    .run(nextStatus, detail, JSON.stringify(nextAttempts), deliveredAt, row.id);
+  if (isTerminalWebhookStatus(nextStatus) && nextStatus !== previousStatus) {
+    try {
+      enqueueWebhookDeliveries({
+        id: row.id,
+        userId: row.user_id,
+        domainId: row.domain_id,
+        status: nextStatus,
+        sender: row.sender,
+        recipients,
+        subject: row.subject,
+        detail,
+        queueId: cleanQueueId,
+        deliveredAt
+      });
+    } catch (error) {
+      console.error('webhook enqueue after updateSendEventDelivery failed', error);
+    }
+  }
   return true;
 }
 
@@ -824,6 +914,511 @@ export function listSendEvents(userId, limit = 30) {
       deliveredAt: row.delivered_at,
       createdAt: row.created_at
     }));
+}
+
+export function listWebhooks(userId, { domainId } = {}) {
+  const params = [userId];
+  let domainClause = '';
+  if (domainId === null) {
+    domainClause = ' AND domain_id IS NULL';
+  } else if (domainId !== undefined) {
+    domainClause = ' AND domain_id = ?';
+    params.push(domainId);
+  }
+  return requireDb()
+    .prepare(`
+      SELECT *
+      FROM webhooks
+      WHERE user_id = ?${domainClause}
+      ORDER BY created_at DESC, id DESC
+    `)
+    .all(...params)
+    .map(publicWebhook);
+}
+
+export function getWebhook(id, userId) {
+  const row = getWebhookRow(id, userId);
+  return publicWebhook(row);
+}
+
+export function createWebhook(userId, { name, url, events, domainId = null, enabled = true } = {}) {
+  const cleanName = String(name || '').trim();
+  const cleanUrl = String(url || '').trim();
+  if (!cleanName) throw new Error('Webhook 名称不能为空。');
+  if (!cleanUrl) throw new Error('Webhook URL 不能为空。');
+  const normalizedEvents = normalizeWebhookEvents(events);
+  const resolvedDomainId = normalizeWebhookDomainId(userId, domainId);
+  const secret = generateWebhookSecret();
+  const createdAt = now();
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO webhooks (
+        user_id, domain_id, name, url, secret_ciphertext, secret_prefix,
+        events_json, enabled, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      userId,
+      resolvedDomainId,
+      cleanName,
+      cleanUrl,
+      encryptSecret(secret),
+      secret.slice(0, 8),
+      JSON.stringify(normalizedEvents),
+      boolString(enabled),
+      createdAt,
+      createdAt
+    );
+  return {
+    ...getWebhook(result.lastInsertRowid, userId),
+    secret
+  };
+}
+
+export function updateWebhook(userId, id, patch = {}) {
+  const current = getWebhookRow(id, userId);
+  if (!current) return null;
+  const nextName = patch.name !== undefined ? String(patch.name || '').trim() : current.name;
+  const nextUrl = patch.url !== undefined ? String(patch.url || '').trim() : current.url;
+  if (!nextName) throw new Error('Webhook 名称不能为空。');
+  if (!nextUrl) throw new Error('Webhook URL 不能为空。');
+  const nextEvents = patch.events !== undefined
+    ? normalizeWebhookEvents(patch.events)
+    : parseWebhookEventsJson(current.events_json);
+  const nextDomainId = patch.domainId !== undefined
+    ? normalizeWebhookDomainId(userId, patch.domainId)
+    : current.domain_id;
+  const nextEnabled = patch.enabled !== undefined ? boolString(patch.enabled) : current.enabled;
+  const updatedAt = now();
+  requireDb()
+    .prepare(`
+      UPDATE webhooks
+      SET domain_id = ?, name = ?, url = ?, events_json = ?, enabled = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `)
+    .run(nextDomainId, nextName, nextUrl, JSON.stringify(nextEvents), nextEnabled, updatedAt, id, userId);
+  return getWebhook(id, userId);
+}
+
+export function rotateWebhookSecret(userId, id) {
+  const current = getWebhookRow(id, userId);
+  if (!current) return null;
+  const secret = generateWebhookSecret();
+  const updatedAt = now();
+  requireDb()
+    .prepare(`
+      UPDATE webhooks
+      SET secret_ciphertext = ?, secret_prefix = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `)
+    .run(encryptSecret(secret), secret.slice(0, 8), updatedAt, id, userId);
+  return {
+    ...getWebhook(id, userId),
+    secret
+  };
+}
+
+export function deleteWebhook(userId, id) {
+  const result = requireDb()
+    .prepare('DELETE FROM webhooks WHERE id = ? AND user_id = ?')
+    .run(id, userId);
+  return result.changes > 0;
+}
+
+/**
+ * Enqueue pending webhook deliveries for a terminal send event.
+ * Idempotent on (webhook_id, send_event_id, event_type).
+ */
+export function enqueueWebhookDeliveries(sendEvent) {
+  if (!sendEvent?.userId) return [];
+  if (!isTerminalWebhookStatus(sendEvent.status)) return [];
+
+  const eventType = sendEvent.status;
+  const externalType = eventTypeForStatus(eventType);
+  if (!externalType) return [];
+
+  const domainId = sendEvent.domainId ?? null;
+  const domainName = resolveSendEventDomainName(sendEvent);
+  const recipients = Array.isArray(sendEvent.recipients)
+    ? sendEvent.recipients
+    : safeJson(sendEvent.recipients, []);
+  const normalizedEvent = {
+    id: sendEvent.id,
+    userId: sendEvent.userId,
+    domainId,
+    domain: domainName,
+    status: eventType,
+    sender: sendEvent.sender || '',
+    recipients,
+    subject: sendEvent.subject || '',
+    detail: sendEvent.detail || '',
+    queueId: sendEvent.queueId || '',
+    deliveredAt: sendEvent.deliveredAt ?? null
+  };
+
+  const accountWebhooks = listWebhookRowsForResolve(sendEvent.userId, null);
+  const domainWebhooks = domainId == null
+    ? []
+    : listWebhookRowsForResolve(sendEvent.userId, domainId);
+  const targets = resolveWebhooksForEvent({
+    accountWebhooks,
+    domainWebhooks,
+    eventType
+  });
+
+  const created = [];
+  const database = requireDb();
+  for (const webhook of targets) {
+    database.exec('BEGIN');
+    try {
+      const existing = database
+        .prepare(`
+          SELECT id FROM webhook_deliveries
+          WHERE webhook_id = ? AND send_event_id = ? AND event_type = ?
+        `)
+        .get(webhook.id, normalizedEvent.id, eventType);
+      if (existing) {
+        database.exec('COMMIT');
+        continue;
+      }
+
+      const createdAt = now();
+      const insert = database
+        .prepare(`
+          INSERT INTO webhook_deliveries (
+            webhook_id, user_id, send_event_id, event_type, payload_json, status,
+            attempt_count, next_attempt_at, last_attempt_at, response_status,
+            response_body_preview, error, created_at
+          ) VALUES (?, ?, ?, ?, '{}', 'pending', 0, ?, NULL, NULL, '', '', ?)
+        `)
+        .run(
+          webhook.id,
+          sendEvent.userId,
+          normalizedEvent.id,
+          eventType,
+          createdAt,
+          createdAt
+        );
+      if (insert.changes !== 1) {
+        database.exec('ROLLBACK');
+        continue;
+      }
+      const deliveryId = insert.lastInsertRowid;
+      const payload = buildWebhookPayload({
+        deliveryId,
+        eventType: externalType,
+        createdAt,
+        sendEvent: normalizedEvent,
+        test: false
+      });
+      database
+        .prepare('UPDATE webhook_deliveries SET payload_json = ? WHERE id = ?')
+        .run(JSON.stringify(payload), deliveryId);
+      database.exec('COMMIT');
+      created.push(publicWebhookDelivery(
+        database.prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(deliveryId)
+      ));
+    } catch (error) {
+      try {
+        database.exec('ROLLBACK');
+      } catch {
+        // ignore rollback errors when no transaction is open
+      }
+      throw error;
+    }
+  }
+  return created;
+}
+
+export function claimWebhookDeliveries(limit = 3) {
+  const batchLimit = Math.max(1, Math.min(50, Number(limit) || 3));
+  const claimedAt = now();
+  const leaseUntil = new Date(Date.now() + WEBHOOK_LEASE_MS).toISOString();
+  const database = requireDb();
+  database.exec('BEGIN');
+  try {
+    const rows = database
+      .prepare(`
+        SELECT d.*, w.url AS webhook_url, w.secret_ciphertext AS webhook_secret_ciphertext
+        FROM webhook_deliveries d
+        JOIN webhooks w ON w.id = d.webhook_id
+        WHERE d.status = 'pending' AND d.next_attempt_at <= ?
+        ORDER BY d.next_attempt_at ASC, d.id ASC
+        LIMIT ?
+      `)
+      .all(claimedAt, batchLimit);
+
+    const claimed = [];
+    for (const row of rows) {
+      const update = database
+        .prepare(`
+          UPDATE webhook_deliveries
+          SET status = 'processing', last_attempt_at = ?, next_attempt_at = ?
+          WHERE id = ? AND status = 'pending'
+        `)
+        .run(claimedAt, leaseUntil, row.id);
+      if (update.changes !== 1) continue;
+      claimed.push({
+        delivery: publicWebhookDelivery({
+          ...row,
+          status: 'processing',
+          last_attempt_at: claimedAt,
+          next_attempt_at: leaseUntil
+        }),
+        webhook: {
+          id: row.webhook_id,
+          url: row.webhook_url,
+          secret: decryptSecret(row.webhook_secret_ciphertext)
+        }
+      });
+    }
+    database.exec('COMMIT');
+    return claimed;
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // ignore
+    }
+    throw error;
+  }
+}
+
+export function reapExpiredWebhookProcessing() {
+  const reapedAt = now();
+  const result = requireDb()
+    .prepare(`
+      UPDATE webhook_deliveries
+      SET status = 'pending', next_attempt_at = ?
+      WHERE status = 'processing' AND next_attempt_at < ?
+    `)
+    .run(reapedAt, reapedAt);
+  return result.changes;
+}
+
+export function completeWebhookDeliverySuccess(id, { responseStatus = null, bodyPreview = '' } = {}) {
+  const row = requireDb().prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(id);
+  if (!row) return null;
+  const attemptCount = Number(row.attempt_count || 0) + 1;
+  const completedAt = now();
+  requireDb()
+    .prepare(`
+      UPDATE webhook_deliveries
+      SET status = 'success',
+          attempt_count = ?,
+          last_attempt_at = ?,
+          next_attempt_at = ?,
+          response_status = ?,
+          response_body_preview = ?,
+          error = ''
+      WHERE id = ?
+    `)
+    .run(
+      attemptCount,
+      completedAt,
+      completedAt,
+      responseStatus,
+      truncateWebhookBodyPreview(bodyPreview),
+      id
+    );
+  return publicWebhookDelivery(requireDb().prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(id));
+}
+
+export function completeWebhookDeliveryFailure(
+  id,
+  { responseStatus = null, bodyPreview = '', error = '', permanent = false } = {}
+) {
+  const row = requireDb().prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(id);
+  if (!row) return null;
+  const attemptCount = Number(row.attempt_count || 0) + 1;
+  const completedAt = now();
+  // Permanent failures (SSRF blocked, invalid URL, missing secret) skip backoff and die immediately.
+  const exhausted = permanent || attemptCount >= MAX_WEBHOOK_ATTEMPTS;
+  const nextStatus = exhausted ? 'dead' : 'pending';
+  const nextAttemptAt = exhausted
+    ? completedAt
+    : new Date(Date.now() + nextBackoffMs(attemptCount)).toISOString();
+  requireDb()
+    .prepare(`
+      UPDATE webhook_deliveries
+      SET status = ?,
+          attempt_count = ?,
+          last_attempt_at = ?,
+          next_attempt_at = ?,
+          response_status = ?,
+          response_body_preview = ?,
+          error = ?
+      WHERE id = ?
+    `)
+    .run(
+      nextStatus,
+      attemptCount,
+      completedAt,
+      nextAttemptAt,
+      responseStatus,
+      truncateWebhookBodyPreview(bodyPreview),
+      String(error || ''),
+      id
+    );
+  return publicWebhookDelivery(requireDb().prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(id));
+}
+
+export function listWebhookDeliveries(userId, filters = {}) {
+  const where = ['user_id = ?'];
+  const params = [userId];
+  if (filters.status) {
+    where.push('status = ?');
+    params.push(String(filters.status));
+  }
+  if (filters.webhookId != null) {
+    where.push('webhook_id = ?');
+    params.push(Number(filters.webhookId));
+  }
+  if (filters.eventType) {
+    where.push('event_type = ?');
+    params.push(String(filters.eventType));
+  }
+  const limit = Math.max(1, Math.min(200, Number(filters.limit) || 50));
+  params.push(limit);
+  return requireDb()
+    .prepare(`
+      SELECT *
+      FROM webhook_deliveries
+      WHERE ${where.join(' AND ')}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `)
+    .all(...params)
+    .map(publicWebhookDelivery);
+}
+
+export function getWebhookDelivery(id, userId) {
+  const row = requireDb()
+    .prepare('SELECT * FROM webhook_deliveries WHERE id = ? AND user_id = ?')
+    .get(id, userId);
+  return publicWebhookDelivery(row);
+}
+
+export function replayWebhookDelivery(userId, id) {
+  const row = requireDb()
+    .prepare('SELECT * FROM webhook_deliveries WHERE id = ? AND user_id = ?')
+    .get(id, userId);
+  if (!row) return null;
+  if (row.status === 'processing') {
+    throw new Error('Webhook 正在投递中，请等待完成或租约过期后再重放。');
+  }
+  const resetAt = now();
+  requireDb()
+    .prepare(`
+      UPDATE webhook_deliveries
+      SET status = 'pending',
+          attempt_count = 0,
+          next_attempt_at = ?,
+          last_attempt_at = NULL,
+          response_status = NULL,
+          response_body_preview = '',
+          error = ''
+      WHERE id = ? AND user_id = ?
+    `)
+    .run(resetAt, id, userId);
+  return getWebhookDelivery(id, userId);
+}
+
+export function enqueueWebhookTestDelivery(userId, webhookId) {
+  const webhook = getWebhookRow(webhookId, userId);
+  if (!webhook) return null;
+
+  const events = parseWebhookEventsJson(webhook.events_json);
+  const eventType = events[0] || 'sent';
+  const externalType = eventTypeForStatus(eventType) || 'email.sent';
+  const firstDomain = requireDb()
+    .prepare('SELECT domain FROM domains WHERE user_id = ? ORDER BY created_at ASC, id ASC LIMIT 1')
+    .get(userId);
+  const domainName = firstDomain?.domain || 'example.com';
+  const sendEvent = {
+    id: 0,
+    status: eventType,
+    queueId: '',
+    domain: domainName,
+    sender: `noreply@${domainName}`,
+    recipients: ['webhook-test@example.com'],
+    subject: 'MailHub webhook test',
+    detail: 'test delivery',
+    deliveredAt: null
+  };
+
+  const database = requireDb();
+  database.exec('BEGIN');
+  try {
+    const existing = database
+      .prepare(`
+        SELECT * FROM webhook_deliveries
+        WHERE webhook_id = ? AND send_event_id = 0 AND event_type = ?
+      `)
+      .get(webhook.id, eventType);
+
+    if (existing) {
+      if (existing.status === 'processing') {
+        database.exec('ROLLBACK');
+        throw new Error('Webhook 正在投递中，请等待完成或租约过期后再测试。');
+      }
+      const resetAt = now();
+      database
+        .prepare(`
+          UPDATE webhook_deliveries
+          SET status = 'pending',
+              attempt_count = 0,
+              next_attempt_at = ?,
+              last_attempt_at = NULL,
+              response_status = NULL,
+              response_body_preview = '',
+              error = ''
+          WHERE id = ?
+        `)
+        .run(resetAt, existing.id);
+      database.exec('COMMIT');
+      return publicWebhookDelivery(
+        database.prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(existing.id)
+      );
+    }
+
+    const createdAt = now();
+    const insert = database
+      .prepare(`
+        INSERT INTO webhook_deliveries (
+          webhook_id, user_id, send_event_id, event_type, payload_json, status,
+          attempt_count, next_attempt_at, last_attempt_at, response_status,
+          response_body_preview, error, created_at
+        ) VALUES (?, ?, 0, ?, '{}', 'pending', 0, ?, NULL, NULL, '', '', ?)
+      `)
+      .run(webhook.id, userId, eventType, createdAt, createdAt);
+    if (insert.changes !== 1) {
+      database.exec('ROLLBACK');
+      return null;
+    }
+    const deliveryId = insert.lastInsertRowid;
+    const payload = buildWebhookPayload({
+      deliveryId,
+      eventType: externalType,
+      createdAt,
+      sendEvent,
+      test: true
+    });
+    database
+      .prepare('UPDATE webhook_deliveries SET payload_json = ? WHERE id = ?')
+      .run(JSON.stringify(payload), deliveryId);
+    database.exec('COMMIT');
+    return publicWebhookDelivery(
+      database.prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(deliveryId)
+    );
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // ignore
+    }
+    throw error;
+  }
 }
 
 export function getSendAnalytics(userId, { days = 7 } = {}) {
@@ -1655,6 +2250,94 @@ function publicAuditLog(row) {
     summary: safeJson(row.summary_json, {}),
     createdAt: row.created_at
   };
+}
+
+function getWebhookRow(id, userId) {
+  return requireDb()
+    .prepare('SELECT * FROM webhooks WHERE id = ? AND user_id = ?')
+    .get(id, userId);
+}
+
+function publicWebhook(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    domainId: row.domain_id ?? null,
+    name: row.name,
+    url: row.url,
+    secretPrefix: row.secret_prefix,
+    events: parseWebhookEventsJson(row.events_json),
+    enabled: row.enabled === 'true' || row.enabled === true || row.enabled === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function publicWebhookDelivery(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    webhookId: row.webhook_id,
+    userId: row.user_id,
+    sendEventId: row.send_event_id,
+    eventType: row.event_type,
+    payloadJson: row.payload_json,
+    status: row.status,
+    attemptCount: Number(row.attempt_count || 0),
+    nextAttemptAt: row.next_attempt_at,
+    lastAttemptAt: row.last_attempt_at,
+    responseStatus: row.response_status ?? null,
+    responseBodyPreview: row.response_body_preview || '',
+    error: row.error || '',
+    createdAt: row.created_at
+  };
+}
+
+function listWebhookRowsForResolve(userId, domainId) {
+  const rows = domainId == null
+    ? requireDb()
+      .prepare('SELECT * FROM webhooks WHERE user_id = ? AND domain_id IS NULL')
+      .all(userId)
+    : requireDb()
+      .prepare('SELECT * FROM webhooks WHERE user_id = ? AND domain_id = ?')
+      .all(userId, domainId);
+  return rows.map((row) => ({
+    id: row.id,
+    domainId: row.domain_id ?? null,
+    enabled: row.enabled === 'true' || row.enabled === true || row.enabled === 1,
+    events: parseWebhookEventsJson(row.events_json)
+  }));
+}
+
+function normalizeWebhookDomainId(userId, domainId) {
+  if (domainId == null || domainId === '') return null;
+  const id = Number(domainId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error('域名不存在。');
+  const domain = requireDb()
+    .prepare('SELECT id FROM domains WHERE id = ? AND user_id = ?')
+    .get(id, userId);
+  if (!domain) throw new Error('域名不存在。');
+  return id;
+}
+
+function generateWebhookSecret() {
+  return `whsec_${crypto.randomBytes(24).toString('base64url')}`;
+}
+
+function resolveSendEventDomainName(sendEvent) {
+  if (sendEvent?.domain) return String(sendEvent.domain);
+  if (sendEvent?.domainId == null) return '';
+  const row = requireDb()
+    .prepare('SELECT domain FROM domains WHERE id = ?')
+    .get(sendEvent.domainId);
+  return row?.domain || '';
+}
+
+function truncateWebhookBodyPreview(value, maxLength = 2048) {
+  const text = String(value ?? '');
+  if (text.length <= maxLength) return text;
+  return text.slice(0, maxLength);
 }
 
 function normalizeUsername(value) {

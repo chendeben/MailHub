@@ -37,6 +37,7 @@ import type {
   SmtpCredential,
   SmtpRelay
 } from '../../frontend/types';
+import Webhooks from '../Webhooks';
 
 interface DomainDetailProps {
   domain: Domain;
@@ -157,7 +158,11 @@ export default function DomainDetail({
           },
           { key: 'logs', label: 'Sending Logs', children: <SendingLogsTab events={domainEvents} /> },
           { key: 'guide', label: 'Integration Guide', children: <IntegrationGuideTab domain={domain} config={config} apiTokens={apiTokens} /> },
-          { key: 'webhooks', label: 'Webhooks', children: <Placeholder title="Webhooks" /> }
+          {
+            key: 'webhooks',
+            label: 'Webhooks',
+            children: <Webhooks domainId={domain.id} domains={[domain]} onCopy={onCopy} />
+          }
         ]}
       />
       <Modal title={t('domainDetail.editTitle')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={saveEdit} confirmLoading={actionLoading}>
@@ -421,15 +426,6 @@ function IntegrationGuideTab({
   return (
     <SectionCard title={t('domainDetail.apiExample')}>
       <CodeBlock value={code} />
-    </SectionCard>
-  );
-}
-
-function Placeholder({ title }: { title: string }) {
-  const { t } = useI18n();
-  return (
-    <SectionCard>
-      <EmptyState description={`${title} ${t('domainDetail.placeholder')}`} />
     </SectionCard>
   );
 }

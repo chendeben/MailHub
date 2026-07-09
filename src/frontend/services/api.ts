@@ -19,7 +19,12 @@ import type {
   UserMergePreview,
   UserMergeResult,
   UserRole,
-  UserStatus
+  UserStatus,
+  Webhook,
+  WebhookDelivery,
+  WebhookDeliveryFilters,
+  WebhookPatchPayload,
+  WebhookPayload
 } from '../types';
 
 interface RequestOptions extends RequestInit {
@@ -195,7 +200,37 @@ export const api = {
     request<{ message: string }>('/api/auth/forgot-password', { method: 'POST', data: { email } }),
   resetPassword: (token: string, password: string) =>
     request<{ message: string }>('/api/auth/reset-password', { method: 'POST', data: { token, password } }),
-  logout: () => request<{ ok: boolean }>('/api/logout', { method: 'POST' })
+  logout: () => request<{ ok: boolean }>('/api/logout', { method: 'POST' }),
+  webhooks: (domainId?: number | null) => {
+    const params = new URLSearchParams();
+    if (domainId === null) params.set('domainId', 'null');
+    else if (domainId !== undefined) params.set('domainId', String(domainId));
+    const query = params.toString();
+    return request<{ webhooks: Webhook[] }>(`/api/webhooks${query ? `?${query}` : ''}`);
+  },
+  createWebhook: (data: WebhookPayload) =>
+    request<{ webhook: Webhook }>('/api/webhooks', { method: 'POST', data }),
+  updateWebhook: (id: number, data: WebhookPatchPayload) =>
+    request<{ webhook: Webhook }>(`/api/webhooks/${id}`, { method: 'PATCH', data }),
+  deleteWebhook: (id: number) =>
+    request<{ deleted: boolean }>(`/api/webhooks/${id}`, { method: 'DELETE' }),
+  rotateWebhookSecret: (id: number) =>
+    request<{ webhook: Webhook }>(`/api/webhooks/${id}/rotate-secret`, { method: 'POST' }),
+  testWebhook: (id: number) =>
+    request<{ delivery: WebhookDelivery }>(`/api/webhooks/${id}/test`, { method: 'POST' }),
+  webhookDeliveries: (filters: WebhookDeliveryFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.status) params.set('status', String(filters.status));
+    if (filters.webhookId != null) params.set('webhookId', String(filters.webhookId));
+    if (filters.eventType) params.set('eventType', String(filters.eventType));
+    if (filters.limit != null) params.set('limit', String(filters.limit));
+    const query = params.toString();
+    return request<{ deliveries: WebhookDelivery[] }>(
+      `/api/webhook-deliveries${query ? `?${query}` : ''}`
+    );
+  },
+  replayWebhookDelivery: (id: number) =>
+    request<{ delivery: WebhookDelivery }>(`/api/webhook-deliveries/${id}/replay`, { method: 'POST' })
 };
 
 interface SystemMailActionResult {

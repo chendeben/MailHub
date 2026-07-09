@@ -77,3 +77,18 @@ test('translates smtp login credential labels separately from outbound relays', 
   assert.equal(en('smtp.loginCredentialsTitle'), 'Sending login credentials');
   assert.equal(en('smtpRelay.title'), 'Advanced: external SMTP relays');
 });
+
+test('translates webhook page chrome strings', () => {
+  const zh = createTranslator('zh-CN');
+  const en = createTranslator('en-US');
+
+  assert.equal(zh('webhooks.title'), 'Webhooks');
+  assert.equal(zh('webhooks.secretCreatedWarning'), '完整密钥只会显示这一次。关闭后无法再次查看，请立即复制并保存到安全位置。');
+  assert.equal(zh('webhooks.eventSent'), '已送达');
+  assert.equal(zh('webhooks.replay'), '重放');
+  assert.equal(zh('webhooks.domainOverrideHelp'), '若某域名对某一事件存在任何已启用的端点，则该事件不会再投递到账号级端点。');
+  assert.equal(en('webhooks.title'), 'Webhooks');
+  assert.equal(en('webhooks.create'), 'Create webhook');
+  assert.equal(en('webhooks.statusDead'), 'Dead');
+  assert.equal(en('actions.webhookCreated'), 'Webhook created');
+});

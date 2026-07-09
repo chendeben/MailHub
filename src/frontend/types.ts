@@ -367,3 +367,61 @@ export interface DomainPatchPayload {
   dmarcPolicy?: string;
   dmarcRua?: string;
 }
+
+export type WebhookEvent = 'sent' | 'bounced' | 'failed';
+export type WebhookDeliveryStatus = 'pending' | 'processing' | 'success' | 'dead';
+
+export interface Webhook {
+  id: number;
+  userId: number;
+  domainId: number | null;
+  name: string;
+  url: string;
+  secretPrefix: string;
+  events: WebhookEvent[];
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /** Present only on create / rotate-secret responses. */
+  secret?: string;
+}
+
+export interface WebhookPayload {
+  name: string;
+  url: string;
+  events: WebhookEvent[];
+  domainId?: number | string | null;
+  enabled?: boolean;
+}
+
+export interface WebhookPatchPayload {
+  name?: string;
+  url?: string;
+  events?: WebhookEvent[];
+  domainId?: number | string | null;
+  enabled?: boolean;
+}
+
+export interface WebhookDelivery {
+  id: number;
+  webhookId: number;
+  userId: number;
+  sendEventId: number;
+  eventType: WebhookEvent | string;
+  payloadJson?: string;
+  status: WebhookDeliveryStatus | string;
+  attemptCount: number;
+  nextAttemptAt?: string | null;
+  lastAttemptAt?: string | null;
+  responseStatus?: number | null;
+  responseBodyPreview?: string;
+  error?: string;
+  createdAt: string;
+}
+
+export interface WebhookDeliveryFilters {
+  status?: WebhookDeliveryStatus | string;
+  webhookId?: number;
+  eventType?: WebhookEvent | string;
+  limit?: number;
+}
