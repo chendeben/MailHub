@@ -228,6 +228,13 @@ body {
 
 .chart-card .ant-card-body {
   min-height: 364px;
+  overflow: visible;
+}
+
+.chart-card .g2-tooltip,
+.chart-card canvas,
+.chart-card svg {
+  overflow: visible;
 }
 
 .language-select {

@@ -101,7 +101,7 @@ function MailHubConsole() {
         api.config(),
         api.domains(),
         api.events(),
-        api.analytics(30),
+        api.analytics(7),
         api.smtpCredential(),
         api.smtpCredentials(),
         api.smtpRelays(),
@@ -245,7 +245,7 @@ function MailHubConsole() {
     const values = await testForm.validateFields();
     await runAction(async () => api.sendTest(testDomain.id, values), t('actions.testMailQueued'));
     setTestDomain(null);
-    const [events, analytics] = await Promise.all([api.events(), api.analytics(30)]);
+    const [events, analytics] = await Promise.all([api.events(), api.analytics(7)]);
     setData((current) => ({ ...current, events: events.events || [], analytics: analytics.analytics || current.analytics }));
   }
 

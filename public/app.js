@@ -143,7 +143,7 @@ async function refreshAll() {
       api('/api/config'),
       api('/api/domains'),
       api('/api/events'),
-      api('/api/analytics?days=30'),
+      api('/api/analytics?days=7'),
       api('/api/smtp-credential'),
       api('/api/dns-credentials'),
       api('/api/api-tokens')
@@ -1308,7 +1308,7 @@ async function sendTest(form) {
     await api(`/api/domains/${id}/test-send`, { method: 'POST', body: JSON.stringify(data) });
     const [events, analytics] = await Promise.all([
       api('/api/events'),
-      api('/api/analytics?days=30')
+      api('/api/analytics?days=7')
     ]);
     state.events = events.events || [];
     state.analytics = analytics.analytics || state.analytics;

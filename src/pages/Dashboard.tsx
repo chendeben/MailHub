@@ -132,8 +132,13 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 data={statusData}
                 angleField="value"
                 colorField="label"
-                innerRadius={0.64}
+                radius={0.68}
+                innerRadius={0.48}
                 height={316}
+                marginLeft={24}
+                marginRight={24}
+                marginTop={8}
+                marginBottom={8}
                 scale={{
                   color: {
                     range: [brandColors.chartSuccess, brandColors.chartDanger, brandColors.chartWarning]
@@ -142,7 +147,13 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 label={{
                   text: (datum: { label?: string; value?: number }) =>
                     `${datum.label || ''}${datum.value != null ? ` ${datum.value}` : ''}`,
-                  position: 'outside'
+                  position: 'outside',
+                  transform: [{ type: 'overlapDodgeY' }],
+                  style: {
+                    fontSize: 12,
+                    textAlign: 'center'
+                  },
+                  connector: true
                 }}
                 legend={{ color: { position: 'bottom' } }}
                 tooltip={{

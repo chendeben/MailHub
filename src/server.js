@@ -263,7 +263,7 @@ async function handleApi(req, res, url, user) {
     return sendJson(res, 200, { events: listSendEvents(user.id) });
   }
   if (method === 'GET' && pathname === '/api/analytics') {
-    return sendJson(res, 200, { analytics: getSendAnalytics(user.id, { days: Number(url.searchParams.get('days') || 30) }) });
+    return sendJson(res, 200, { analytics: getSendAnalytics(user.id, { days: Number(url.searchParams.get('days') || 7) }) });
   }
   if (method === 'GET' && pathname === '/api/smtp-credential') {
     return sendJson(res, 200, { credential: getSmtpCredential(user.id, { includePassword: true }) });

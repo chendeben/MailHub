@@ -826,7 +826,7 @@ export function listSendEvents(userId, limit = 30) {
     }));
 }
 
-export function getSendAnalytics(userId, { days = 30 } = {}) {
+export function getSendAnalytics(userId, { days = 7 } = {}) {
   const windowDays = clampAnalyticsDays(days);
   const since = new Date();
   since.setUTCHours(0, 0, 0, 0);
@@ -1709,8 +1709,8 @@ function clampTtl(value) {
 }
 
 function clampAnalyticsDays(value) {
-  const days = Number(value || 30);
-  if (!Number.isInteger(days) || days < 7) return 30;
+  const days = Number(value || 7);
+  if (!Number.isInteger(days) || days < 7) return 7;
   if (days > 90) return 90;
   return days;
 }
