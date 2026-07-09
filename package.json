@@ -21,7 +21,7 @@
   "bugs": {
     "url": "https://github.com/chendeben/MailHub/issues"
   },
-  "homepage": "https://github.com/chendeben/MailHub#readme",
+  "homepage": "https://mail-send.ss5.xyz",
   "scripts": {
     "start": "node src/server.js",
     "dev": "NODE_ENV=development node src/server.js",

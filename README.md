@@ -2,6 +2,11 @@
 
 MailHub is a Dockerized, multi-user outbound mail control panel with an SMTP Submission service and an HTTP sending API. It is designed for teams that want to self-host outbound email infrastructure with domain verification, DKIM signing, DNS guidance, SMTP credential management, outbound SMTP relay management, and API tokens.
 
+## Demo
+
+- **Live demo:** [https://mail-send.ss5.xyz](https://mail-send.ss5.xyz)
+- **Source:** [github.com/chendeben/MailHub](https://github.com/chendeben/MailHub)
+
 ## Features
 
 - Multi-user accounts with isolated domains, SMTP credentials, DNS API credentials, API tokens, outbound SMTP relays, and sending logs.
