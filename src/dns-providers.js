@@ -97,9 +97,25 @@ class CloudflareProvider {
   }
 
   async listRecords(zoneId, record) {
-    const params = new URLSearchParams({ type: record.type, name: record.host });
-    const response = await this.request(`/zones/${zoneId}/dns_records?${params}`);
-    return response.result || [];
+    const records = [];
+    let page = 1;
+    let totalPages = 1;
+    do {
+      const params = new URLSearchParams({
+        type: record.type,
+        'name.exact': record.host,
+        match: 'all',
+        page: String(page),
+        per_page: '100'
+      });
+      const response = await this.request(`/zones/${zoneId}/dns_records?${params}`);
+      records.push(
+        ...(response.result || []).filter((item) => item.type === record.type && sameDnsName(item.name, record.host))
+      );
+      totalPages = Number(response.result_info?.total_pages || page);
+      page += 1;
+    } while (page <= totalPages);
+    return records;
   }
 
   async zoneId(record, domain) {
@@ -387,6 +403,10 @@ function recordMatchesKind(desired, value) {
 
 function normalizeValue(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function sameDnsName(left, right) {
+  return normalizeZoneName(left) === normalizeZoneName(right);
 }
 
 function relativeName(host, zoneName) {
