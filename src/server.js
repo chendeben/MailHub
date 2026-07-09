@@ -192,6 +192,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/auth/reset-password') return await handleResetPassword(req, res);
 
     const user = getRequestUser(req, url.pathname);
+
+    if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/landing.html') {
+      if (user && (url.pathname === '/' || url.pathname === '/index.html')) {
+        return sendStaticFile(res, path.join(__dirname, '..', 'public', 'index.html'), { noStore: true });
+      }
+      if (!user && (url.pathname === '/' || url.pathname === '/landing.html')) {
+        return sendStaticFile(res, path.join(__dirname, '..', 'public', 'landing.html'), { noStore: true });
+      }
+      if (user && url.pathname === '/landing.html') {
+        return redirect(res, '/');
+      }
+    }
+
     if (isLoginAsset(url.pathname)) {
       if ((url.pathname === '/login' || url.pathname === '/register') && user) return redirect(res, '/');
       return await serveStatic(req, res, url);
@@ -1350,12 +1363,13 @@ async function serveStatic(req, res, url) {
   const pathname = decodeURIComponent(resolveStaticPathname(url.pathname));
   const filePath = path.normalize(path.join(publicDir, pathname));
   if (!filePath.startsWith(publicDir) || !existsSync(filePath) || statSync(filePath).isDirectory()) {
-    return sendStaticFile(res, path.join(publicDir, 'index.html'));
+    return sendStaticFile(res, path.join(publicDir, 'index.html'), { noStore: true });
   }
-  return sendStaticFile(res, filePath);
+  const noStore = path.extname(filePath) === '.html';
+  return sendStaticFile(res, filePath, { noStore });
 }
 
-async function sendStaticFile(res, filePath) {
+async function sendStaticFile(res, filePath, { noStore = false } = {}) {
   const ext = path.extname(filePath);
   const contentType = {
     '.html': 'text/html; charset=utf-8',
@@ -1364,7 +1378,11 @@ async function sendStaticFile(res, filePath) {
     '.json': 'application/json; charset=utf-8',
     '.svg': 'image/svg+xml'
   }[ext] || 'application/octet-stream';
-  res.writeHead(200, { 'Content-Type': contentType });
+  const headers = { 'Content-Type': contentType };
+  if (noStore || ext === '.html') {
+    headers['Cache-Control'] = 'private, no-store';
+  }
+  res.writeHead(200, headers);
   res.end(await readFile(filePath));
 }
 
@@ -1524,12 +1542,13 @@ function isLoginAsset(pathname) {
       '/reset-password',
       '/login.html',
       '/login.css',
-      '/login.js'
+      '/login.js',
+      '/landing.html'
     ].includes(pathname);
 }
 
 function resolveStaticPathname(pathname) {
-  if (pathname === '/') return '/index.html';
+  if (pathname === '/') return '/landing.html';
   if (['/login', '/register', '/forgot-password', '/resend-verification', '/reset-password'].includes(pathname)) return '/login.html';
   return pathname;
 }
