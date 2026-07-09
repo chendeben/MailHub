@@ -1,8 +1,14 @@
-import { Button, Card, Form, Input, Select, Space, Switch, Table, Tag, Typography } from 'antd';
+import { Button, Form, Input, Select, Space, Switch, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 
+import { PageHeader } from '../components/common/PageHeader';
+import { SectionCard } from '../components/common/SectionCard';
+import { StatusPill, type StatusTone } from '../components/common/StatusPill';
+import { StatusTag } from '../components/common/StatusTag';
+import { getDnsCurrentValues } from '../frontend/domain-model.js';
 import { useI18n } from '../frontend/i18n/react';
-import type { RuntimeConfig, User } from '../frontend/types';
+import type { DnsRecord, RuntimeConfig, User } from '../frontend/types';
+import { adminUserStatusMeta } from './Admin/admin-model.js';
 
 interface SettingsProps {
   me: User | null;
@@ -16,22 +22,63 @@ export default function Settings({ me, settings, users, loading, onSave }: Setti
   const { t } = useI18n();
   if (me?.role !== 'admin') {
     return (
-      <Card>
-        <Typography.Text type="secondary">{t('settings.noPermission')}</Typography.Text>
-      </Card>
+      <Space direction="vertical" size={20} className="full-width">
+        <PageHeader title={t('nav.settings')} />
+        <SectionCard>
+          <Typography.Text type="secondary">{t('settings.noPermission')}</Typography.Text>
+        </SectionCard>
+      </Space>
     );
   }
 
   const columns: ColumnsType<User> = [
     { title: 'Username', dataIndex: 'username' },
     { title: 'Email', dataIndex: 'email' },
-    { title: 'Role', dataIndex: 'role', render: (value) => <Tag>{value}</Tag> },
-    { title: 'Status', dataIndex: 'status', render: (value) => <Tag color={value === 'active' ? 'success' : 'default'}>{value}</Tag> }
+    {
+      title: 'Role',
+      dataIndex: 'role',
+      render: (value: string) => (
+        <StatusPill tone={value === 'admin' ? 'info' : 'neutral'}>
+          {roleLabel(value)}
+        </StatusPill>
+      )
+    },
+    {
+      title: 'Status',
+      dataIndex: 'status',
+      render: (value: string) => {
+        const meta = adminUserStatusMeta(value);
+        return <StatusPill tone={userStatusTone(meta.color)}>{meta.label}</StatusPill>;
+      }
+    }
   ];
+  const checkColumns: ColumnsType<DnsRecord> = [
+    { title: t('settings.checkItem'), dataIndex: 'label', width: 160 },
+    { title: t('dnsRecord.hostname'), dataIndex: 'host', width: 180, render: (value) => <Typography.Text code>{value || '-'}</Typography.Text> },
+    { title: t('dnsRecord.targetValue'), dataIndex: 'value', width: 220, render: (value) => <Typography.Text code>{value || '-'}</Typography.Text> },
+    {
+      title: t('dnsRecord.currentValue'),
+      width: 260,
+      render: (_, record) => {
+        const values: string[] = getDnsCurrentValues(record);
+        return values.length
+          ? (
+              <Space direction="vertical" size={4}>
+                {values.map((value) => <Typography.Text key={value} code>{value}</Typography.Text>)}
+              </Space>
+            )
+          : <Typography.Text type="secondary">{t('dnsRecord.emptyCurrent')}</Typography.Text>;
+      }
+    },
+    { title: t('common.status'), width: 120, render: (_, record) => <StatusTag record={record} /> }
+  ];
+  const checkData = settings?.systemChecks?.ptr ? [settings.systemChecks.ptr] : [];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <Card title="System">
+    <Space direction="vertical" size={20} className="full-width">
+      <PageHeader title={t('nav.settings')} />
+
+      <SectionCard title="System">
         <Form
           layout="vertical"
           initialValues={settings || undefined}
@@ -65,10 +112,42 @@ export default function Settings({ me, settings, users, loading, onSave }: Setti
             {t('settings.save')}
           </Button>
         </Form>
-      </Card>
-      <Card title="Users">
+      </SectionCard>
+
+      <SectionCard
+        title={t('settings.deliveryChecks')}
+        extra={
+          settings?.systemChecks?.checkedAt
+            ? <Typography.Text type="secondary">{new Date(settings.systemChecks.checkedAt).toLocaleString()}</Typography.Text>
+            : null
+        }
+      >
+        <Table
+          rowKey="key"
+          columns={checkColumns}
+          dataSource={checkData}
+          pagination={false}
+          scroll={{ x: 940 }}
+        />
+      </SectionCard>
+
+      <SectionCard title="Users">
         <Table rowKey="id" columns={columns} dataSource={users} />
-      </Card>
+      </SectionCard>
     </Space>
   );
+}
+
+function roleLabel(role: string) {
+  if (role === 'admin') return '管理员';
+  if (role === 'user') return '用户';
+  return role || '-';
+}
+
+function userStatusTone(color: string): StatusTone {
+  if (color === 'green' || color === 'success') return 'success';
+  if (color === 'gold' || color === 'orange' || color === 'warning') return 'warning';
+  if (color === 'red' || color === 'error') return 'error';
+  if (color === 'blue' || color === 'processing') return 'info';
+  return 'neutral';
 }

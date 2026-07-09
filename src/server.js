@@ -16,6 +16,7 @@ import {
   deleteApiToken,
   deleteDnsCredential,
   deleteDomain,
+  deleteSmtpCredential,
   getAdminResourceInventory,
   getAdminUser,
   getDnsCredential,
@@ -36,6 +37,7 @@ import {
   listDnsCredentials,
   listDomains,
   listSendEvents,
+  listSmtpCredentials,
   listSmtpRelays,
   listUsersWithResourceCounts,
   logAudit,
@@ -62,8 +64,9 @@ import {
   verifyUserCredentials
 } from './db.js';
 import { applyDnsSetup, testDnsCredential } from './dns-providers.js';
+import { startDnsAutoChecker } from './dns-auto-checker.js';
 import { startPostfixDeliveryTracker } from './delivery-tracker.js';
-import { buildDnsGuide } from './dns-guide.js';
+import { buildDnsGuide, buildSystemDnsChecks } from './dns-guide.js';
 import { createDkimKeyPair } from './dkim.js';
 import {
   buildMessage,
@@ -103,6 +106,9 @@ const envConfig = {
   postfixLogFile: process.env.POSTFIX_LOG_FILE || path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'postfix-logs', 'mail.log'),
   postfixLogPollIntervalMs: Number(process.env.POSTFIX_LOG_POLL_INTERVAL_MS || 5000),
   deliveryTrackingEnabled: String(process.env.DELIVERY_TRACKING_ENABLED || 'true').toLowerCase() !== 'false',
+  dnsAutoCheckEnabled: String(process.env.DNS_AUTO_CHECK_ENABLED || 'true').toLowerCase() !== 'false',
+  dnsAutoCheckIntervalMs: Number(process.env.DNS_AUTO_CHECK_INTERVAL_MS || 60000),
+  dnsAutoCheckLimit: Number(process.env.DNS_AUTO_CHECK_LIMIT || 25),
   submissionEnabled: String(process.env.SUBMISSION_ENABLED || 'true').toLowerCase() !== 'false',
   submissionHost: process.env.SUBMISSION_HOST || process.env.APP_BASE_URL?.replace(/^https?:\/\//, '') || 'localhost',
   submissionListeners: parseSubmissionListeners(process.env.SUBMISSION_PORTS),
@@ -143,6 +149,12 @@ startPostfixDeliveryTracker({
   enabled: envConfig.deliveryTrackingEnabled,
   logFile: envConfig.postfixLogFile,
   pollIntervalMs: envConfig.postfixLogPollIntervalMs
+});
+
+startDnsAutoChecker({
+  enabled: envConfig.dnsAutoCheckEnabled,
+  intervalMs: envConfig.dnsAutoCheckIntervalMs,
+  limit: envConfig.dnsAutoCheckLimit
 });
 
 const server = http.createServer(async (req, res) => {
@@ -259,7 +271,9 @@ async function handleApi(req, res, url, user) {
   if ((method === 'POST' || method === 'PUT' || method === 'PATCH') && pathname === '/api/smtp-credential') {
     const body = await readJson(req);
     try {
+      const current = getSmtpCredential(user.id);
       saveSmtpCredential(user.id, {
+        id: current?.id || null,
         username: String(body.username || '').trim(),
         password: String(body.password || '')
       });
@@ -268,6 +282,50 @@ async function handleApi(req, res, url, user) {
       throw error;
     }
     return sendJson(res, 200, { credential: getSmtpCredential(user.id, { includePassword: true }) });
+  }
+  if (method === 'GET' && pathname === '/api/smtp-credentials') {
+    return sendJson(res, 200, { credentials: listSmtpCredentials(user.id, { includePassword: true }) });
+  }
+  if (method === 'POST' && pathname === '/api/smtp-credentials') {
+    const body = await readJson(req);
+    try {
+      const credential = saveSmtpCredential(user.id, {
+        username: String(body.username || '').trim(),
+        password: String(body.password || '')
+      });
+      return sendJson(res, 201, { credential: getSmtpCredential(credential.id, user.id, { includePassword: true }) });
+    } catch (error) {
+      if (isUniqueError(error)) return sendJson(res, 409, { error: 'SMTP 用户名已被占用。' });
+      throw error;
+    }
+  }
+  const smtpCredentialMatch = pathname.match(/^\/api\/smtp-credentials\/(\d+)$/);
+  if (smtpCredentialMatch) {
+    const id = Number(smtpCredentialMatch[1]);
+    if (method === 'GET') {
+      const credential = getSmtpCredential(id, user.id, { includePassword: true });
+      return sendJson(res, credential ? 200 : 404, { credential });
+    }
+    if (method === 'PATCH' || method === 'PUT') {
+      const body = await readJson(req);
+      try {
+        const credential = saveSmtpCredential(user.id, {
+          id,
+          username: String(body.username || '').trim(),
+          password: String(body.password || '')
+        });
+        return sendJson(res, credential ? 200 : 404, {
+          credential: credential ? getSmtpCredential(credential.id, user.id, { includePassword: true }) : null
+        });
+      } catch (error) {
+        if (isUniqueError(error)) return sendJson(res, 409, { error: 'SMTP 用户名已被占用。' });
+        throw error;
+      }
+    }
+    if (method === 'DELETE') {
+      const deleted = deleteSmtpCredential(id, user.id);
+      return sendJson(res, deleted ? 200 : 404, { deleted });
+    }
   }
   if (method === 'GET' && pathname === '/api/smtp-relays') {
     return sendJson(res, 200, { relays: listSmtpRelays(user.id) });
@@ -447,7 +505,7 @@ async function handleAdminApi(req, res, url, user) {
   if (!pathname.startsWith('/api/admin/')) return null;
   if (user.role !== 'admin') return sendJson(res, 403, { error: '需要管理员权限。' });
   if (method === 'GET' && pathname === '/api/admin/settings') {
-    return sendJson(res, 200, { settings: runtimeSettings() });
+    return sendJson(res, 200, { settings: await adminRuntimeSettings() });
   }
   if (method === 'GET' && pathname === '/api/admin/system-email') {
     return sendJson(res, 200, { settings: getSystemEmailSettings() });
@@ -584,7 +642,7 @@ async function handleAdminApi(req, res, url, user) {
       dmarcRua: body.dmarcRua,
       sendRequiresVerified: boolString(body.sendRequiresVerified)
     });
-    return sendJson(res, 200, { settings: runtimeSettings() });
+    return sendJson(res, 200, { settings: await adminRuntimeSettings() });
   }
   if (method === 'GET' && pathname === '/api/admin/users') {
     return sendJson(res, 200, { users: listUsersWithResourceCounts() });
@@ -1163,6 +1221,14 @@ function runtimeSettings() {
     dmarcPolicy: normalizeDmarcPolicy(settings.dmarcPolicy),
     dmarcRua: settings.dmarcRua,
     sendRequiresVerified: String(settings.sendRequiresVerified).toLowerCase() === 'true'
+  };
+}
+
+async function adminRuntimeSettings() {
+  const settings = runtimeSettings();
+  return {
+    ...settings,
+    systemChecks: await buildSystemDnsChecks(settings)
   };
 }
 

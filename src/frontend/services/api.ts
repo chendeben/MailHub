@@ -93,6 +93,15 @@ export const api = {
   smtpCredential: () => request<{ credential: SmtpCredential | null }>('/api/smtp-credential'),
   saveSmtpCredential: (data: { username: string; password?: string }) =>
     request<{ credential: SmtpCredential }>('/api/smtp-credential', { method: 'PUT', data }),
+  smtpCredentials: () => request<{ credentials: SmtpCredential[] }>('/api/smtp-credentials'),
+  smtpCredentialDetail: (id: number) => request<{ credential: SmtpCredential }>(`/api/smtp-credentials/${id}`),
+  saveSmtpLoginCredential: (data: { username: string; password?: string }, id?: number) =>
+    request<{ credential: SmtpCredential }>(id ? `/api/smtp-credentials/${id}` : '/api/smtp-credentials', {
+      method: id ? 'PATCH' : 'POST',
+      data
+    }),
+  deleteSmtpCredential: (id: number) =>
+    request<{ deleted: boolean }>(`/api/smtp-credentials/${id}`, { method: 'DELETE' }),
   smtpRelays: () => request<{ relays: SmtpRelay[] }>('/api/smtp-relays'),
   smtpRelay: (id: number) => request<{ relay: SmtpRelay }>(`/api/smtp-relays/${id}`),
   saveSmtpRelay: (data: SmtpRelayPayload, id?: number) =>

@@ -20,16 +20,38 @@ import type { User, ViewKey } from '../frontend/types';
 
 const { Header, Sider, Content } = Layout;
 
-const navItems: Array<{ key: ViewKey; labelKey: string; icon: ReactNode }> = [
-  { key: 'dashboard', labelKey: 'nav.dashboard', icon: <DashboardOutlined /> },
-  { key: 'domains', labelKey: 'nav.domains', icon: <GlobalOutlined /> },
-  { key: 'dns-api', labelKey: 'nav.dnsApi', icon: <CloudServerOutlined /> },
-  { key: 'smtp', labelKey: 'nav.smtp', icon: <MailOutlined /> },
-  { key: 'tokens', labelKey: 'nav.tokens', icon: <KeyOutlined /> },
-  { key: 'logs', labelKey: 'nav.logs', icon: <SendOutlined /> },
-  { key: 'webhooks', labelKey: 'nav.webhooks', icon: <ApiOutlined /> },
-  { key: 'admin', labelKey: 'nav.admin', icon: <SafetyCertificateOutlined /> },
-  { key: 'settings', labelKey: 'nav.settings', icon: <SettingOutlined /> }
+const navGroups: Array<{
+  key: string;
+  labelKey: string;
+  items: Array<{ key: ViewKey; labelKey: string; icon: ReactNode; adminOnly?: boolean }>;
+}> = [
+  {
+    key: 'overview',
+    labelKey: 'nav.group.overview',
+    items: [
+      { key: 'dashboard', labelKey: 'nav.dashboard', icon: <DashboardOutlined /> },
+      { key: 'domains', labelKey: 'nav.domains', icon: <GlobalOutlined /> },
+      { key: 'dns-api', labelKey: 'nav.dnsApi', icon: <CloudServerOutlined /> }
+    ]
+  },
+  {
+    key: 'delivery',
+    labelKey: 'nav.group.delivery',
+    items: [
+      { key: 'smtp', labelKey: 'nav.smtp', icon: <MailOutlined /> },
+      { key: 'tokens', labelKey: 'nav.tokens', icon: <KeyOutlined /> },
+      { key: 'logs', labelKey: 'nav.logs', icon: <SendOutlined /> },
+      { key: 'webhooks', labelKey: 'nav.webhooks', icon: <ApiOutlined /> }
+    ]
+  },
+  {
+    key: 'system',
+    labelKey: 'nav.group.system',
+    items: [
+      { key: 'admin', labelKey: 'nav.admin', icon: <SafetyCertificateOutlined />, adminOnly: true },
+      { key: 'settings', labelKey: 'nav.settings', icon: <SettingOutlined /> }
+    ]
+  }
 ];
 
 interface AdminLayoutProps {
@@ -58,35 +80,60 @@ export function AdminLayout({
   onLogout
 }: AdminLayoutProps) {
   const { locale, locales, setLocale, t } = useI18n();
-  const visibleNavItems = navItems.filter((item) => item.key !== 'admin' || user?.role === 'admin');
+  const isAdmin = user?.role === 'admin';
+
+  const menuItems = navGroups.map((group) => ({
+    type: 'group' as const,
+    key: group.key,
+    label: t(group.labelKey),
+    children: group.items
+      .filter((item) => !item.adminOnly || isAdmin)
+      .map((item) => ({
+        key: item.key,
+        icon: item.icon,
+        label: t(item.labelKey)
+      }))
+  }));
 
   return (
     <Layout className="admin-layout">
       <Sider breakpoint="lg" collapsedWidth={0} width={248} className="admin-sider">
-        <div className="brand">
-          <div className="brand-logo">MH</div>
-          <div>
-            <div className="brand-title">MailHub</div>
-            <div className="brand-subtitle">Email Delivery</div>
+        <div className="admin-sider-inner">
+          <div className="brand">
+            <div className="brand-logo">MH</div>
+            <div>
+              <div className="brand-title">MailHub</div>
+              <div className="brand-subtitle">Email Delivery</div>
+            </div>
           </div>
+          <Menu
+            theme="dark"
+            mode="inline"
+            selectedKeys={[activeView]}
+            items={menuItems}
+            onClick={({ key }) => onViewChange(key as ViewKey)}
+            className="admin-menu"
+          />
+          {user ? (
+            <div className="admin-sider-footer">
+              <Avatar size={28} icon={<UserOutlined />} className="sider-user-avatar" />
+              <div className="sider-user-meta">
+                <div className="sider-user-name">{user.username || t('common.user')}</div>
+                <div className="sider-user-role">{user.role || '—'}</div>
+              </div>
+            </div>
+          ) : null}
         </div>
-        <Menu
-          theme="dark"
-          mode="inline"
-          selectedKeys={[activeView]}
-          items={visibleNavItems.map((item) => ({ key: item.key, icon: item.icon, label: t(item.labelKey) }))}
-          onClick={({ key }) => onViewChange(key as ViewKey)}
-        />
       </Sider>
       <Layout>
         <Header className="admin-header">
           <div className="header-title">
-            <Breadcrumb items={breadcrumb.map((title) => ({ title }))} />
+            <Breadcrumb items={breadcrumb.map((title) => ({ title }))} className="header-breadcrumb" />
             <Typography.Text type="secondary" className="runtime-line">
               {runtimeLine}
             </Typography.Text>
           </div>
-          <Space wrap>
+          <Space wrap className="header-actions">
             <Select
               aria-label="Language"
               value={locale}

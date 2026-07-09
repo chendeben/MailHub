@@ -1,8 +1,11 @@
 import { DeleteOutlined, EditOutlined, ThunderboltOutlined } from '@ant-design/icons';
-import { Button, Card, Form, Input, InputNumber, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd';
+import { Button, Form, Input, InputNumber, Popconfirm, Select, Space, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 
+import { PageHeader } from '../components/common/PageHeader';
+import { SectionCard } from '../components/common/SectionCard';
+import { StatusPill } from '../components/common/StatusPill';
 import { useI18n } from '../frontend/i18n/react';
 import type { DnsCredential } from '../frontend/types';
 
@@ -58,11 +61,17 @@ export default function DnsApi({ credentials, loading, onSave, onTest, onDelete 
   ];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <Card title={t('dnsApi.title')} extra={<Tag>{credentials.length}</Tag>}>
+    <Space direction="vertical" size={20} className="full-width">
+      <PageHeader title={t('dnsApi.title')} />
+
+      <SectionCard
+        title={t('dnsApi.title')}
+        extra={<StatusPill tone="neutral">{credentials.length}</StatusPill>}
+      >
         <Table rowKey="id" columns={columns} dataSource={credentials} scroll={{ x: 900 }} />
-      </Card>
-      <Card
+      </SectionCard>
+
+      <SectionCard
         title={editing ? `${t('dnsApi.editTitle')} ${editing.name}` : t('dnsApi.createTitle')}
         extra={editing ? <Button onClick={() => { setEditing(null); form.resetFields(); }}>{t('common.cancel')}</Button> : null}
       >
@@ -134,15 +143,15 @@ export default function DnsApi({ credentials, loading, onSave, onTest, onDelete 
             <Typography.Text type="secondary">{t('dnsApi.secretHint')}</Typography.Text>
           </Space>
         </Form>
-      </Card>
+      </SectionCard>
     </Space>
   );
 }
 
 function providerLabel(provider: string) {
   return {
-    cloudflare: <Tag color="blue">Cloudflare</Tag>,
-    aliyun: <Tag color="orange">Aliyun DNS</Tag>,
-    dnspod: <Tag color="cyan">Tencent DNSPod</Tag>
-  }[provider] || <Tag>{provider}</Tag>;
+    cloudflare: <StatusPill tone="info">Cloudflare</StatusPill>,
+    aliyun: <StatusPill tone="warning">Aliyun DNS</StatusPill>,
+    dnspod: <StatusPill tone="neutral">Tencent DNSPod</StatusPill>
+  }[provider] || <StatusPill tone="neutral">{provider}</StatusPill>;
 }

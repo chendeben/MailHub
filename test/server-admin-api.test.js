@@ -37,7 +37,9 @@ test('admin API routes respond once and keep the server alive', async () => {
       headers: { Cookie: cookie }
     });
     assert.equal(settings.status, 200);
-    assert.equal((await settings.json()).settings.mailHostname, 'mailhub.local');
+    const settingsPayload = await settings.json();
+    assert.equal(settingsPayload.settings.mailHostname, 'mailhub.local');
+    assert.equal(settingsPayload.settings.systemChecks.ptr.key, 'ptr');
 
     const exited = await waitForExit(child, 300);
     assert.equal(exited, false);
@@ -91,6 +93,53 @@ test('auth pages preserve query messages instead of redirecting them away', asyn
       assert.equal(response.headers.get('location'), null);
       assert.match(await response.text(), /auth-root/);
     }
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+  }
+});
+
+test('users can manage multiple smtp login credentials', async () => {
+  const { child, baseUrl } = await startTestServer();
+
+  try {
+    const cookie = await login(baseUrl, 'admin', 'password123');
+    const first = await createSmtpCredential(baseUrl, cookie, {
+      username: 'admin-smtp-main',
+      password: 'main-secret'
+    });
+    const second = await createSmtpCredential(baseUrl, cookie, {
+      username: 'admin-smtp-app',
+      password: 'app-secret'
+    });
+
+    assert.equal(first.username, 'admin-smtp-main');
+    assert.equal(first.password, 'main-secret');
+    assert.equal(second.username, 'admin-smtp-app');
+
+    const list = await fetch(`${baseUrl}/api/smtp-credentials`, { headers: { Cookie: cookie } });
+    assert.equal(list.status, 200);
+    const listPayload = await list.json();
+    assert.deepEqual(listPayload.credentials.map((credential) => credential.username), ['admin-smtp-app', 'admin-smtp-main']);
+    assert.equal(listPayload.credentials[0].password, 'app-secret');
+
+    const update = await fetch(`${baseUrl}/api/smtp-credentials/${second.id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({ username: 'admin-smtp-app-renamed' })
+    });
+    assert.equal(update.status, 200);
+    assert.equal((await update.json()).credential.password, 'app-secret');
+
+    const deleted = await fetch(`${baseUrl}/api/smtp-credentials/${first.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie }
+    });
+    assert.equal(deleted.status, 200);
+    assert.equal((await deleted.json()).deleted, true);
   } finally {
     child.kill('SIGTERM');
     await waitForExit(child, 1000);
@@ -1244,6 +1293,7 @@ async function startTestServer() {
       DATA_DIR: dataDir,
       ADMIN_PASSWORD: 'password123',
       SESSION_SECRET: sessionSecret,
+      DNS_AUTO_CHECK_ENABLED: 'false',
       SUBMISSION_ENABLED: 'false'
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -1620,6 +1670,19 @@ async function createSmtpRelay(baseUrl, cookie, data = {}) {
   });
   assert.equal(response.status, 201);
   return (await response.json()).relay;
+}
+
+async function createSmtpCredential(baseUrl, cookie, data = {}) {
+  const response = await fetch(`${baseUrl}/api/smtp-credentials`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: cookie
+    },
+    body: JSON.stringify(data)
+  });
+  assert.equal(response.status, 201);
+  return (await response.json()).credential;
 }
 
 async function sendApiMail(baseUrl, cookie, data) {

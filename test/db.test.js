@@ -14,6 +14,7 @@ import {
   createDomain,
   createUser,
   createUserWithAccountToken,
+  deleteSmtpCredential,
   deleteSmtpRelay,
   getDnsCredential,
   getDomain,
@@ -27,6 +28,7 @@ import {
   listAuditLogs,
   listDomains,
   listSendEvents,
+  listSmtpCredentials,
   listSmtpRelays,
   listUsersWithResourceCounts,
   invalidateAccountTokens,
@@ -153,6 +155,28 @@ test('isolates domains, smtp credentials, and api tokens by user', () => {
 
   const token = createApiToken(alice.id, 'send');
   assert.equal(verifyApiToken(token.token).id, alice.id);
+});
+
+test('stores multiple smtp login credentials per user', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const alice = createUser({ username: 'alice', email: 'alice@example.com', password: 'password123' });
+  const bob = createUser({ username: 'bob', email: 'bob@example.com', password: 'password123' });
+
+  const first = saveSmtpCredential(alice.id, { username: 'alice-main', password: 'first-secret' });
+  const second = saveSmtpCredential(alice.id, { username: 'alice-app', password: 'second-secret' });
+  saveSmtpCredential(bob.id, { username: 'bob-main', password: 'bob-secret' });
+
+  assert.equal(first.passwordSet, true);
+  assert.equal(second.passwordSet, true);
+  assert.deepEqual(listSmtpCredentials(alice.id).map((credential) => credential.username), ['alice-app', 'alice-main']);
+  assert.equal(getSmtpCredential(first.id, alice.id, { includePassword: true }).password, 'first-secret');
+  assert.equal(getSmtpCredential(first.id, bob.id), null);
+  assert.equal(verifySmtpCredential('alice-main', 'first-secret').user.id, alice.id);
+  assert.equal(verifySmtpCredential('alice-app', 'second-secret').user.id, alice.id);
+  assert.equal(verifySmtpCredential('alice-app', 'wrong'), null);
+  assert.equal(deleteSmtpCredential(first.id, alice.id), true);
+  assert.equal(verifySmtpCredential('alice-main', 'first-secret'), null);
+  assert.equal(verifySmtpCredential('alice-app', 'second-secret').user.id, alice.id);
 });
 
 test('stores multiple outbound smtp relays with encrypted recoverable passwords', () => {
@@ -419,6 +443,7 @@ test('lists users with owned resource counts', () => {
   createApiToken(alice.id, 'secondary');
   createApiToken(bob.id, 'primary');
   saveSmtpCredential(alice.id, { username: 'smtp-alice', password: 'smtp-secret-123' });
+  saveSmtpCredential(alice.id, { username: 'smtp-alice-app', password: 'smtp-secret-456' });
 
   logSendEvent({
     userId: alice.id,
@@ -454,7 +479,7 @@ test('lists users with owned resource counts', () => {
     dnsCredentials: 2,
     apiTokens: 2,
     sendEvents: 2,
-    smtpCredential: 1
+    smtpCredential: 2
   });
   assert.deepEqual(bobWithCounts.resourceCounts, {
     domains: 1,
@@ -621,7 +646,7 @@ test('transfers individual resources with audit logs', () => {
   assert.equal(JSON.stringify(listAuditLogs({ actorUserId: admin.id })).includes('alice-secret'), false);
 });
 
-test('previews and executes user merge with resource counts and smtp conflict handling', () => {
+test('previews and executes user merge with resource counts and multiple smtp credentials', () => {
   initDatabase(tempDataDir(), 'test-secret');
   const admin = createUser({ username: 'admin3', email: 'admin3@example.com', password: 'password123', role: 'admin' });
   const source = createUser({ username: 'source', email: 'source@example.com', password: 'password123' });
@@ -635,6 +660,7 @@ test('previews and executes user merge with resource counts and smtp conflict ha
   const domain = createDomain(source.id, { ...domainFixture('source.example'), dnsCredentialId: credential.id });
   const apiToken = createApiToken(source.id, 'primary');
   saveSmtpCredential(source.id, { username: 'smtp-source', password: 'source-secret-123' });
+  saveSmtpCredential(source.id, { username: 'smtp-source-app', password: 'source-secret-456' });
   saveSmtpCredential(target.id, { username: 'smtp-target', password: 'target-secret-123' });
   logSendEvent({
     userId: source.id,
@@ -652,7 +678,7 @@ test('previews and executes user merge with resource counts and smtp conflict ha
     dnsCredentials: 1,
     apiTokens: 1,
     sendEvents: 1,
-    smtpCredential: 1
+    smtpCredential: 2
   });
   assert.equal(preview.resources.source.domains[0].domain, 'source.example');
   assert.equal(preview.resources.source.dnsCredentials[0].name, 'Source DNS');
@@ -664,10 +690,10 @@ test('previews and executes user merge with resource counts and smtp conflict ha
     dnsCredentials: 1,
     apiTokens: 1,
     sendEvents: 1,
-    smtpCredential: 0
+    smtpCredential: 2
   });
-  assert.equal(preview.smtp.conflict, true);
-  assert.ok(preview.warnings.some((warning) => warning.type === 'smtp_credential_conflict'));
+  assert.equal(preview.smtp.conflict, false);
+  assert.deepEqual(preview.warnings, []);
 
   assert.throws(
     () => executeUserMerge({
@@ -692,14 +718,14 @@ test('previews and executes user merge with resource counts and smtp conflict ha
     dnsCredentials: 1,
     apiTokens: 1,
     sendEvents: 1,
-    smtpCredential: 0
+    smtpCredential: 2
   });
   assert.equal(getDomain(domain.id).userId, target.id);
   assert.equal(getDnsCredential(credential.id, target.id).id, credential.id);
   assert.equal(verifyApiToken(apiToken.token).id, target.id);
   assert.equal(listSendEvents(target.id).length, 1);
-  assert.equal(getSmtpCredential(target.id).username, 'smtp-target');
-  assert.equal(getSmtpCredential(source.id).username, 'smtp-source');
+  assert.deepEqual(listSmtpCredentials(target.id).map((item) => item.username).sort(), ['smtp-source', 'smtp-source-app', 'smtp-target']);
+  assert.deepEqual(listSmtpCredentials(source.id), []);
   assert.equal(getUser(source.id).status, 'disabled');
 
   const [audit] = listAuditLogs({ action: 'admin.user_merge' });

@@ -1,6 +1,7 @@
 import { CheckCircleOutlined, ClockCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
-import { Button, Card, Col, Progress, Row, Space, Statistic, Tag, Typography } from 'antd';
+import { Button, Col, Progress, Row, Space, Typography } from 'antd';
 
+import { StatusPill } from '../common/StatusPill';
 import { buildDomainHealth } from '../../frontend/domain-model.js';
 import { useI18n } from '../../frontend/i18n/react';
 import type { Domain } from '../../frontend/types';
@@ -28,6 +29,7 @@ export function DomainHealthCard({
 }: DomainHealthCardProps) {
   const { t } = useI18n();
   const health = buildDomainHealth(domain);
+  const tone = health.status === 'success' ? 'success' : health.status === 'warning' ? 'warning' : 'error';
   const icon = health.status === 'success'
     ? <CheckCircleOutlined />
     : health.status === 'warning'
@@ -35,33 +37,31 @@ export function DomainHealthCard({
       : <ExclamationCircleOutlined />;
 
   return (
-    <Card className="domain-health-card">
+    <div className="domain-health-card">
       <Row gutter={[24, 24]} align="middle">
         <Col xs={24} xl={16}>
-          <Space direction="vertical" size={16} className="full-width">
+          <Space direction="vertical" size={20} className="full-width">
             <div className="domain-title-row">
-              <div>
-                <Typography.Text type="secondary">{t('domainHealth.sendingDomain')}</Typography.Text>
-                <Typography.Title level={2}>{domain.domain}</Typography.Title>
+              <div className="domain-title-row__text">
+                <Typography.Text type="secondary" className="domain-health-card__eyebrow">
+                  {t('domainHealth.sendingDomain')}
+                </Typography.Text>
+                <Typography.Title level={2} className="domain-health-card__title">
+                  {domain.domain}
+                </Typography.Title>
               </div>
-              <Tag color={health.status === 'success' ? 'success' : health.status === 'warning' ? 'warning' : 'error'} icon={icon}>
+              <StatusPill tone={tone} icon={icon}>
                 {domainHealthLabel(health.status, t)}
-              </Tag>
+              </StatusPill>
             </div>
-            <Row gutter={[16, 16]}>
-              <Col xs={12} md={6}>
-                <Statistic title={t('domains.senderHost')} value={domain.senderHost || '-'} valueStyle={{ fontSize: 14 }} />
-              </Col>
-              <Col xs={12} md={6}>
-                <Statistic title={t('domains.sendingIp')} value={domain.sendingIp || '-'} valueStyle={{ fontSize: 14 }} />
-              </Col>
-              <Col xs={12} md={6}>
-                <Statistic title="DKIM selector" value={domain.selector} valueStyle={{ fontSize: 14 }} />
-              </Col>
-              <Col xs={12} md={6}>
-                <Statistic title={t('domains.lastSent')} value={lastSentAt || t('common.notFound')} valueStyle={{ fontSize: 14 }} />
-              </Col>
-            </Row>
+
+            <div className="domain-health-stats">
+              <HealthStat label={t('domains.senderHost')} value={domain.senderHost || '-'} />
+              <HealthStat label={t('domains.sendingIp')} value={domain.sendingIp || '-'} />
+              <HealthStat label="DKIM selector" value={domain.selector} />
+              <HealthStat label={t('domains.lastSent')} value={lastSentAt || t('common.notFound')} />
+            </div>
+
             <div className="health-progress">
               <div>
                 <Typography.Text strong>{t('domainHealth.dnsProgress')}</Typography.Text>
@@ -69,11 +69,20 @@ export function DomainHealthCard({
                   {health.passed}/{health.total} {t('domainHealth.passed')} · {t('domainHealth.dnsIssues')} {health.dnsIssues}
                 </Typography.Text>
               </div>
-              <Progress percent={health.percent} status={health.status === 'error' ? 'exception' : 'active'} />
+              <Progress
+                percent={health.percent}
+                status={health.status === 'error' ? 'exception' : health.status === 'success' ? 'success' : 'active'}
+                strokeColor={health.status === 'success' ? 'var(--mh-success)' : health.status === 'error' ? 'var(--mh-danger)' : 'var(--mh-primary)'}
+              />
             </div>
-            <Space wrap>
-              <Tag>{t('domainHealth.dnsApi')}：{dnsApiName || t('common.notConfigured')}</Tag>
-              <Tag>{t('domainDetail.lastCheck')}：{health.checkedAt ? new Date(health.checkedAt).toLocaleString() : t('domainDetail.notChecked')}</Tag>
+
+            <Space wrap size={8} className="domain-health-meta">
+              <StatusPill tone={dnsApiName ? 'info' : 'neutral'}>
+                {t('domainHealth.dnsApi')}：{dnsApiName || t('common.notConfigured')}
+              </StatusPill>
+              <StatusPill tone={health.checkedAt ? 'neutral' : 'warning'}>
+                {t('domainDetail.lastCheck')}：{health.checkedAt ? new Date(health.checkedAt).toLocaleString() : t('domainDetail.notChecked')}
+              </StatusPill>
             </Space>
           </Space>
         </Col>
@@ -94,7 +103,20 @@ export function DomainHealthCard({
           </div>
         </Col>
       </Row>
-    </Card>
+    </div>
+  );
+}
+
+function HealthStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="domain-health-stat">
+      <Typography.Text type="secondary" className="domain-health-stat__label">
+        {label}
+      </Typography.Text>
+      <Typography.Text strong className="domain-health-stat__value">
+        {value}
+      </Typography.Text>
+    </div>
   );
 }
 

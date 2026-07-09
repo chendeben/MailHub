@@ -1,7 +1,12 @@
 import { Area, Bar, Column, Pie } from '@ant-design/plots';
-import { Alert, Card, Col, Empty, List, Row, Space, Table, Tag, Typography } from 'antd';
+import { Alert, Col, List, Row, Space, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 
+import { EmptyState } from '../components/common/EmptyState';
+import { MetricCard } from '../components/common/MetricCard';
+import { PageHeader } from '../components/common/PageHeader';
+import { SectionCard } from '../components/common/SectionCard';
+import { StatusPill } from '../components/common/StatusPill';
 import {
   buildDashboardSummary,
   buildDomainRanking,
@@ -11,6 +16,7 @@ import {
 } from '../frontend/analytics-model.js';
 import { buildDomainHealth } from '../frontend/domain-model.js';
 import { useI18n } from '../frontend/i18n/react';
+import { brandColors } from '../frontend/theme';
 import type { Analytics, Domain, RuntimeConfig, SendEvent, SmtpCredential } from '../frontend/types';
 
 interface DashboardProps {
@@ -36,17 +42,9 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
   }));
   const rankingData = buildDomainRanking(analytics);
   const hourlyData = buildHourlyHeatmap(analytics);
-
-  const cards = [
-    { label: t('dashboard.verifiedDomains'), value: summary.verifiedDomains },
-    { label: t('dashboard.todaySent'), value: summary.today },
-    { label: t('dashboard.successRate'), value: `${summary.successRate}%` },
-    { label: t('dashboard.bounceRate'), value: `${summary.bounceRate}%` },
-    { label: t('dashboard.complaintRate'), value: `${summary.complaintRate}%` },
-    { label: t('dashboard.lastSentAt'), value: summary.lastSentAt ? new Date(summary.lastSentAt).toLocaleString() : t('common.notFound') },
-    { label: t('dashboard.dnsIssues'), value: summary.dnsIssues },
-    { label: t('dashboard.smtpStatus'), value: summary.smtpReady ? t('dashboard.smtpReady') : t('dashboard.smtpNotConfigured') }
-  ];
+  const lastSentLabel = summary.lastSentAt
+    ? new Date(summary.lastSentAt).toLocaleString()
+    : t('common.notFound');
 
   const columns: ColumnsType<SendEvent> = [
     { title: 'Time', dataIndex: 'createdAt', render: (value) => new Date(value).toLocaleString() },
@@ -56,7 +54,9 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
     {
       title: t('common.status'),
       dataIndex: 'status',
-      render: (value) => <Tag color={statusColor(value)}>{statusLabel(value, t)}</Tag>
+      render: (value) => (
+        <StatusPill tone={statusTone(value)}>{statusLabel(value, t)}</StatusPill>
+      )
     }
   ];
 
@@ -65,21 +65,44 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
       {config?.usingDefaultAdminPassword ? (
         <Alert type="warning" showIcon message={t('dashboard.defaultPasswordWarning')} />
       ) : null}
+
+      <PageHeader
+        title={t('dashboard.title')}
+        extra={
+          <StatusPill tone={summary.smtpReady ? 'success' : 'warning'}>
+            {t('dashboard.smtpStatus')}:{' '}
+            {summary.smtpReady ? t('dashboard.smtpReady') : t('dashboard.smtpNotConfigured')}
+          </StatusPill>
+        }
+      />
+
       <Row gutter={[16, 16]}>
-        {cards.map((card) => (
-          <Col xs={24} sm={12} lg={6} key={card.label}>
-            <Card className="metric-card">
-              <Typography.Text type="secondary">{card.label}</Typography.Text>
-              <Typography.Title level={3} className="metric-value">
-                {card.value}
-              </Typography.Title>
-            </Card>
-          </Col>
-        ))}
+        <Col xs={24} sm={12} lg={6}>
+          <MetricCard label={t('dashboard.todaySent')} value={summary.today} />
+        </Col>
+        <Col xs={24} sm={12} lg={6}>
+          <MetricCard
+            label={t('dashboard.successRate')}
+            value={`${summary.successRate}%`}
+            hint={`${t('dashboard.bounceRate')} ${summary.bounceRate}% · ${t('dashboard.complaintRate')} ${summary.complaintRate}%`}
+          />
+        </Col>
+        <Col xs={24} sm={12} lg={6}>
+          <MetricCard label={t('dashboard.verifiedDomains')} value={summary.verifiedDomains} />
+        </Col>
+        <Col xs={24} sm={12} lg={6}>
+          <MetricCard
+            label={t('dashboard.dnsIssues')}
+            value={summary.dnsIssues}
+            tone={summary.dnsIssues > 0 ? 'warning' : 'default'}
+            hint={summary.dnsIssues > 0 ? t('dashboard.dnsActionHint') : undefined}
+          />
+        </Col>
       </Row>
+
       <Row gutter={[16, 16]}>
         <Col xs={24} xl={15}>
-          <Card title={t('dashboard.trend')} className="chart-card">
+          <SectionCard title={t('dashboard.trend')} className="chart-card">
             {trendData.length ? (
               <Area
                 data={trendData}
@@ -89,17 +112,21 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 shapeField="smooth"
                 height={316}
                 axis={{ y: { title: false }, x: { title: false } }}
-                scale={{ color: { range: ['#1677ff', '#52c41a', '#ff4d4f'] } }}
+                scale={{
+                  color: {
+                    range: [brandColors.chartPrimary, brandColors.chartSuccess, brandColors.chartDanger]
+                  }
+                }}
                 tooltip={{ title: 'date' }}
                 legend={{ color: { position: 'top' } }}
               />
             ) : (
-              <Empty description={t('dashboard.noTrend')} />
+              <EmptyState description={t('dashboard.noTrend')} />
             )}
-          </Card>
+          </SectionCard>
         </Col>
         <Col xs={24} xl={9}>
-          <Card title={t('dashboard.statusDistribution')} className="chart-card">
+          <SectionCard title={t('dashboard.statusDistribution')} className="chart-card">
             {statusData.length ? (
               <Pie
                 data={statusData}
@@ -107,19 +134,37 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 colorField="label"
                 innerRadius={0.64}
                 height={316}
-                scale={{ color: { range: ['#52c41a', '#ff4d4f', '#faad14'] } }}
-                label={{ text: 'value', position: 'outside' }}
+                scale={{
+                  color: {
+                    range: [brandColors.chartSuccess, brandColors.chartDanger, brandColors.chartWarning]
+                  }
+                }}
+                label={{
+                  text: (datum: { label?: string; value?: number }) =>
+                    `${datum.label || ''}${datum.value != null ? ` ${datum.value}` : ''}`,
+                  position: 'outside'
+                }}
                 legend={{ color: { position: 'bottom' } }}
+                tooltip={{
+                  title: (datum: { label?: string }) => datum.label || '',
+                  items: [
+                    (datum: { value?: number }) => ({
+                      name: t('metrics.total'),
+                      value: datum.value ?? 0
+                    })
+                  ]
+                }}
               />
             ) : (
-              <Empty description={t('dashboard.noTrend')} />
+              <EmptyState description={t('dashboard.noTrend')} />
             )}
-          </Card>
+          </SectionCard>
         </Col>
       </Row>
+
       <Row gutter={[16, 16]}>
         <Col xs={24} xl={12}>
-          <Card title={t('dashboard.domainRanking')} className="chart-card">
+          <SectionCard title={t('dashboard.domainRanking')} className="chart-card">
             {rankingData.length ? (
               <Bar
                 data={rankingData}
@@ -127,17 +172,18 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 yField="domain"
                 height={312}
                 colorField="domain"
+                scale={{ color: { range: [brandColors.chartPrimary] } }}
                 label={{ text: 'total', position: 'right' }}
                 axis={{ x: { title: false }, y: { title: false } }}
                 legend={false}
               />
             ) : (
-              <Empty description={t('dashboard.noDomains')} />
+              <EmptyState description={t('dashboard.noDomains')} />
             )}
-          </Card>
+          </SectionCard>
         </Col>
         <Col xs={24} xl={12}>
-          <Card title={t('dashboard.hourlyHeatmap')} className="chart-card">
+          <SectionCard title={t('dashboard.hourlyHeatmap')} className="chart-card">
             {hourlyData.length ? (
               <Column
                 data={hourlyData}
@@ -145,20 +191,21 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 yField="total"
                 height={312}
                 colorField="total"
-                scale={{ color: { range: ['#dbeafe', '#1677ff'] } }}
+                scale={{ color: { range: [brandColors.chartTrack, brandColors.chartPrimary] } }}
                 axis={{ x: { title: false }, y: { title: false } }}
                 tooltip={{ title: 'hour' }}
                 legend={false}
               />
             ) : (
-              <Empty description={t('dashboard.noTrend')} />
+              <EmptyState description={t('dashboard.noTrend')} />
             )}
-          </Card>
+          </SectionCard>
         </Col>
       </Row>
+
       <Row gutter={[16, 16]}>
         <Col xs={24} xl={9}>
-          <Card title={t('dashboard.recentFailures')}>
+          <SectionCard title={t('dashboard.recentFailures')}>
             {analytics?.recentFailures?.length ? (
               <List
                 dataSource={analytics.recentFailures}
@@ -177,12 +224,12 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                 )}
               />
             ) : (
-              <Empty description={t('dashboard.noFailures')} />
+              <EmptyState description={t('dashboard.noFailures')} />
             )}
-          </Card>
+          </SectionCard>
         </Col>
         <Col xs={24} xl={15}>
-          <Card title={t('dashboard.domainHealth')}>
+          <SectionCard title={t('dashboard.domainHealth')}>
             <Space direction="vertical" className="full-width">
               {domains.slice(0, 6).map((domain) => {
                 const health = buildDomainHealth(domain);
@@ -192,20 +239,28 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
                       <Typography.Text strong>{domain.domain}</Typography.Text>
                       <Typography.Text type="secondary">DNS {health.passed}/{health.total}</Typography.Text>
                     </div>
-                    <Tag color={health.status === 'success' ? 'success' : health.status === 'warning' ? 'warning' : 'error'}>
+                    <StatusPill tone={domainHealthTone(health.status)}>
                       {domainHealthLabel(health.status, t)}
-                    </Tag>
+                    </StatusPill>
                   </div>
                 );
               })}
-              {!domains.length ? <Empty description={t('dashboard.noDomains')} /> : null}
+              {!domains.length ? <EmptyState description={t('dashboard.noDomains')} /> : null}
             </Space>
-          </Card>
+          </SectionCard>
         </Col>
       </Row>
-      <Card title={t('dashboard.recentLogs')}>
+
+      <SectionCard
+        title={t('dashboard.recentLogs')}
+        extra={
+          <Typography.Text type="secondary">
+            {t('dashboard.lastSentAt')}: {lastSentLabel}
+          </Typography.Text>
+        }
+      >
         <Table rowKey="id" columns={columns} dataSource={events.slice(0, 8)} pagination={false} scroll={{ x: 900 }} />
-      </Card>
+      </SectionCard>
     </Space>
   );
 }
@@ -219,16 +274,22 @@ function statusLabel(status: string, t: (key: string) => string) {
   return status || t('dashboard.statusUnknown');
 }
 
-function statusColor(status: string) {
-  if (status === 'queued') return 'processing';
+function statusTone(status: string): 'success' | 'warning' | 'error' | 'info' | 'neutral' {
+  if (status === 'queued') return 'info';
   if (status === 'sent') return 'success';
   if (status === 'deferred') return 'warning';
   if (status === 'bounced' || status === 'failed') return 'error';
-  return 'default';
+  return 'neutral';
 }
 
 function domainHealthLabel(status: string, t: (key: string) => string) {
   if (status === 'success') return t('domains.healthy');
   if (status === 'warning') return t('domains.waitingDns');
   return t('domains.needsAction');
+}
+
+function domainHealthTone(status: string): 'success' | 'warning' | 'error' {
+  if (status === 'success') return 'success';
+  if (status === 'warning') return 'warning';
+  return 'error';
 }

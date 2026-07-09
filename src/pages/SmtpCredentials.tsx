@@ -1,57 +1,112 @@
 import { CopyOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
-import { Button, Card, Descriptions, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Tag, Typography } from 'antd';
+import { Button, Descriptions, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
+import { PageHeader } from '../components/common/PageHeader';
+import { SectionCard } from '../components/common/SectionCard';
+import { StatusPill } from '../components/common/StatusPill';
 import { useI18n } from '../frontend/i18n/react';
 import type { RuntimeConfig, SmtpCredential, SmtpRelay, SmtpRelayPayload } from '../frontend/types';
 
 interface SmtpCredentialsProps {
   config: RuntimeConfig | null;
   credential: SmtpCredential | null;
+  credentials: SmtpCredential[];
   relays: SmtpRelay[];
   loading?: boolean;
   onCopy: (value: string) => void;
-  onSave: (values: { username: string; password?: string }) => Promise<void>;
+  onLoadCredential: (id: number) => Promise<SmtpCredential | null>;
+  onSaveCredential: (values: { username: string; password?: string }, id?: number) => Promise<SmtpCredential | null>;
+  onDeleteCredential: (credential: SmtpCredential) => Promise<void>;
   onLoadRelay: (id: number) => Promise<SmtpRelay | null>;
   onSaveRelay: (values: SmtpRelayPayload, id?: number) => Promise<SmtpRelay | null>;
   onDeleteRelay: (relay: SmtpRelay) => Promise<void>;
 }
 
+interface CredentialFormValues {
+  username: string;
+  password?: string;
+}
+
 export default function SmtpCredentials({
   config,
   credential,
+  credentials,
   relays,
   loading,
   onCopy,
-  onSave,
+  onLoadCredential,
+  onSaveCredential,
+  onDeleteCredential,
   onLoadRelay,
   onSaveRelay,
   onDeleteRelay
 }: SmtpCredentialsProps) {
   const { t } = useI18n();
-  const [form] = Form.useForm();
+  const [credentialForm] = Form.useForm<CredentialFormValues>();
   const [relayForm] = Form.useForm<SmtpRelayPayload>();
+  const [credentialOpen, setCredentialOpen] = useState(false);
+  const [credentialLoading, setCredentialLoading] = useState(false);
+  const [editingCredential, setEditingCredential] = useState<SmtpCredential | null>(null);
   const [relayOpen, setRelayOpen] = useState(false);
   const [relayLoading, setRelayLoading] = useState(false);
   const [editingRelay, setEditingRelay] = useState<SmtpRelay | null>(null);
 
-  useEffect(() => {
-    form.setFieldsValue({ username: credential?.username || config?.submission?.username || '' });
-  }, [config?.submission?.username, credential?.username, form]);
-
-  function generatePassword() {
-    const bytes = new Uint8Array(24);
-    crypto.getRandomValues(bytes);
-    const password = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '').slice(0, 28);
-    form.setFieldValue('password', password);
+  function generateCredentialPassword() {
+    credentialForm.setFieldValue('password', randomPassword());
   }
 
   function generateRelayPassword() {
-    const bytes = new Uint8Array(24);
-    crypto.getRandomValues(bytes);
-    const password = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '').slice(0, 28);
-    relayForm.setFieldValue('password', password);
+    relayForm.setFieldValue('password', randomPassword());
+  }
+
+  function openCreateCredential() {
+    setEditingCredential(null);
+    credentialForm.setFieldsValue({
+      username: credentials.length === 0 ? credential?.username || config?.submission?.username || '' : '',
+      password: ''
+    });
+    setCredentialOpen(true);
+  }
+
+  async function openEditCredential(item: SmtpCredential) {
+    if (!item.id) return;
+    setEditingCredential(item);
+    setCredentialOpen(true);
+    setCredentialLoading(true);
+    try {
+      const detail = await onLoadCredential(item.id);
+      if (!detail) {
+        setCredentialOpen(false);
+        return;
+      }
+      credentialForm.setFieldsValue({
+        username: detail.username,
+        password: detail.password || ''
+      });
+    } finally {
+      setCredentialLoading(false);
+    }
+  }
+
+  async function saveCredential() {
+    const values = await credentialForm.validateFields();
+    setCredentialLoading(true);
+    try {
+      const saved = await onSaveCredential(values, editingCredential?.id);
+      if (!saved) return;
+      setCredentialOpen(false);
+      credentialForm.resetFields();
+    } finally {
+      setCredentialLoading(false);
+    }
+  }
+
+  function closeCredentialModal() {
+    setCredentialOpen(false);
+    setEditingCredential(null);
+    credentialForm.resetFields();
   }
 
   function openCreateRelay() {
@@ -107,6 +162,54 @@ export default function SmtpCredentials({
     }
   }
 
+  const credentialColumns: ColumnsType<SmtpCredential> = [
+    {
+      title: t('smtp.username'),
+      dataIndex: 'username',
+      width: 240,
+      render: (value: string) => copyable(value, onCopy)
+    },
+    {
+      title: t('smtp.password'),
+      dataIndex: 'password',
+      width: 280,
+      render: (value: string | undefined) => (
+        value
+          ? copyable(value, onCopy)
+          : <Typography.Text type="secondary">{t('smtp.passwordUnavailable')}</Typography.Text>
+      )
+    },
+    {
+      title: t('common.status'),
+      dataIndex: 'passwordSet',
+      width: 120,
+      render: (value: boolean) => (
+        <StatusPill tone={value ? 'success' : 'neutral'}>
+          {value ? t('smtp.passwordSet') : t('smtp.passwordEmpty')}
+        </StatusPill>
+      )
+    },
+    {
+      title: t('tokens.createdAt'),
+      dataIndex: 'createdAt',
+      width: 190,
+      render: formatDate
+    },
+    {
+      title: t('domains.actions'),
+      fixed: 'right',
+      width: 150,
+      render: (_, item) => (
+        <Space>
+          <Button icon={<EditOutlined />} onClick={() => openEditCredential(item)} disabled={!item.id} />
+          <Popconfirm title={t('smtp.deleteConfirm')} onConfirm={() => onDeleteCredential(item)} disabled={!item.id}>
+            <Button danger icon={<DeleteOutlined />} disabled={!item.id} />
+          </Popconfirm>
+        </Space>
+      )
+    }
+  ];
+
   const relayColumns: ColumnsType<SmtpRelay> = [
     {
       title: t('smtpRelay.name'),
@@ -115,7 +218,7 @@ export default function SmtpCredentials({
       render: (value, relay) => (
         <Space wrap>
           <Typography.Text strong>{value}</Typography.Text>
-          {relay.isDefault ? <Tag color="success">{t('smtpRelay.default')}</Tag> : null}
+          {relay.isDefault ? <StatusPill tone="success">{t('smtpRelay.default')}</StatusPill> : null}
         </Space>
       )
     },
@@ -134,7 +237,11 @@ export default function SmtpCredentials({
       title: t('smtpRelay.password'),
       dataIndex: 'passwordSet',
       width: 120,
-      render: (value: boolean) => <Tag color={value ? 'success' : 'default'}>{value ? t('smtpRelay.passwordSet') : t('smtpRelay.passwordEmpty')}</Tag>
+      render: (value: boolean) => (
+        <StatusPill tone={value ? 'success' : 'neutral'}>
+          {value ? t('smtpRelay.passwordSet') : t('smtpRelay.passwordEmpty')}
+        </StatusPill>
+      )
     },
     { title: 'HELO', dataIndex: 'helo', width: 180, render: (value) => value || '-' },
     {
@@ -153,44 +260,47 @@ export default function SmtpCredentials({
   ];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <Card title={t('smtp.connectionTitle')}>
+    <Space direction="vertical" size={20} className="full-width">
+      <PageHeader title={t('nav.smtp')} />
+
+      <SectionCard title={t('smtp.connectionTitle')}>
         <Descriptions column={1}>
           <Descriptions.Item label="SMTP Host">{copyable(config?.submission?.host || '-', onCopy)}</Descriptions.Item>
           <Descriptions.Item label="SMTP Port">
-            {(config?.submission?.ports || []).map((item) => <Tag key={item.port}>{item.port} · {item.protocol}</Tag>)}
+            <Space wrap size={8}>
+              {(config?.submission?.ports || []).map((item) => (
+                <StatusPill key={item.port} tone="info">
+                  {item.port} · {item.protocol}
+                </StatusPill>
+              ))}
+            </Space>
           </Descriptions.Item>
           <Descriptions.Item label="TLS / SSL">{config?.submission?.tls ? 'TLS' : 'STARTTLS'}</Descriptions.Item>
-          <Descriptions.Item label="Username">{copyable(credential?.username || config?.submission?.username || '-', onCopy)}</Descriptions.Item>
-          <Descriptions.Item label="Password">
+          <Descriptions.Item label={t('smtp.username')}>{copyable(credential?.username || config?.submission?.username || '-', onCopy)}</Descriptions.Item>
+          <Descriptions.Item label={t('smtp.password')}>
             {credential?.password ? copyable(credential.password, onCopy) : <Typography.Text type="secondary">{t('smtp.resetToCopy')}</Typography.Text>}
           </Descriptions.Item>
         </Descriptions>
-      </Card>
-      <Card title={t('smtp.updateTitle')}>
-        <Form
-          form={form}
-          layout="vertical"
-          onFinish={onSave}
-          initialValues={{ username: credential?.username || config?.submission?.username || '' }}
-        >
-          <Form.Item name="username" label="Username" rules={[{ required: true, message: t('smtp.usernameRequired') }]}>
-            <Input autoComplete="off" />
-          </Form.Item>
-          <Form.Item name="password" label="Password" extra={t('smtp.passwordExtra')}>
-            <Input.Password autoComplete="new-password" />
-          </Form.Item>
-          <Space wrap>
-            <Button icon={<ReloadOutlined />} onClick={generatePassword}>
-              {t('smtp.regenerate')}
-            </Button>
-            <Button type="primary" htmlType="submit" loading={loading}>
-              {t('smtp.save')}
-            </Button>
-          </Space>
-        </Form>
-      </Card>
-      <Card
+      </SectionCard>
+
+      <SectionCard
+        title={t('smtp.loginCredentialsTitle')}
+        extra={
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreateCredential}>
+            {t('smtp.create')}
+          </Button>
+        }
+      >
+        <Table
+          rowKey={(item) => item.id || item.username}
+          columns={credentialColumns}
+          dataSource={credentials}
+          scroll={{ x: 980 }}
+          pagination={credentials.length > 10 ? { pageSize: 10 } : false}
+        />
+      </SectionCard>
+
+      <SectionCard
         title={t('smtpRelay.title')}
         extra={
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreateRelay}>
@@ -205,7 +315,37 @@ export default function SmtpCredentials({
           scroll={{ x: 1040 }}
           pagination={false}
         />
-      </Card>
+      </SectionCard>
+
+      <Modal
+        title={editingCredential ? t('smtp.editTitle') : t('smtp.createTitle')}
+        open={credentialOpen}
+        confirmLoading={loading || credentialLoading}
+        onCancel={closeCredentialModal}
+        onOk={saveCredential}
+        width={560}
+        destroyOnHidden
+      >
+        <Form form={credentialForm} layout="vertical">
+          <Form.Item name="username" label={t('smtp.username')} rules={[{ required: true, message: t('smtp.usernameRequired') }]}>
+            <Input autoComplete="off" />
+          </Form.Item>
+          <Form.Item
+            name="password"
+            label={t('smtp.password')}
+            extra={editingCredential ? t('smtp.passwordExtra') : undefined}
+            rules={[{ required: !editingCredential, message: t('smtp.passwordRequired') }]}
+          >
+            <Input autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item>
+            <Button icon={<ReloadOutlined />} onClick={generateCredentialPassword}>
+              {t('smtp.regenerate')}
+            </Button>
+          </Form.Item>
+        </Form>
+      </Modal>
+
       <Modal
         title={editingRelay ? t('smtpRelay.editTitle') : t('smtpRelay.createTitle')}
         open={relayOpen}
@@ -251,11 +391,21 @@ export default function SmtpCredentials({
   );
 }
 
+function randomPassword() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '').slice(0, 28);
+}
+
 function copyable(value: string, onCopy: (value: string) => void) {
   return (
     <Space>
-      <Typography.Text code>{value}</Typography.Text>
+      <Typography.Text code className="inline-code-value">{value}</Typography.Text>
       <Button size="small" icon={<CopyOutlined />} onClick={() => onCopy(value)} />
     </Space>
   );
+}
+
+function formatDate(value?: string) {
+  return value ? new Date(value).toLocaleString() : '-';
 }

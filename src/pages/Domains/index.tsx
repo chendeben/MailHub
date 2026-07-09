@@ -1,12 +1,15 @@
 import { DeleteOutlined, EyeOutlined, SearchOutlined } from '@ant-design/icons';
-import { Button, Card, Input, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd';
+import { Button, Input, Popconfirm, Select, Space, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useMemo, useState } from 'react';
 
+import { PageHeader } from '../../components/common/PageHeader';
+import { SectionCard } from '../../components/common/SectionCard';
+import { StatusPill } from '../../components/common/StatusPill';
+import { StatusTag } from '../../components/common/StatusTag';
 import { buildDomainHealth } from '../../frontend/domain-model.js';
 import { useI18n } from '../../frontend/i18n/react';
 import type { DnsCredential, Domain, SendEvent } from '../../frontend/types';
-import { StatusTag } from '../../components/common/StatusTag';
 
 interface DomainsPageProps {
   domains: Domain[];
@@ -65,16 +68,29 @@ export default function DomainsPage({
       title: t('domains.dnsApi'),
       dataIndex: 'dnsCredentialId',
       width: 150,
-      render: (value: number | null) => value ? <Tag>{credentialName.get(value) || value}</Tag> : <Tag>{t('common.manual')}</Tag>
+      render: (value: number | null) => {
+        if (!value) {
+          return <StatusPill tone="neutral">{t('common.manual')}</StatusPill>;
+        }
+        const name = credentialName.get(value);
+        return (
+          <StatusPill tone={name ? 'info' : 'warning'}>
+            {name || t('common.notConfigured')}
+          </StatusPill>
+        );
+      }
     },
     recordColumn('DKIM', 'dkim'),
     recordColumn('SPF', 'spf'),
     recordColumn('DMARC', 'dmarc'),
-    recordColumn('PTR', 'ptr'),
     {
       title: t('domains.smtp'),
       width: 110,
-      render: (_, domain) => <Tag color={domain.status?.verified ? 'success' : 'warning'}>{domain.status?.verified ? t('domains.sendable') : t('domains.waitingVerify')}</Tag>
+      render: (_, domain) => (
+        <StatusPill tone={domain.status?.verified ? 'success' : 'warning'}>
+          {domain.status?.verified ? t('domains.sendable') : t('domains.waitingVerify')}
+        </StatusPill>
+      )
     },
     {
       title: t('domains.lastSent'),
@@ -89,7 +105,11 @@ export default function DomainsPage({
       width: 130,
       render: (_, domain) => {
         const health = buildDomainHealth(domain);
-        return <Tag color={health.status === 'success' ? 'success' : health.status === 'warning' ? 'warning' : 'error'}>{domainHealthLabel(health.status, t)}</Tag>;
+        return (
+          <StatusPill tone={healthTone(health.status)}>
+            {domainHealthLabel(health.status, t)}
+          </StatusPill>
+        );
       }
     },
     {
@@ -117,8 +137,10 @@ export default function DomainsPage({
   ];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <Card>
+    <Space direction="vertical" size={20} className="full-width">
+      <PageHeader title={t('domains.title')} />
+
+      <SectionCard className="domains-toolbar-card">
         <div className="page-toolbar">
           <Space wrap>
             <Input
@@ -146,8 +168,9 @@ export default function DomainsPage({
             {t('common.addDomain')}
           </Button>
         </div>
-      </Card>
-      <Card
+      </SectionCard>
+
+      <SectionCard
         title={t('domains.title')}
         extra={
           <Typography.Text type="secondary">
@@ -156,7 +179,7 @@ export default function DomainsPage({
         }
       >
         <Table rowKey="id" columns={columns} dataSource={filtered} scroll={{ x: 1800 }} />
-      </Card>
+      </SectionCard>
     </Space>
   );
 }
@@ -171,6 +194,12 @@ function recordColumn(title: string, key: string): ColumnsType<Domain>[number] {
       return <StatusTag record={record} />;
     }
   };
+}
+
+function healthTone(status: string): 'success' | 'warning' | 'error' {
+  if (status === 'success') return 'success';
+  if (status === 'warning') return 'warning';
+  return 'error';
 }
 
 function domainHealthLabel(status: string, t: (key: string) => string) {

@@ -1,8 +1,12 @@
 import { CopyOutlined, SearchOutlined } from '@ant-design/icons';
-import { Button, Card, DatePicker, Descriptions, Drawer, Empty, Input, Select, Space, Table, Tag, Timeline, Typography } from 'antd';
+import { Button, DatePicker, Descriptions, Drawer, Input, Select, Space, Table, Tag, Timeline, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useMemo, useState } from 'react';
 
+import { EmptyState } from '../components/common/EmptyState';
+import { PageHeader } from '../components/common/PageHeader';
+import { SectionCard } from '../components/common/SectionCard';
+import { StatusPill } from '../components/common/StatusPill';
 import { useI18n } from '../frontend/i18n/react';
 import type { DeliveryAttempt, DeliveryLogEntry, Domain, SendEvent } from '../frontend/types';
 
@@ -38,7 +42,12 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
     { title: t('logs.recipient'), dataIndex: 'recipients', render: (value: string[]) => value.join(', '), ellipsis: true },
     { title: t('logs.domain'), dataIndex: 'domain', width: 180 },
     { title: 'Subject', dataIndex: 'subject', ellipsis: true },
-    { title: t('common.status'), dataIndex: 'status', render: (value) => <StatusTag status={value} />, width: 120 },
+    {
+      title: t('common.status'),
+      dataIndex: 'status',
+      render: (value) => <StatusTag status={value} />,
+      width: 120
+    },
     { title: 'Message ID', dataIndex: 'id', render: (value) => <span>mh-{value}</span>, width: 140 },
     { title: t('logs.errorReason'), dataIndex: 'detail', ellipsis: true },
     { title: t('domains.actions'), render: (_, event) => <Button onClick={() => setSelected(event)}>{t('logs.viewDetail')}</Button>, width: 120 }
@@ -46,8 +55,10 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
 
   return (
     <>
-      <Space direction="vertical" size={16} className="full-width">
-        <Card>
+      <Space direction="vertical" size={20} className="full-width">
+        <PageHeader title={t('logs.title')} />
+
+        <SectionCard className="logs-toolbar-card">
           <div className="page-toolbar">
             <Space wrap>
               <RangePicker
@@ -89,11 +100,20 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
               />
             </Space>
           </div>
-        </Card>
-        <Card title={t('logs.title')}>
+        </SectionCard>
+
+        <SectionCard
+          title={t('logs.title')}
+          extra={
+            <Typography.Text type="secondary">
+              {filtered.length} / {events.length}
+            </Typography.Text>
+          }
+        >
           <Table rowKey="id" columns={columns} dataSource={filtered} scroll={{ x: 1300 }} />
-        </Card>
+        </SectionCard>
       </Space>
+
       <DeliveryLogDrawer
         event={selected}
         onClose={() => setSelected(null)}
@@ -146,7 +166,7 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
                 <Typography.Text code className="inline-code-value">{event.detail || '-'}</Typography.Text>
               </Descriptions.Item>
             </Descriptions>
-            <Card size="small" title={t('logs.deliveryAttempts')} className="delivery-log-card">
+            <SectionCard title={t('logs.deliveryAttempts')} className="delivery-log-card">
               {event.deliveryAttempts?.length ? (
                 <Timeline
                   items={event.deliveryAttempts.map((attempt, index) => ({
@@ -156,10 +176,10 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
                   }))}
                 />
               ) : (
-                <Empty description={t('logs.noDeliveryAttempts')} />
+                <EmptyState description={t('logs.noDeliveryAttempts')} />
               )}
-            </Card>
-            <Card size="small" title={t('logs.deliveryLog')} className="delivery-log-card">
+            </SectionCard>
+            <SectionCard title={t('logs.deliveryLog')} className="delivery-log-card">
               {deliveryLog.length ? (
                 <Timeline
                   items={deliveryLog.map((entry, index) => ({
@@ -169,9 +189,9 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
                   }))}
                 />
               ) : (
-                <Empty description={t('logs.noDeliveryLog')} />
+                <EmptyState description={t('logs.noDeliveryLog')} />
               )}
-            </Card>
+            </SectionCard>
           </Space>
         ) : null}
       </Drawer>
@@ -184,7 +204,9 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
         <Space wrap size={8}>
           <Typography.Text strong>{entry.phase}</Typography.Text>
           {entry.direction ? <Tag>{entry.direction}</Tag> : null}
-          {entry.code ? <Tag color={entry.ok === false ? 'red' : 'blue'}>{entry.code}</Tag> : null}
+          {entry.code ? (
+            <StatusPill tone={entry.ok === false ? 'error' : 'info'}>{entry.code}</StatusPill>
+          ) : null}
           <Typography.Text type="secondary">{entry.at ? new Date(entry.at).toLocaleString() : '-'}</Typography.Text>
         </Space>
         {entry.command ? <LogLine label="C" value={entry.command} /> : null}
@@ -261,15 +283,8 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
     return lines.join('\n').trim();
   }
 
-  function timelineColor(entry: DeliveryLogEntry) {
-    if (entry.ok === false || entry.phase === 'error') return 'red';
-    if (entry.phase === 'queue') return 'green';
-    if (entry.phase === 'auth') return 'gold';
-    return 'blue';
-  }
-
   function StatusTag({ status }: { status: string }) {
-    return <Tag color={statusColor(status)}>{statusLabel(status)}</Tag>;
+    return <StatusPill tone={statusTone(status)}>{statusLabel(status)}</StatusPill>;
   }
 
   function statusLabel(status: string) {
@@ -282,14 +297,21 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
     }[status] || status;
   }
 
-  function statusColor(status: string) {
+  function statusTone(status: string): 'success' | 'warning' | 'error' | 'info' | 'neutral' {
     return {
-      queued: 'processing',
+      queued: 'info',
       sent: 'success',
       deferred: 'warning',
       bounced: 'error',
       failed: 'error'
-    }[status] || 'default';
+    }[status] as 'success' | 'warning' | 'error' | 'info' | 'neutral' || 'neutral';
+  }
+
+  function timelineColor(entry: DeliveryLogEntry) {
+    if (entry.ok === false || entry.phase === 'error') return 'red';
+    if (entry.phase === 'queue') return 'green';
+    if (entry.phase === 'auth') return 'gold';
+    return 'blue';
   }
 
   function deliveryAttemptColor(status: string) {

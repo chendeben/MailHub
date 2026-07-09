@@ -17,6 +17,7 @@ import { I18nProvider, useI18n } from './i18n/react';
 import { buildDnsApplyFeedback } from './domain-model.js';
 import { api } from './services/api';
 import './styles.css';
+import { mailhubTheme } from './theme';
 import type {
   AddDomainPayload,
   ApiToken,
@@ -26,6 +27,7 @@ import type {
   DomainMode,
   DomainPatchPayload,
   RuntimeConfig,
+  SmtpCredential,
   SmtpRelay,
   SmtpRelayPayload,
   User,
@@ -39,6 +41,7 @@ const emptyData: AppData = {
   events: [],
   analytics: null,
   smtpCredential: null,
+  smtpCredentials: [],
   smtpRelays: [],
   dnsCredentials: [],
   apiTokens: [],
@@ -60,25 +63,7 @@ const viewTitleKeys: Record<ViewKey, string> = {
 
 export default function App() {
   return (
-    <ConfigProvider
-      theme={{
-        token: {
-          colorPrimary: '#1677ff',
-          borderRadius: 10,
-          colorBgLayout: '#f5f7fb',
-          colorBorderSecondary: '#e5eaf2'
-        },
-        components: {
-          Card: {
-            borderRadiusLG: 12
-          },
-          Table: {
-            cellPaddingBlock: 14,
-            cellPaddingInline: 14
-          }
-        }
-      }}
-    >
+    <ConfigProvider theme={mailhubTheme}>
       <AntApp>
         <I18nProvider>
           <MailHubConsole />
@@ -112,12 +97,13 @@ function MailHubConsole() {
     setLoading(true);
     try {
       const me = await api.me();
-      const [config, domains, events, analytics, smtpCredential, smtpRelays, dnsCredentials, apiTokens] = await Promise.all([
+      const [config, domains, events, analytics, smtpCredential, smtpCredentials, smtpRelays, dnsCredentials, apiTokens] = await Promise.all([
         api.config(),
         api.domains(),
         api.events(),
         api.analytics(30),
         api.smtpCredential(),
+        api.smtpCredentials(),
         api.smtpRelays(),
         api.dnsCredentials(),
         api.apiTokens()
@@ -136,6 +122,7 @@ function MailHubConsole() {
         events: events.events || [],
         analytics: analytics.analytics || null,
         smtpCredential: smtpCredential.credential || null,
+        smtpCredentials: smtpCredentials.credentials || [],
         smtpRelays: smtpRelays.relays || [],
         dnsCredentials: dnsCredentials.credentials || [],
         apiTokens: apiTokens.tokens || [],
@@ -293,23 +280,63 @@ function MailHubConsole() {
     }));
   }
 
-  async function saveSmtpCredential(values: { username: string; password?: string }) {
-    const result = await runAction(async () => api.saveSmtpCredential(values), t('actions.smtpSaved'));
-    if (!result?.credential) return;
-    setData((current) => ({
-      ...current,
-      smtpCredential: result.credential,
-      config: current.config?.submission
-        ? {
-            ...current.config,
-            submission: {
-              ...current.config.submission,
-              username: result.credential.username,
-              passwordSet: Boolean(result.credential.passwordSet)
+  async function loadSmtpLoginCredential(id: number) {
+    const result = await runAction(async () => api.smtpCredentialDetail(id));
+    return result?.credential || null;
+  }
+
+  async function saveSmtpLoginCredential(values: { username: string; password?: string }, id?: number) {
+    const result = await runAction(
+      async () => api.saveSmtpLoginCredential(values, id),
+      id ? t('actions.smtpUpdated') : t('actions.smtpCreated')
+    );
+    if (!result?.credential) return null;
+    setData((current) => {
+      const credentials = id
+        ? current.smtpCredentials.map((item) => item.id === id ? result.credential : item)
+        : [result.credential, ...current.smtpCredentials];
+      return {
+        ...current,
+        smtpCredential: credentials[0] || null,
+        smtpCredentials: credentials,
+        config: current.config?.submission
+          ? {
+              ...current.config,
+              submission: {
+                ...current.config.submission,
+                username: credentials[0]?.username || '',
+                passwordSet: Boolean(credentials[0]?.passwordSet)
+              }
             }
-          }
-        : current.config
-    }));
+          : current.config
+      };
+    });
+    return result.credential;
+  }
+
+  async function deleteSmtpLoginCredential(credential: SmtpCredential) {
+    const credentialId = credential.id;
+    if (!credentialId) return;
+    const result = await runAction(async () => api.deleteSmtpCredential(credentialId), t('actions.smtpDeleted'));
+    if (!result?.deleted) return;
+    setData((current) => {
+      const credentials = current.smtpCredentials.filter((item) => item.id !== credentialId);
+      return {
+        ...current,
+        smtpCredential: credentials[0] || null,
+        smtpCredentials: credentials,
+        config: current.config?.submission
+          ? {
+              ...current.config,
+              submission: {
+                ...current.config.submission,
+                username: credentials[0]?.username || '',
+                passwordSet: Boolean(credentials[0]?.passwordSet)
+              }
+            }
+          : current.config
+      };
+    });
   }
 
   async function loadSmtpRelay(id: number) {
@@ -506,10 +533,13 @@ function MailHubConsole() {
         <SmtpCredentials
           config={data.config}
           credential={data.smtpCredential}
+          credentials={data.smtpCredentials}
           relays={data.smtpRelays}
           loading={actionLoading}
           onCopy={copy}
-          onSave={saveSmtpCredential}
+          onLoadCredential={loadSmtpLoginCredential}
+          onSaveCredential={saveSmtpLoginCredential}
+          onDeleteCredential={deleteSmtpLoginCredential}
           onLoadRelay={loadSmtpRelay}
           onSaveRelay={saveSmtpRelay}
           onDeleteRelay={deleteSmtpRelay}

@@ -44,6 +44,7 @@ export interface RuntimeConfig {
   dmarcPolicy: string;
   dmarcRua: string;
   sendRequiresVerified: boolean;
+  systemChecks?: SystemChecks;
   submission?: {
     enabled: boolean;
     host: string;
@@ -55,6 +56,11 @@ export interface RuntimeConfig {
   };
   apiTokenSet?: boolean;
   usingDefaultAdminPassword?: boolean;
+}
+
+export interface SystemChecks {
+  checkedAt: string;
+  ptr: DnsRecord;
 }
 
 export interface DnsRecord {
@@ -331,6 +337,7 @@ export interface AppData {
   events: SendEvent[];
   analytics: Analytics | null;
   smtpCredential: SmtpCredential | null;
+  smtpCredentials: SmtpCredential[];
   smtpRelays: SmtpRelay[];
   dnsCredentials: DnsCredential[];
   apiTokens: ApiToken[];

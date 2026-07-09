@@ -9,10 +9,8 @@ import {
   Alert,
   App as AntApp,
   Button,
-  Card,
   Checkbox,
   Descriptions,
-  Empty,
   Form,
   Input,
   InputNumber,
@@ -26,8 +24,12 @@ import {
   Typography
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 
+import { EmptyState } from '../../components/common/EmptyState';
+import { PageHeader } from '../../components/common/PageHeader';
+import { SectionCard } from '../../components/common/SectionCard';
+import { StatusPill } from '../../components/common/StatusPill';
 import {
   adminUserStatusMeta,
   buildMergeConfirmationText,
@@ -40,10 +42,7 @@ import { api } from '../../frontend/services/api';
 import type {
   AdminResourceInventory,
   AdminUser,
-  ApiToken,
   AuditLogEntry,
-  DnsCredential,
-  Domain,
   SystemEmailSettings,
   User,
   UserMergeOptions,
@@ -85,9 +84,12 @@ export default function AdminPage({ me }: AdminPageProps) {
 
   if (me?.role !== 'admin') {
     return (
-      <Card>
-        <Typography.Text type="secondary">{t('settings.noPermission')}</Typography.Text>
-      </Card>
+      <Space direction="vertical" size={20} className="full-width">
+        <PageHeader title={t('admin.title')} />
+        <SectionCard>
+          <Typography.Text type="secondary">{t('settings.noPermission')}</Typography.Text>
+        </SectionCard>
+      </Space>
     );
   }
 
@@ -229,16 +231,18 @@ export default function AdminPage({ me }: AdminPageProps) {
   ];
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
-      <div className="page-toolbar">
-        <Typography.Title level={3}>{t('admin.title')}</Typography.Title>
-        <Button icon={<ReloadOutlined />} loading={loading} onClick={() => loadAdminData()}>
-          {t('common.refresh')}
-        </Button>
-      </div>
-      <Card>
+    <Space direction="vertical" size={20} className="full-width">
+      <PageHeader
+        title={t('admin.title')}
+        extra={
+          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => loadAdminData()}>
+            {t('common.refresh')}
+          </Button>
+        }
+      />
+      <SectionCard>
         <Tabs items={tabItems} />
-      </Card>
+      </SectionCard>
     </Space>
   );
 }
@@ -419,7 +423,11 @@ function AdminResources({
     {
       title: 'SMTP',
       width: 120,
-      render: (_, group) => group.smtpCredential ? <Tag color="green">已配置</Tag> : <Tag>无</Tag>
+      render: (_, group) => (
+        group.smtpCredential
+          ? <StatusPill tone="success">已配置</StatusPill>
+          : <StatusPill tone="neutral">无</StatusPill>
+      )
     }
   ];
 
@@ -466,7 +474,7 @@ function AdminResources({
         />
       ) : null}
       <div className="form-grid three">
-        <Card title="迁移域名">
+        <SectionCard title="迁移域名">
           <Form form={domainForm} layout="vertical" onFinish={submitDomainTransfer} disabled={loading}>
             <Form.Item name="domainId" label="域名" rules={[{ required: true }]}>
               <Select
@@ -492,8 +500,8 @@ function AdminResources({
             </Form.Item>
             <Button type="primary" htmlType="submit" loading={loading}>执行迁移</Button>
           </Form>
-        </Card>
-        <Card title="迁移 DNS 凭据">
+        </SectionCard>
+        <SectionCard title="迁移 DNS 凭据">
           <Form form={dnsForm} layout="vertical" onFinish={submitDnsTransfer} disabled={loading}>
             <Form.Item name="credentialId" label="DNS 凭据" rules={[{ required: true }]}>
               <Select
@@ -510,8 +518,8 @@ function AdminResources({
             </Form.Item>
             <Button type="primary" htmlType="submit" loading={loading}>执行迁移</Button>
           </Form>
-        </Card>
-        <Card title="迁移 API Token">
+        </SectionCard>
+        <SectionCard title="迁移 API Token">
           <Form form={tokenForm} layout="vertical" onFinish={submitTokenTransfer} disabled={loading}>
             <Form.Item name="tokenIds" label="API Token" rules={[{ required: true }]}>
               <Select
@@ -528,9 +536,9 @@ function AdminResources({
             </Form.Item>
             <Button type="primary" htmlType="submit" loading={loading}>执行迁移</Button>
           </Form>
-        </Card>
+        </SectionCard>
       </div>
-      <Card title="资源归属">
+      <SectionCard title="资源归属">
         <Table
           rowKey={(group) => group.user.id}
           columns={groupColumns}
@@ -538,7 +546,7 @@ function AdminResources({
           loading={loading}
           expandable={{ expandedRowRender: renderResourceDetails }}
         />
-      </Card>
+      </SectionCard>
     </Space>
   );
 }
@@ -640,7 +648,7 @@ function AdminMigration({
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <Card title="合并预览">
+      <SectionCard title="合并预览">
         <Form form={form} layout="inline" onFinish={submitPreview} disabled={loading}>
           <Form.Item name="sourceUserId" label="源用户" rules={[{ required: true }]}>
             <Select options={userOptions} className="toolbar-select" />
@@ -650,16 +658,16 @@ function AdminMigration({
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={loading}>预览</Button>
         </Form>
-      </Card>
+      </SectionCard>
       {preview ? (
-        <Card title={`${preview.sourceUser.username} → ${preview.targetUser.username}`}>
+        <SectionCard title={`${preview.sourceUser.username} → ${preview.targetUser.username}`}>
           <Space direction="vertical" size={16} className="full-width">
             {preview.warnings.length ? (
               <Alert type="warning" showIcon message={preview.warnings.map((item) => item.message || item.type).join('；')} />
             ) : null}
             <Space wrap>
               {mergePreviewSummary(preview).map((item) => (
-                <Tag key={item.key}>{item.label}: {item.count}</Tag>
+                <StatusPill key={item.key} tone="neutral">{item.label}: {item.count}</StatusPill>
               ))}
             </Space>
             <div className="form-grid two">
@@ -693,9 +701,9 @@ function AdminMigration({
               执行合并
             </Button>
           </Space>
-        </Card>
+        </SectionCard>
       ) : (
-        <Empty description="暂无预览" />
+        <EmptyState description="暂无预览" />
       )}
     </Space>
   );
@@ -724,7 +732,7 @@ function AdminSystemEmail({
   }
 
   return (
-    <Card title="系统邮件服务器">
+    <SectionCard title="系统邮件服务器">
       <Form form={form} layout="vertical" onFinish={submit} disabled={loading}>
         <div className="form-grid two">
           <Form.Item name="host" label="SMTP Host" rules={[{ required: true }]}>
@@ -760,7 +768,7 @@ function AdminSystemEmail({
           <Button onClick={() => onTest(form.getFieldValue('testRecipient'))} loading={loading}>发送测试</Button>
         </Space>
       </Form>
-    </Card>
+    </SectionCard>
   );
 }
 
@@ -801,7 +809,7 @@ function AdminAuditLogs({
 
   return (
     <Space direction="vertical" size={16} className="full-width">
-      <Card>
+      <SectionCard className="admin-audit-toolbar-card">
         <Form form={form} layout="inline" onFinish={submit} disabled={loading}>
           <Form.Item name="actorUserId" label="操作者">
             <Select allowClear options={[{ value: 'system', label: 'system' }, ...userOptions]} className="toolbar-select" />
@@ -820,7 +828,7 @@ function AdminAuditLogs({
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={loading}>查询</Button>
         </Form>
-      </Card>
+      </SectionCard>
       <Table rowKey="id" columns={columns} dataSource={logs} loading={loading} scroll={{ x: 1100 }} />
     </Space>
   );
@@ -841,7 +849,16 @@ function ResourceCountTags({ counts }: { counts?: AdminUser['resourceCounts'] })
 
 function UserStatusTag({ status }: { status: UserStatus }) {
   const meta = adminUserStatusMeta(status);
-  return <Tag color={meta.color}>{meta.label}</Tag>;
+  const tone = statusToneFromColor(meta.color);
+  return <StatusPill tone={tone}>{meta.label}</StatusPill>;
+}
+
+function statusToneFromColor(color: string): 'success' | 'warning' | 'error' | 'info' | 'neutral' {
+  if (color === 'green' || color === 'success') return 'success';
+  if (color === 'gold' || color === 'orange' || color === 'warning') return 'warning';
+  if (color === 'red' || color === 'error' || color === 'volcano') return 'error';
+  if (color === 'blue' || color === 'processing' || color === 'cyan') return 'info';
+  return 'neutral';
 }
 
 function formatDate(value?: string) {

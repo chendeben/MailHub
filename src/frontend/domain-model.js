@@ -1,4 +1,4 @@
-const REQUIRED_DNS_KEYS = ['verification', 'dkim', 'spf', 'dmarc', 'sender-a', 'ptr'];
+const REQUIRED_DNS_KEYS = ['verification', 'dkim', 'spf', 'dmarc', 'sender-a'];
 
 const STATUS_META = {
   ok: { key: 'success', label: '已通过', color: 'success' },
@@ -15,10 +15,24 @@ export function getRecordStatusMeta(record = {}) {
   return STATUS_META[String(record.status || '').toLowerCase()] || STATUS_META.missing;
 }
 
+export function getDnsCurrentValues(record = {}) {
+  if (Array.isArray(record.current)) return record.current.filter((value) => value);
+  if (record.current) return [record.current];
+  const status = getRecordStatusMeta(record);
+  return status.key === 'success' && record.value ? [record.value] : [];
+}
+
 export function getRequiredDnsRecords(domain = {}) {
   const records = Array.isArray(domain.status?.records) ? domain.status.records : [];
   const byKey = new Map(records.map((record) => [record.key, record]));
   return REQUIRED_DNS_KEYS.map((key) => byKey.get(key)).filter(Boolean);
+}
+
+export function getVisibleDnsRecords(records = []) {
+  const rank = new Map(REQUIRED_DNS_KEYS.map((key, index) => [key, index]));
+  return [...records]
+    .filter((record) => rank.has(record.key))
+    .sort((a, b) => rank.get(a.key) - rank.get(b.key));
 }
 
 export function buildDomainHealth(domain = {}) {

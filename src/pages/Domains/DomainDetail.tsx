@@ -2,28 +2,29 @@ import { ArrowLeftOutlined, CopyOutlined } from '@ant-design/icons';
 import {
   Alert,
   Button,
-  Card,
-  Col,
   Collapse,
   Descriptions,
-  Empty,
   Form,
   Input,
   Modal,
   Row,
+  Col,
   Select,
   Space,
   Table,
   Tabs,
-  Tag,
   Typography
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useMemo, useState } from 'react';
 
+import { CodeBlock } from '../../components/common/CodeBlock';
+import { EmptyState } from '../../components/common/EmptyState';
+import { SectionCard } from '../../components/common/SectionCard';
+import { StatusPill } from '../../components/common/StatusPill';
 import { DomainHealthCard } from '../../components/domain/DomainHealthCard';
 import { DnsRecordCard } from '../../components/domain/DnsRecordCard';
-import { getDnsRecordOrder } from '../../frontend/domain-model.js';
+import { getVisibleDnsRecords } from '../../frontend/domain-model.js';
 import { useI18n } from '../../frontend/i18n/react';
 import type {
   ApiToken,
@@ -108,7 +109,7 @@ export default function DomainDetail({
   }
 
   return (
-    <Space direction="vertical" size={16} className="full-width">
+    <Space direction="vertical" size={20} className="full-width">
       <Button icon={<ArrowLeftOutlined />} onClick={onBack}>
         {t('domainDetail.back')}
       </Button>
@@ -125,6 +126,7 @@ export default function DomainDetail({
       <Tabs
         activeKey={activeTab}
         onChange={setActiveTab}
+        className="domain-detail-tabs"
         items={[
           { key: 'overview', label: 'Overview', children: <OverviewTab domain={domain} events={domainEvents} smtpRelayName={smtpRelayName} onDelete={() => onDelete(domain)} /> },
           {
@@ -219,7 +221,7 @@ function OverviewTab({
   return (
     <Row gutter={[16, 16]}>
       <Col xs={24} lg={16}>
-        <Card title={t('domainDetail.overview')}>
+        <SectionCard title={t('domainDetail.overview')}>
           <Descriptions column={1}>
             <Descriptions.Item label={t('domains.domain')}>{domain.domain}</Descriptions.Item>
             <Descriptions.Item label={t('domains.senderHost')}>{domain.senderHost}</Descriptions.Item>
@@ -228,17 +230,17 @@ function OverviewTab({
             <Descriptions.Item label="DKIM selector">{domain.selector}</Descriptions.Item>
             <Descriptions.Item label={t('domains.lastSent')}>{events[0] ? new Date(events[0].createdAt).toLocaleString() : t('common.notFound')}</Descriptions.Item>
           </Descriptions>
-        </Card>
+        </SectionCard>
       </Col>
       <Col xs={24} lg={8}>
-        <Card title={t('domainDetail.danger')}>
-          <Space direction="vertical" className="full-width">
+        <SectionCard title={t('domainDetail.danger')} className="domain-danger-card">
+          <Space direction="vertical" className="full-width" size={12}>
             <Typography.Text type="secondary">{t('domainDetail.deleteHint')}</Typography.Text>
             <Button danger block onClick={onDelete}>
               {t('common.delete')}
             </Button>
           </Space>
-        </Card>
+        </SectionCard>
       </Col>
     </Row>
   );
@@ -268,16 +270,19 @@ function DnsRecordsTab({
           {records.length ? records.map((record) => (
               <DnsRecordCard key={record.key} record={record} loading={loading} onCopy={onCopy} onRecheck={onCheck} />
           )) : (
-            <Card>
-              <Empty description={t('domainDetail.noDnsResult')}>
-                <Button type="primary" onClick={onCheck}>{t('domainHealth.checkNow')}</Button>
-              </Empty>
-            </Card>
+            <SectionCard>
+              <EmptyState
+                description={t('domainDetail.noDnsResult')}
+                action={
+                  <Button type="primary" onClick={onCheck}>{t('domainHealth.checkNow')}</Button>
+                }
+              />
+            </SectionCard>
           )}
         </Space>
       </Col>
       <Col xs={24} xl={9}>
-        <Card
+        <SectionCard
           title={t('domainDetail.currentDnsResult')}
           extra={
             <Space>
@@ -289,18 +294,18 @@ function DnsRecordsTab({
           }
         >
           <Space direction="vertical" size={16} className="full-width">
-            <Tag>{t('domainDetail.lastCheck')}：{domain.status?.checkedAt ? new Date(domain.status.checkedAt).toLocaleString() : t('domainDetail.notChecked')}</Tag>
+            <StatusPill tone={domain.status?.checkedAt ? 'neutral' : 'warning'}>
+              {t('domainDetail.lastCheck')}：{domain.status?.checkedAt ? new Date(domain.status.checkedAt).toLocaleString() : t('domainDetail.notChecked')}
+            </StatusPill>
             {liveEntries.length ? (
               <Collapse
                 items={liveEntries.map(([key, values]) => ({
                   key,
                   label: liveLabel(key, t),
                   children: values.length ? (
-                    <Space direction="vertical" className="full-width">
+                    <Space direction="vertical" className="full-width" size={8}>
                       {values.map((value) => (
-                        <Typography.Paragraph key={value} code copyable className="dns-code-block">
-                          {value}
-                        </Typography.Paragraph>
+                        <CodeBlock key={value} value={value} onCopy={onCopy} />
                       ))}
                     </Space>
                   ) : (
@@ -309,13 +314,13 @@ function DnsRecordsTab({
                 }))}
               />
             ) : (
-              <Empty description={t('domainDetail.noPublicDns')} />
+              <EmptyState description={t('domainDetail.noPublicDns')} />
             )}
             {domain.status?.warnings?.length ? (
               <Alert type="warning" showIcon message={t('domainDetail.needAttention')} description={domain.status.warnings.join('\n')} />
             ) : null}
           </Space>
-        </Card>
+        </SectionCard>
       </Col>
     </Row>
   );
@@ -339,26 +344,32 @@ function SmtpApiTab({
   return (
     <Row gutter={[16, 16]}>
       <Col xs={24} lg={12}>
-        <Card title="SMTP">
+        <SectionCard title="SMTP">
           <Descriptions column={1}>
             <Descriptions.Item label="SMTP Host">{copyable(config?.submission?.host || '-', onCopy)}</Descriptions.Item>
             <Descriptions.Item label="SMTP Port">
-              {(config?.submission?.ports || []).map((item) => <Tag key={item.port}>{item.port} · {item.protocol}</Tag>)}
+              <Space wrap size={6}>
+                {(config?.submission?.ports || []).map((item) => (
+                  <StatusPill key={item.port} tone="info">
+                    {item.port} · {item.protocol}
+                  </StatusPill>
+                ))}
+              </Space>
             </Descriptions.Item>
             <Descriptions.Item label="Username">{copyable(smtpCredential?.username || config?.submission?.username || '-', onCopy)}</Descriptions.Item>
             <Descriptions.Item label="Password">{smtpCredential?.password ? copyable(smtpCredential.password, onCopy) : t('domainDetail.noSmtpPassword')}</Descriptions.Item>
             <Descriptions.Item label="TLS / SSL">{config?.submission?.tls ? 'TLS' : 'STARTTLS'}</Descriptions.Item>
           </Descriptions>
-        </Card>
+        </SectionCard>
       </Col>
       <Col xs={24} lg={12}>
-        <Card title="API">
+        <SectionCard title="API">
           <Descriptions column={1}>
             <Descriptions.Item label="API Endpoint">{copyable(apiEndpoint, onCopy)}</Descriptions.Item>
             <Descriptions.Item label="API Token">{apiTokens[0] ? `${apiTokens[0].tokenPrefix}...` : t('domainDetail.noApiToken')}</Descriptions.Item>
             <Descriptions.Item label="From">noreply@{domain.domain}</Descriptions.Item>
           </Descriptions>
-        </Card>
+        </SectionCard>
       </Col>
     </Row>
   );
@@ -370,10 +381,20 @@ function SendingLogsTab({ events }: { events: SendEvent[] }) {
     { title: t('logs.time'), dataIndex: 'createdAt', render: (value) => new Date(value).toLocaleString() },
     { title: t('logs.recipient'), dataIndex: 'recipients', render: (value: string[]) => value.join(', ') },
     { title: 'Subject', dataIndex: 'subject', ellipsis: true },
-    { title: t('common.status'), dataIndex: 'status', render: (value) => <Tag color={sendStatusColor(value)}>{sendStatusLabel(value, t)}</Tag> },
+    {
+      title: t('common.status'),
+      dataIndex: 'status',
+      render: (value) => (
+        <StatusPill tone={sendStatusTone(value)}>{sendStatusLabel(value, t)}</StatusPill>
+      )
+    },
     { title: t('logs.errorReason'), dataIndex: 'detail', ellipsis: true }
   ];
-  return <Table rowKey="id" columns={columns} dataSource={events} scroll={{ x: 900 }} />;
+  return (
+    <SectionCard title={t('logs.title')}>
+      <Table rowKey="id" columns={columns} dataSource={events} scroll={{ x: 900 }} />
+    </SectionCard>
+  );
 }
 
 function IntegrationGuideTab({
@@ -398,26 +419,23 @@ function IntegrationGuideTab({
     "text": "Signed with DKIM and queued by MailHub."
   }'`;
   return (
-    <Card title={t('domainDetail.apiExample')}>
-      <Typography.Paragraph code copyable className="code-sample">
-        {code}
-      </Typography.Paragraph>
-    </Card>
+    <SectionCard title={t('domainDetail.apiExample')}>
+      <CodeBlock value={code} />
+    </SectionCard>
   );
 }
 
 function Placeholder({ title }: { title: string }) {
   const { t } = useI18n();
   return (
-    <Card>
-      <Empty description={`${title} ${t('domainDetail.placeholder')}`} />
-    </Card>
+    <SectionCard>
+      <EmptyState description={`${title} ${t('domainDetail.placeholder')}`} />
+    </SectionCard>
   );
 }
 
 function orderedRecords(records: DnsRecord[]) {
-  const order = getDnsRecordOrder();
-  return [...records].sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
+  return getVisibleDnsRecords(records);
 }
 
 function sendStatusLabel(status: string, t: (key: string) => string) {
@@ -429,12 +447,12 @@ function sendStatusLabel(status: string, t: (key: string) => string) {
   return status || t('dashboard.statusUnknown');
 }
 
-function sendStatusColor(status: string) {
-  if (status === 'queued') return 'processing';
+function sendStatusTone(status: string): 'success' | 'warning' | 'error' | 'info' | 'neutral' {
+  if (status === 'queued') return 'info';
   if (status === 'sent') return 'success';
   if (status === 'deferred') return 'warning';
   if (status === 'bounced' || status === 'failed') return 'error';
-  return 'default';
+  return 'neutral';
 }
 
 function liveLabel(key: string, t: (key: string) => string) {

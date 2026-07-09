@@ -44,6 +44,17 @@ test('uses localized Chinese labels for the main navigation', () => {
   assert.equal(zh('nav.settings'), '系统设置');
 });
 
+test('nav group chrome strings exist', () => {
+  const zh = createTranslator('zh-CN');
+  const en = createTranslator('en-US');
+  assert.equal(zh('nav.group.overview'), '概览');
+  assert.equal(zh('nav.group.delivery'), '投递');
+  assert.equal(zh('nav.group.system'), '系统');
+  assert.equal(en('nav.group.overview'), 'Overview');
+  assert.equal(en('nav.group.delivery'), 'Delivery');
+  assert.equal(en('nav.group.system'), 'System');
+});
+
 test('translates admin panel labels', () => {
   const zh = createTranslator('zh-CN');
   const en = createTranslator('en-US');
@@ -52,5 +63,17 @@ test('translates admin panel labels', () => {
   assert.equal(zh('admin.users'), '用户');
   assert.equal(zh('admin.resources'), '资源');
   assert.equal(zh('admin.auditLogs'), '审计日志');
+  assert.equal(zh('settings.deliveryChecks'), '发信环境检查');
   assert.equal(en('admin.title'), 'Admin Panel');
+  assert.equal(en('settings.deliveryChecks'), 'Sending Environment Checks');
+});
+
+test('translates smtp login credential labels separately from outbound relays', () => {
+  const zh = createTranslator('zh-CN');
+  const en = createTranslator('en-US');
+
+  assert.equal(zh('smtp.loginCredentialsTitle'), '发信登录凭据');
+  assert.equal(zh('smtpRelay.title'), '高级：外部 SMTP 出口');
+  assert.equal(en('smtp.loginCredentialsTitle'), 'Sending login credentials');
+  assert.equal(en('smtpRelay.title'), 'Advanced: external SMTP relays');
 });

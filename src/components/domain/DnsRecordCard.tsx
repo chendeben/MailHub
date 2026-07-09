@@ -1,9 +1,12 @@
-import { CopyOutlined, ReloadOutlined } from '@ant-design/icons';
-import { Alert, Button, Card, Space, Tooltip, Typography } from 'antd';
+import { ReloadOutlined } from '@ant-design/icons';
+import { Alert, Button, Space, Typography } from 'antd';
 
+import { CodeBlock } from '../common/CodeBlock';
+import { SectionCard } from '../common/SectionCard';
+import { StatusTag } from '../common/StatusTag';
+import { getDnsCurrentValues } from '../../frontend/domain-model.js';
 import { useI18n } from '../../frontend/i18n/react';
 import type { DnsRecord } from '../../frontend/types';
-import { StatusTag } from '../common/StatusTag';
 
 interface DnsRecordCardProps {
   record: DnsRecord;
@@ -14,22 +17,18 @@ interface DnsRecordCardProps {
 
 export function DnsRecordCard({ record, loading, onCopy, onRecheck }: DnsRecordCardProps) {
   const { t } = useI18n();
-  const currentValues = Array.isArray(record.current)
-    ? record.current
-    : record.current
-      ? [record.current]
-      : [];
+  const currentValues: string[] = getDnsCurrentValues(record);
 
   return (
-    <Card
+    <SectionCard
       className="dns-record-card"
       title={
-        <Space wrap>
-          <span>{record.label}</span>
+        <Space wrap size={8}>
+          <span className="dns-record-card__label">{record.label}</span>
           <StatusTag record={record} />
         </Space>
       }
-      extra={<Typography.Text code>{record.type}</Typography.Text>}
+      extra={<Typography.Text code className="dns-record-card__type">{record.type}</Typography.Text>}
     >
       <Space direction="vertical" size={14} className="full-width">
         <DnsValueRow label={t('dnsRecord.hostname')} value={record.host} onCopy={onCopy} />
@@ -39,9 +38,7 @@ export function DnsRecordCard({ record, loading, onCopy, onRecheck }: DnsRecordC
           {currentValues.length ? (
             <Space direction="vertical" size={8} className="full-width value-stack">
               {currentValues.map((value) => (
-                <Typography.Paragraph key={value} code copyable className="dns-code-block">
-                  {value}
-                </Typography.Paragraph>
+                <CodeBlock key={value} value={value} onCopy={onCopy} />
               ))}
             </Space>
           ) : (
@@ -64,7 +61,7 @@ export function DnsRecordCard({ record, loading, onCopy, onRecheck }: DnsRecordC
           {t('dnsRecord.recheck')}
         </Button>
       </Space>
-    </Card>
+    </SectionCard>
   );
 }
 
@@ -77,16 +74,10 @@ function DnsValueRow({
   value: string;
   onCopy: (value: string) => void;
 }) {
-  const { t } = useI18n();
   return (
     <div className="dns-value-row">
       <Typography.Text type="secondary">{label}</Typography.Text>
-      <Typography.Paragraph code copyable className="dns-code-block">
-        {value}
-      </Typography.Paragraph>
-      <Tooltip title={`${t('dnsRecord.copyLabel')}${label}`}>
-        <Button icon={<CopyOutlined />} onClick={() => onCopy(value)} aria-label={`${t('dnsRecord.copyLabel')}${label}`} />
-      </Tooltip>
+      <CodeBlock value={value} onCopy={onCopy} />
     </div>
   );
 }

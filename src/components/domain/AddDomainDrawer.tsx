@@ -61,10 +61,16 @@ export function AddDomainDrawer({
       open={open}
       onClose={onClose}
       destroyOnHidden
+      className="add-domain-drawer"
+      styles={{
+        header: { padding: '16px 24px' },
+        body: { padding: '20px 24px 28px' },
+        footer: { padding: '12px 24px' }
+      }}
       footer={
         <div className="drawer-footer">
           <Button onClick={onClose}>{t('common.cancel')}</Button>
-          <Space>
+          <Space size={8}>
             <Button disabled={current === 0} onClick={() => setCurrent((value) => value - 1)}>
               {t('common.previous')}
             </Button>
@@ -82,7 +88,7 @@ export function AddDomainDrawer({
       }
     >
       <Space direction="vertical" size={24} className="full-width">
-        <Steps current={current} items={steps.map((title) => ({ title }))} direction="vertical" responsive />
+        <Steps current={current} items={steps.map((title) => ({ title }))} direction="vertical" responsive className="add-domain-steps" />
         <Form form={form} layout="vertical" requiredMark="optional">
           <div hidden={current !== 0}>
             <Form.Item

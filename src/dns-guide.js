@@ -23,6 +23,7 @@ export async function buildDnsGuide(domain) {
       host: `_mailhub.${domain.domain}`,
       type: 'TXT',
       value: verificationValue,
+      current: live.verificationTxt,
       status: containsTxt(live.verificationTxt, verificationValue) ? 'ok' : 'missing'
     },
     {
@@ -31,6 +32,7 @@ export async function buildDnsGuide(domain) {
       host: `${domain.selector}._domainkey.${domain.domain}`,
       type: 'TXT',
       value: dkimValue,
+      current: live.dkimTxt,
       status: containsTxt(live.dkimTxt, dkimValue) ? 'ok' : 'missing'
     },
     {
@@ -65,18 +67,6 @@ export async function buildDnsGuide(domain) {
       warnings: live.senderA.includes(domain.sendingIp)
         ? []
         : [`${domain.senderHost} 当前未解析到 ${domain.sendingIp}，这是平台发信主机，请联系管理员检查。`]
-    },
-    {
-      key: 'ptr',
-      label: 'PTR 反向解析',
-      host: domain.sendingIp,
-      type: 'PTR',
-      value: domain.senderHost,
-      status: live.ptr.includes(domain.senderHost) ? 'ok' : 'warn',
-      current: live.ptr.join(', '),
-      warnings: live.ptr.includes(domain.senderHost)
-        ? []
-        : ['PTR 需要在云服务器或 IP 服务商控制台设置，普通 DNS 控制台通常不能修改。']
     }
   ];
 
@@ -100,23 +90,43 @@ async function readLiveDns(domain) {
     verificationTxt,
     dkimTxt,
     dmarcTxt,
-    senderA,
-    ptr
+    senderA
   ] = await Promise.all([
     resolveTxt(domain.domain),
     resolveTxt(`_mailhub.${domain.domain}`),
     resolveTxt(`${domain.selector}._domainkey.${domain.domain}`),
     resolveTxt(`_dmarc.${domain.domain}`),
-    resolve4(domain.senderHost),
-    resolvePtr(domain.sendingIp)
+    resolve4(domain.senderHost)
   ]);
   return {
     rootTxt,
     verificationTxt,
     dkimTxt,
     dmarcTxt,
-    senderA,
-    ptr
+    senderA
+  };
+}
+
+export async function buildSystemDnsChecks(settings = {}) {
+  const mailHostname = String(settings.mailHostname || '').trim();
+  const sendingIp = String(settings.sendingIp || '').trim();
+  const ptr = sendingIp ? await resolvePtr(sendingIp) : [];
+  const ok = Boolean(mailHostname && sendingIp && ptr.some((value) => hostEquals(value, mailHostname)));
+
+  return {
+    checkedAt: new Date().toISOString(),
+    ptr: {
+      key: 'ptr',
+      label: '发信 IP PTR',
+      host: sendingIp,
+      type: 'PTR',
+      value: mailHostname,
+      status: ok ? 'ok' : (sendingIp ? 'warn' : 'missing'),
+      current: ptr,
+      warnings: ok
+        ? []
+        : ['PTR 需要在云服务器或 IP 服务商控制台设置，普通 DNS 控制台通常不能修改。']
+    }
   };
 }
 
@@ -152,6 +162,11 @@ function containsTxt(records, expected) {
 
 function normalizeTxt(value) {
   return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function hostEquals(left, right) {
+  return String(left || '').trim().replace(/\.$/, '').toLowerCase()
+    === String(right || '').trim().replace(/\.$/, '').toLowerCase();
 }
 
 function isSpfRecord(value) {

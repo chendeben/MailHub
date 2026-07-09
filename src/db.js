@@ -81,7 +81,7 @@ export function initDatabase(dataDir, secret = '') {
 
     CREATE TABLE IF NOT EXISTS smtp_credentials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL UNIQUE,
+      user_id INTEGER NOT NULL,
       username TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       password_secret TEXT NOT NULL DEFAULT '',
@@ -165,6 +165,7 @@ export function initDatabase(dataDir, secret = '') {
   ensureColumn('send_events', 'delivery_log_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('send_events', 'delivery_attempts_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('send_events', 'delivered_at', 'TEXT');
+  migrateSmtpCredentialsToMultiplePerUser();
   ensureColumn('smtp_credentials', 'password_secret', "TEXT NOT NULL DEFAULT ''");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_domains_user_id ON domains(user_id);
@@ -172,6 +173,7 @@ export function initDatabase(dataDir, secret = '') {
     CREATE INDEX IF NOT EXISTS idx_events_user_id ON send_events(user_id);
     CREATE INDEX IF NOT EXISTS idx_events_smtp_relay_id ON send_events(smtp_relay_id);
     CREATE INDEX IF NOT EXISTS idx_events_queue_id ON send_events(queue_id);
+    CREATE INDEX IF NOT EXISTS idx_smtp_credentials_user_id ON smtp_credentials(user_id);
     CREATE INDEX IF NOT EXISTS idx_smtp_relays_user_id ON smtp_relays(user_id);
   `);
   normalizeSendEventQueueIds();
@@ -292,7 +294,7 @@ export function listUsersWithResourceCounts() {
         dnsCredentials: Number(row.dns_credentials_count || 0),
         apiTokens: Number(row.api_tokens_count || 0),
         sendEvents: Number(row.send_events_count || 0),
-        smtpCredential: Number(row.smtp_credentials_count || 0) > 0 ? 1 : 0
+        smtpCredential: Number(row.smtp_credentials_count || 0)
       }
     }));
 }
@@ -444,22 +446,23 @@ export function transferApiTokens({ actorUserId, tokenIds, targetUserId }) {
 
 export function previewUserMerge({ sourceUserId, targetUserId }) {
   const { source, target } = requireMergeUsers(sourceUserId, targetUserId);
-  const sourceSmtp = getSmtpCredential(source.id);
-  const targetSmtp = getSmtpCredential(target.id);
+  const sourceSmtpCredentials = listSmtpCredentials(source.id);
+  const targetSmtpCredentials = listSmtpCredentials(target.id);
+  const sourceSmtp = sourceSmtpCredentials[0] || null;
+  const targetSmtp = targetSmtpCredentials[0] || null;
   const counts = {
     domains: countRows('domains', source.id),
     dnsCredentials: countRows('dns_credentials', source.id),
     apiTokens: countRows('api_tokens', source.id),
     sendEvents: countRows('send_events', source.id),
-    smtpCredential: sourceSmtp ? 1 : 0
+    smtpCredential: sourceSmtpCredentials.length
   };
-  const smtpConflict = Boolean(sourceSmtp && targetSmtp);
   const defaultOptions = {
     transferDomains: true,
     transferDnsCredentials: true,
     transferApiTokens: true,
     transferSendEvents: true,
-    transferSmtpCredential: Boolean(sourceSmtp && !targetSmtp),
+    transferSmtpCredential: sourceSmtpCredentials.length > 0,
     disableSource: true
   };
   const selectedCounts = {
@@ -483,12 +486,9 @@ export function previewUserMerge({ sourceUserId, targetUserId }) {
     smtp: {
       sourceCredential: sourceSmtp,
       targetCredential: targetSmtp,
-      conflict: smtpConflict
+      conflict: false
     },
-    warnings: smtpConflict ? [{
-      type: 'smtp_credential_conflict',
-      message: '目标用户已有 SMTP 凭据，源用户 SMTP 凭据需要手动处理。'
-    }] : []
+    warnings: []
   };
 }
 
@@ -505,7 +505,7 @@ export function executeUserMerge({ actorUserId, sourceUserId, targetUserId, opti
       sendEvents: options.transferSendEvents === false ? 0 : moveRows('send_events', sourceId, targetId),
       smtpCredential: 0
     };
-    if (options.transferSmtpCredential !== false && preview.smtp.sourceCredential && !preview.smtp.targetCredential) {
+    if (options.transferSmtpCredential !== false && preview.counts.smtpCredential > 0) {
       counts.smtpCredential = moveRows('smtp_credentials', sourceId, targetId);
     }
     if (options.disableSource !== false) {
@@ -600,6 +600,13 @@ export function listDomains(userId) {
   return requireDb()
     .prepare('SELECT * FROM domains WHERE user_id = ? ORDER BY created_at DESC')
     .all(userId)
+    .map(publicDomainRow);
+}
+
+export function listDomainsForDnsAutoCheck() {
+  return requireDb()
+    .prepare('SELECT * FROM domains ORDER BY updated_at ASC')
+    .all()
     .map(publicDomainRow);
 }
 
@@ -931,16 +938,31 @@ export function getSendAnalytics(userId, { days = 30 } = {}) {
   };
 }
 
-export function getSmtpCredential(userId, { includeHash = false, includePassword = false, includeSecret = false } = {}) {
-  const row = requireDb()
-    .prepare('SELECT * FROM smtp_credentials WHERE user_id = ?')
-    .get(userId);
+export function listSmtpCredentials(userId, { includePassword = false, includeSecret = false } = {}) {
+  return requireDb()
+    .prepare('SELECT * FROM smtp_credentials WHERE user_id = ? ORDER BY created_at DESC, id DESC')
+    .all(userId)
+    .map((row) => publicSmtpCredential(row, { includePassword, includeSecret }));
+}
+
+export function getSmtpCredential(idOrUserId, userIdOrOptions = {}, maybeOptions = {}) {
+  const scopedLookup = typeof userIdOrOptions === 'number';
+  const options = scopedLookup ? maybeOptions : userIdOrOptions;
+  const { includeHash = false, includePassword = false, includeSecret = false } = options || {};
+  const row = scopedLookup
+    ? requireDb()
+      .prepare('SELECT * FROM smtp_credentials WHERE id = ? AND user_id = ?')
+      .get(Number(idOrUserId), Number(userIdOrOptions))
+    : requireDb()
+      .prepare('SELECT * FROM smtp_credentials WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1')
+      .get(Number(idOrUserId));
   if (!row) return null;
   return publicSmtpCredential(row, { includeHash, includePassword, includeSecret });
 }
 
-export function saveSmtpCredential(userId, { username, password }) {
-  const current = getSmtpCredential(userId, { includeHash: true, includeSecret: true });
+export function saveSmtpCredential(userId, { id = null, username, password }) {
+  const current = id ? getSmtpCredential(id, userId, { includeHash: true, includeSecret: true }) : null;
+  if (id && !current) return null;
   const nextUsername = String(username || current?.username || '').trim();
   if (!nextUsername) throw new Error('SMTP 用户名不能为空。');
   const nextHash = password ? hashPassword(password) : current?.passwordHash;
@@ -949,17 +971,25 @@ export function saveSmtpCredential(userId, { username, password }) {
   const updatedAt = now();
   if (current) {
     requireDb()
-      .prepare('UPDATE smtp_credentials SET username = ?, password_hash = ?, password_secret = ?, updated_at = ? WHERE user_id = ?')
-      .run(nextUsername, nextHash, nextSecret, updatedAt, userId);
+      .prepare('UPDATE smtp_credentials SET username = ?, password_hash = ?, password_secret = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+      .run(nextUsername, nextHash, nextSecret, updatedAt, current.id, userId);
+    return getSmtpCredential(current.id, userId);
   } else {
-    requireDb()
+    const result = requireDb()
       .prepare(`
         INSERT INTO smtp_credentials (user_id, username, password_hash, password_secret, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `)
       .run(userId, nextUsername, nextHash, nextSecret, updatedAt, updatedAt);
+    return getSmtpCredential(result.lastInsertRowid, userId);
   }
-  return getSmtpCredential(userId);
+}
+
+export function deleteSmtpCredential(id, userId) {
+  const result = requireDb()
+    .prepare('DELETE FROM smtp_credentials WHERE id = ? AND user_id = ?')
+    .run(Number(id), userId);
+  return result.changes > 0;
 }
 
 export function listSmtpRelays(userId, { includePassword = false, includeSecret = false } = {}) {
@@ -1402,6 +1432,40 @@ function migrateLegacySmtpTable() {
   } else {
     requireDb().exec('DROP TABLE smtp_credentials;');
   }
+}
+
+function migrateSmtpCredentialsToMultiplePerUser() {
+  if (!tableExists('smtp_credentials') || !smtpCredentialsHasUserIdUniqueConstraint()) return;
+  requireDb().exec(`
+    ALTER TABLE smtp_credentials RENAME TO smtp_credentials_single_user;
+    CREATE TABLE smtp_credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      password_secret TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    INSERT INTO smtp_credentials (id, user_id, username, password_hash, password_secret, created_at, updated_at)
+    SELECT id, user_id, username, password_hash, COALESCE(password_secret, ''), created_at, updated_at
+    FROM smtp_credentials_single_user;
+    DROP TABLE smtp_credentials_single_user;
+  `);
+}
+
+function smtpCredentialsHasUserIdUniqueConstraint() {
+  const row = requireDb()
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'smtp_credentials'")
+    .get();
+  if (/user_id\s+INTEGER\s+NOT\s+NULL\s+UNIQUE/i.test(String(row?.sql || ''))) return true;
+  const indexes = requireDb().prepare('PRAGMA index_list(smtp_credentials)').all();
+  return indexes.some((index) => {
+    if (!index.unique) return false;
+    const columns = requireDb().prepare(`PRAGMA index_info(${index.name})`).all().map((item) => item.name);
+    return columns.length === 1 && columns[0] === 'user_id';
+  });
 }
 
 function requireDb() {

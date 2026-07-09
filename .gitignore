@@ -13,6 +13,8 @@ certs/*
 logs/
 tmp/
 .cache/
+.superpowers/
+.worktrees/
 docs/superpowers/
 node_modules/
 npm-debug.log*

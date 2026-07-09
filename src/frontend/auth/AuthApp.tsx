@@ -144,9 +144,9 @@ export function AuthApp() {
 
   return (
     <main className="auth-page">
-      <section className="auth-brand-panel">
+      <section className="auth-brand-panel" aria-label="MailHub">
         <div className="auth-brand-top">
-          <div className="brand-logo auth-logo">MH</div>
+          <div className="brand-logo auth-logo" aria-hidden="true">MH</div>
           <div>
             <Typography.Title level={1}>MailHub</Typography.Title>
             <Typography.Text>{t('auth.subtitle')}</Typography.Text>

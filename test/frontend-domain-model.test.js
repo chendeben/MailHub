@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  buildDnsApplyFeedback,
   buildDomainHealth,
+  getDnsCurrentValues,
   getRecordStatusMeta,
-  getRequiredDnsRecords
+  getRequiredDnsRecords,
+  getVisibleDnsRecords
 } from '../src/frontend/domain-model.js';
 
 test('maps DNS record states to stable UI status metadata', () => {
@@ -42,7 +45,7 @@ test('builds domain health from required DNS records only', () => {
         record('spf', 'pending'),
         record('dmarc', 'warn'),
         record('sender-a', 'missing'),
-        record('ptr', 'ok'),
+        record('ptr', 'missing'),
         record('optional-mta-sts', 'ok')
       ]
     }
@@ -53,19 +56,58 @@ test('builds domain health from required DNS records only', () => {
     'dkim',
     'spf',
     'dmarc',
-    'sender-a',
-    'ptr'
+    'sender-a'
   ]);
 
   assert.deepEqual(buildDomainHealth(domain), {
     status: 'error',
     label: '需要处理',
-    passed: 3,
-    total: 6,
-    percent: 50,
+    passed: 2,
+    total: 5,
+    percent: 40,
     dnsIssues: 2,
     checkedAt: '2026-07-08T10:30:00.000Z'
   });
+});
+
+test('builds warning feedback for partial DNS apply failures', () => {
+  const feedback = buildDnsApplyFeedback({
+    ok: false,
+    results: [
+      { key: 'verification', type: 'TXT', host: '_mailhub.notify.example.com', ok: true },
+      {
+        key: 'dkim',
+        type: 'TXT',
+        host: 'mh._domainkey.notify.example.com',
+        ok: false,
+        error: 'domain not found'
+      }
+    ]
+  }, {
+    completed: 'DNS 写入请求已完成',
+    partial: 'DNS 写入部分失败'
+  });
+
+  assert.deepEqual(feedback, {
+    type: 'warning',
+    message: 'DNS 写入部分失败：domain not found'
+  });
+});
+
+test('normalizes DNS current values with legacy successful record fallback only', () => {
+  assert.deepEqual(getDnsCurrentValues({ current: ['one', 'two'], value: 'target', status: 'ok' }), ['one', 'two']);
+  assert.deepEqual(getDnsCurrentValues({ current: 'one', value: 'target', status: 'ok' }), ['one']);
+  assert.deepEqual(getDnsCurrentValues({ value: 'target', status: 'ok' }), ['target']);
+  assert.deepEqual(getDnsCurrentValues({ value: 'target', status: 'missing' }), []);
+});
+
+test('hides legacy PTR records from per-domain DNS record lists', () => {
+  assert.deepEqual(getVisibleDnsRecords([
+    record('ptr', 'ok'),
+    record('spf', 'ok'),
+    record('verification', 'ok'),
+    record('unknown', 'ok')
+  ]).map((item) => item.key), ['verification', 'spf']);
 });
 
 function record(key, status) {

@@ -1,13 +1,28 @@
-import { Badge, Tag } from 'antd';
+import { Badge } from 'antd';
 
 import { getRecordStatusMeta } from '../../frontend/domain-model.js';
 import { useI18n } from '../../frontend/i18n/react';
+import { StatusPill, type StatusTone } from './StatusPill';
 
 interface StatusTagProps {
   status?: string;
   record?: { status?: string };
   label?: string;
   mode?: 'tag' | 'badge';
+}
+
+function colorToTone(color: string): StatusTone {
+  switch (color) {
+    case 'success':
+      return 'success';
+    case 'warning':
+    case 'processing':
+      return 'warning';
+    case 'error':
+      return 'error';
+    default:
+      return 'neutral';
+  }
 }
 
 export function StatusTag({ status, record, label, mode = 'tag' }: StatusTagProps) {
@@ -19,5 +34,5 @@ export function StatusTag({ status, record, label, mode = 'tag' }: StatusTagProp
     return <Badge status={meta.color === 'default' ? 'default' : meta.color} text={text} />;
   }
 
-  return <Tag color={meta.color}>{text}</Tag>;
+  return <StatusPill tone={colorToTone(meta.color)}>{text}</StatusPill>;
 }

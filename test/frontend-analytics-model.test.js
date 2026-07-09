@@ -28,8 +28,7 @@ test('builds dashboard summary from analytics, DNS health, and SMTP state', () =
         record('dkim', 'ok'),
         record('spf', 'ok'),
         record('dmarc', 'ok'),
-        record('sender-a', 'ok'),
-        record('ptr', 'ok')
+        record('sender-a', 'ok')
       ]),
       domain(false, [
         record('verification', 'ok'),
@@ -47,7 +46,7 @@ test('builds dashboard summary from analytics, DNS health, and SMTP state', () =
   assert.equal(summary.successRate, 90);
   assert.equal(summary.bounceRate, 10);
   assert.equal(summary.complaintRate, 0);
-  assert.equal(summary.dnsIssues, 5);
+  assert.equal(summary.dnsIssues, 4);
   assert.equal(summary.smtpReady, true);
   assert.equal(summary.lastSentAt, '2026-07-08T12:30:00.000Z');
 });
