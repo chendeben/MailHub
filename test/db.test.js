@@ -14,10 +14,12 @@ import {
   createDomain,
   createUser,
   createUserWithAccountToken,
+  createWebhook,
   deleteSmtpCredential,
   deleteSmtpRelay,
   getDnsCredential,
   getDomain,
+  getSendEvent,
   getSendAnalytics,
   getSmtpRelay,
   getSmtpCredential,
@@ -260,6 +262,116 @@ test('stores multiple outbound smtp relays with encrypted recoverable passwords'
   assert.equal(deleteSmtpRelay(backup.id, bob.id), false);
   assert.equal(deleteSmtpRelay(backup.id, alice.id), true);
   assert.equal(getSmtpRelay(backup.id, alice.id), null);
+});
+
+test('returns scoped send event detail with webhook deliveries', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const alice = createUser({ username: 'alice', email: 'alice@example.com', password: 'password123' });
+  const bob = createUser({ username: 'bob', email: 'bob@example.com', password: 'password123' });
+  const domain = createDomain(alice.id, domainFixture('detail.example'));
+  createWebhook(alice.id, {
+    name: 'Delivery audit',
+    url: 'https://hooks.example.com/mailhub',
+    events: ['sent']
+  });
+
+  const eventId = logSendEvent({
+    userId: alice.id,
+    domainId: domain.id,
+    sender: 'noreply@detail.example',
+    recipients: ['user@example.com'],
+    subject: 'Tracked message',
+    status: 'sent',
+    detail: '250 2.0.0 queued as QDETAIL',
+    queueId: 'QDETAIL',
+    deliveryAttempts: [{
+      at: '2026-07-09T12:00:00.000Z',
+      queueId: 'QDETAIL',
+      recipient: 'user@example.com',
+      relay: 'mx.example.net',
+      dsn: '2.0.0',
+      status: 'sent',
+      response: '250 2.0.0 ok'
+    }],
+    deliveryLog: [{
+      at: '2026-07-09T11:59:58.000Z',
+      phase: 'queue',
+      direction: 'server',
+      response: '250 2.0.0 queued as QDETAIL',
+      ok: true
+    }],
+    deliveredAt: '2026-07-09T12:00:00.000Z'
+  });
+
+  const detail = getSendEvent(alice.id, eventId);
+
+  assert.equal(detail.id, eventId);
+  assert.equal(detail.domain, 'detail.example');
+  assert.equal(detail.queueId, 'QDETAIL');
+  assert.equal(detail.deliveryAttempts[0].relay, 'mx.example.net');
+  assert.equal(detail.deliveryLog[0].phase, 'queue');
+  assert.equal(detail.webhookDeliveries.length, 1);
+  assert.equal(detail.webhookDeliveries[0].sendEventId, eventId);
+  assert.equal(detail.webhookDeliveries[0].eventType, 'sent');
+  assert.equal(getSendEvent(bob.id, eventId), null);
+});
+
+test('send analytics includes delivery funnel and top failure reasons', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const alice = createUser({ username: 'alice', email: 'alice@example.com', password: 'password123' });
+  const domain = createDomain(alice.id, domainFixture('analytics.example'));
+
+  for (const [index, status] of ['sent', 'sent', 'queued'].entries()) {
+    logSendEvent({
+      userId: alice.id,
+      domainId: domain.id,
+      sender: 'noreply@analytics.example',
+      recipients: ['user@example.com'],
+      subject: `Message ${status}`,
+      status,
+      detail: status === 'queued' ? 'queued as QPENDING' : '250 2.0.0 ok',
+      queueId: status === 'queued' ? 'QPENDING' : `QSENT${index + 1}`
+    });
+  }
+  logSendEvent({
+    userId: alice.id,
+    domainId: domain.id,
+    sender: 'noreply@analytics.example',
+    recipients: ['bad@example.com'],
+    subject: 'Bounce',
+    status: 'bounced',
+    detail: 'Mailbox unavailable',
+    queueId: 'QBOUNCE'
+  });
+  logSendEvent({
+    userId: alice.id,
+    domainId: domain.id,
+    sender: 'noreply@analytics.example',
+    recipients: ['bad2@example.com'],
+    subject: 'Failure',
+    status: 'failed',
+    detail: 'Mailbox unavailable'
+  });
+
+  const analytics = getSendAnalytics(alice.id, { days: 7 });
+
+  assert.equal(analytics.summary.submitted, 5);
+  assert.equal(analytics.summary.accepted, 4);
+  assert.equal(analytics.summary.delivered, 2);
+  assert.equal(analytics.summary.pending, 1);
+  assert.equal(analytics.summary.failed, 2);
+  assert.equal(analytics.summary.acceptanceRate, 80);
+  assert.equal(analytics.summary.deliveryRate, 40);
+  assert.equal(analytics.summary.failureRate, 40);
+  assert.deepEqual(analytics.deliveryFunnel.map((item) => [item.stage, item.total, item.rate]), [
+    ['submitted', 5, 100],
+    ['accepted', 4, 80],
+    ['delivered', 2, 40],
+    ['pending', 1, 20],
+    ['failed', 2, 40]
+  ]);
+  assert.equal(analytics.failureReasons[0].reason, 'Mailbox unavailable');
+  assert.equal(analytics.failureReasons[0].total, 2);
 });
 
 test('stores account tokens as hashes and enforces token lifecycle', () => {

@@ -315,6 +315,26 @@ body {
   gap: 2px;
 }
 
+.delivery-funnel {
+  display: grid;
+  gap: 12px;
+}
+
+.delivery-funnel-row {
+  align-items: center;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(148px, 0.8fr) minmax(120px, 1fr) 52px;
+}
+
+.delivery-funnel-row__meta {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
 .page-toolbar {
   align-items: center;
   display: flex;
@@ -816,6 +836,10 @@ body {
   .toolbar-search,
   .toolbar-select {
     width: 100%;
+  }
+
+  .delivery-funnel-row {
+    grid-template-columns: 1fr;
   }
 
   .domain-health-stats {

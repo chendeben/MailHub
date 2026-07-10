@@ -897,23 +897,28 @@ export function listSendEvents(userId, limit = 30) {
       LIMIT ?
     `)
     .all(userId, limit)
-    .map((row) => ({
-      id: row.id,
-      userId: row.user_id,
-      domainId: row.domain_id,
-      smtpRelayId: row.smtp_relay_id,
-      domain: row.domain,
-      sender: row.sender,
-      recipients: safeJson(row.recipients, []),
-      subject: row.subject,
-      status: row.status,
-      detail: row.detail,
-      queueId: row.queue_id,
-      deliveryLog: safeJson(row.delivery_log_json, []),
-      deliveryAttempts: safeJson(row.delivery_attempts_json, []),
-      deliveredAt: row.delivered_at,
-      createdAt: row.created_at
-    }));
+    .map(publicSendEvent);
+}
+
+export function getSendEvent(userId, eventId) {
+  const event = publicSendEvent(
+    requireDb()
+      .prepare(`
+        SELECT e.*, d.domain
+        FROM send_events e
+        LEFT JOIN domains d ON d.id = e.domain_id
+        WHERE e.user_id = ? AND e.id = ?
+      `)
+      .get(userId, Number(eventId))
+  );
+  if (!event) return null;
+  return {
+    ...event,
+    webhookDeliveries: listWebhookDeliveries(userId, {
+      sendEventId: event.id,
+      limit: 50
+    })
+  };
 }
 
 export function listWebhooks(userId, { domainId } = {}) {
@@ -1278,6 +1283,10 @@ export function listWebhookDeliveries(userId, filters = {}) {
     where.push('event_type = ?');
     params.push(String(filters.eventType));
   }
+  if (filters.sendEventId != null) {
+    where.push('send_event_id = ?');
+    params.push(Number(filters.sendEventId));
+  }
   const limit = Math.max(1, Math.min(200, Number(filters.limit) || 50));
   params.push(limit);
   return requireDb()
@@ -1444,13 +1453,24 @@ export function getSendAnalytics(userId, { days = 7 } = {}) {
     hour,
     total: 0,
     queued: 0,
-    failed: 0
+    failed: 0,
+    accepted: 0,
+    delivered: 0,
+    pending: 0,
+    terminalFailed: 0
   }));
   let recipients = 0;
   let queued = 0;
   let failed = 0;
+  let accepted = 0;
+  let delivered = 0;
+  let pending = 0;
+  let deferred = 0;
+  let bounced = 0;
+  let terminalFailed = 0;
   let today = 0;
   let last7Days = 0;
+  const failureReasons = new Map();
   const todayKey = new Date().toISOString().slice(0, 10);
   const weekStart = new Date();
   weekStart.setUTCHours(0, 0, 0, 0);
@@ -1465,19 +1485,31 @@ export function getSendAnalytics(userId, { days = 7 } = {}) {
     const dayKey = row.created_at.slice(0, 10);
     const hour = Number.isInteger(createdAt.getUTCHours()) ? createdAt.getUTCHours() : 0;
     const isQueued = ['queued', 'sent'].includes(status);
+    const classification = classifySendEvent(row);
 
     recipients += recipientCount;
     queued += isQueued ? 1 : 0;
     failed += isQueued ? 0 : 1;
+    accepted += classification.accepted ? 1 : 0;
+    delivered += classification.delivered ? 1 : 0;
+    pending += classification.pending ? 1 : 0;
+    deferred += classification.deferred ? 1 : 0;
+    bounced += classification.bounced ? 1 : 0;
+    terminalFailed += classification.terminalFailed ? 1 : 0;
     today += dayKey === todayKey ? 1 : 0;
     last7Days += createdAt >= weekStart ? 1 : 0;
     byStatus[status] = (byStatus[status] || 0) + 1;
+    if (isDeliveryFailureStatus(status)) addFailureReason(failureReasons, row);
 
     if (dayBuckets.has(dayKey)) {
       const bucket = dayBuckets.get(dayKey);
       bucket.total += 1;
       bucket.queued += isQueued ? 1 : 0;
       bucket.failed += isQueued ? 0 : 1;
+      bucket.accepted += classification.accepted ? 1 : 0;
+      bucket.delivered += classification.delivered ? 1 : 0;
+      bucket.pending += classification.pending ? 1 : 0;
+      bucket.terminalFailed += classification.terminalFailed ? 1 : 0;
       bucket.recipients += recipientCount;
     }
 
@@ -1486,17 +1518,29 @@ export function getSendAnalytics(userId, { days = 7 } = {}) {
       total: 0,
       queued: 0,
       failed: 0,
+      accepted: 0,
+      delivered: 0,
+      pending: 0,
+      terminalFailed: 0,
       recipients: 0
     };
     domainBucket.total += 1;
     domainBucket.queued += isQueued ? 1 : 0;
     domainBucket.failed += isQueued ? 0 : 1;
+    domainBucket.accepted += classification.accepted ? 1 : 0;
+    domainBucket.delivered += classification.delivered ? 1 : 0;
+    domainBucket.pending += classification.pending ? 1 : 0;
+    domainBucket.terminalFailed += classification.terminalFailed ? 1 : 0;
     domainBucket.recipients += recipientCount;
     byDomain.set(domainName, domainBucket);
 
     hourly[hour].total += 1;
     hourly[hour].queued += isQueued ? 1 : 0;
     hourly[hour].failed += isQueued ? 0 : 1;
+    hourly[hour].accepted += classification.accepted ? 1 : 0;
+    hourly[hour].delivered += classification.delivered ? 1 : 0;
+    hourly[hour].pending += classification.pending ? 1 : 0;
+    hourly[hour].terminalFailed += classification.terminalFailed ? 1 : 0;
   }
 
   const recentFailures = [...rows]
@@ -1516,19 +1560,39 @@ export function getSendAnalytics(userId, { days = 7 } = {}) {
     windowDays,
     summary: {
       total: rows.length,
+      submitted: rows.length,
       queued,
       failed,
+      accepted,
+      delivered,
+      pending,
+      deferred,
+      bounced,
+      terminalFailed,
       recipients,
       today,
       last7Days,
-      successRate: rows.length ? Math.round((queued / rows.length) * 1000) / 10 : 0,
+      successRate: percent(queued, rows.length),
+      acceptanceRate: percent(accepted, rows.length),
+      deliveryRate: percent(delivered, rows.length),
+      failureRate: percent(terminalFailed, rows.length),
       domains: domains.length,
       verifiedDomains: domains.filter((domain) => domain.status?.verified).length
     },
+    deliveryFunnel: [
+      { stage: 'submitted', total: rows.length, rate: percent(rows.length, rows.length) },
+      { stage: 'accepted', total: accepted, rate: percent(accepted, rows.length) },
+      { stage: 'delivered', total: delivered, rate: percent(delivered, rows.length) },
+      { stage: 'pending', total: pending, rate: percent(pending, rows.length) },
+      { stage: 'failed', total: terminalFailed, rate: percent(terminalFailed, rows.length) }
+    ],
     byDay: [...dayBuckets.values()],
     byDomain: [...byDomain.values()].sort((a, b) => b.total - a.total).slice(0, 10),
     byStatus: Object.entries(byStatus).map(([status, total]) => ({ status, total })),
     hourly,
+    failureReasons: [...failureReasons.values()]
+      .sort((a, b) => b.total - a.total || String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)))
+      .slice(0, 10),
     recentFailures
   };
 }
@@ -2238,6 +2302,27 @@ function publicDnsCredential(row) {
   };
 }
 
+function publicSendEvent(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    domainId: row.domain_id,
+    smtpRelayId: row.smtp_relay_id,
+    domain: row.domain,
+    sender: row.sender,
+    recipients: safeJson(row.recipients, []),
+    subject: row.subject,
+    status: row.status,
+    detail: row.detail,
+    queueId: row.queue_id,
+    deliveryLog: safeJson(row.delivery_log_json, []),
+    deliveryAttempts: safeJson(row.delivery_attempts_json, []),
+    deliveredAt: row.delivered_at,
+    createdAt: row.created_at
+  };
+}
+
 function publicAuditLog(row) {
   if (!row) return null;
   return {
@@ -2412,10 +2497,53 @@ function buildDayBuckets(days) {
       total: 0,
       queued: 0,
       failed: 0,
+      accepted: 0,
+      delivered: 0,
+      pending: 0,
+      terminalFailed: 0,
       recipients: 0
     });
   }
   return buckets;
+}
+
+function percent(part, total) {
+  return total ? Math.round((Number(part || 0) / total) * 1000) / 10 : 0;
+}
+
+function classifySendEvent(row) {
+  const status = String(row?.status || '').toLowerCase();
+  const hasQueueId = Boolean(normalizeQueueId(row?.queue_id));
+  const accepted = hasQueueId || ['queued', 'sent', 'deferred', 'bounced'].includes(status);
+  return {
+    status,
+    accepted,
+    delivered: status === 'sent',
+    pending: status === 'queued' || status === 'deferred',
+    deferred: status === 'deferred',
+    bounced: status === 'bounced',
+    terminalFailed: status === 'bounced' || status === 'failed'
+  };
+}
+
+function normalizeFailureReason(row) {
+  const detail = String(row?.detail || '').replace(/\s+/g, ' ').trim();
+  return detail || String(row?.status || 'unknown failure');
+}
+
+function addFailureReason(map, row) {
+  const reason = normalizeFailureReason(row);
+  const status = String(row?.status || 'unknown').toLowerCase();
+  const bucket = map.get(reason) || {
+    reason,
+    total: 0,
+    statuses: {},
+    lastSeenAt: row?.created_at || ''
+  };
+  bucket.total += 1;
+  bucket.statuses[status] = (bucket.statuses[status] || 0) + 1;
+  if (row?.created_at && row.created_at > bucket.lastSeenAt) bucket.lastSeenAt = row.created_at;
+  map.set(reason, bucket);
 }
 
 function safeJson(value, fallback) {

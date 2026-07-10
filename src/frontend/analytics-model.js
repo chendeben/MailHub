@@ -62,6 +62,22 @@ export function buildStatusDistribution(analytics = null) {
 
 /**
  * @param {any} [analytics]
+ * @returns {Array<{stage: string; total: number; rate: number; tone: 'success' | 'warning' | 'error' | 'info' | 'neutral'}>}
+ */
+export function buildDeliveryFunnel(analytics = null) {
+  return (analytics?.deliveryFunnel || []).map((item) => {
+    const stage = item.stage || 'unknown';
+    return {
+      stage,
+      total: Number(item.total || 0),
+      rate: Number(item.rate || 0),
+      tone: deliveryStageTone(stage)
+    };
+  });
+}
+
+/**
+ * @param {any} [analytics]
  * @returns {Array<{domain: string; total: number; accepted: number; failed: number; recipients: number}>}
  */
 export function buildDomainRanking(analytics = null) {
@@ -87,4 +103,98 @@ export function buildHourlyHeatmap(analytics = null) {
     accepted: Number(item.queued || 0),
     failed: Number(item.failed || 0)
   }));
+}
+
+/**
+ * @param {any} [event]
+ * @returns {Array<{
+ *   stage: string;
+ *   at: string;
+ *   tone: 'success' | 'warning' | 'error' | 'info' | 'neutral';
+ *   status?: string;
+ *   queueId?: string;
+ *   recipient?: string;
+ *   relay?: string;
+ *   response?: string;
+ *   webhookId?: number;
+ *   responseStatus?: number | null;
+ * }>}
+ */
+export function buildEventTimeline(event = null) {
+  if (!event) return [];
+  const timeline = [];
+  if (event.createdAt) {
+    timeline.push({
+      stage: 'submitted',
+      at: event.createdAt,
+      tone: 'info',
+      status: event.status
+    });
+  }
+  if (event.queueId) {
+    timeline.push({
+      stage: 'accepted',
+      at: event.createdAt || '',
+      tone: 'info',
+      status: 'queued',
+      queueId: event.queueId
+    });
+  }
+  const attempts = Array.isArray(event.deliveryAttempts) ? event.deliveryAttempts : [];
+  for (const attempt of attempts) {
+    const stage = deliveryAttemptStage(attempt.status);
+    timeline.push({
+      stage,
+      at: attempt.at || '',
+      tone: deliveryStageTone(stage),
+      status: attempt.status,
+      queueId: attempt.queueId,
+      recipient: attempt.recipient,
+      relay: attempt.relay,
+      response: attempt.response
+    });
+  }
+  if (!attempts.length && event.deliveredAt) {
+    timeline.push({
+      stage: 'delivered',
+      at: event.deliveredAt,
+      tone: 'success',
+      status: 'sent',
+      queueId: event.queueId
+    });
+  }
+  const webhookDeliveries = Array.isArray(event.webhookDeliveries) ? event.webhookDeliveries : [];
+  for (const delivery of webhookDeliveries) {
+    timeline.push({
+      stage: 'webhook',
+      at: delivery.lastAttemptAt || delivery.createdAt || '',
+      tone: webhookDeliveryTone(delivery.status),
+      status: delivery.status,
+      webhookId: delivery.webhookId,
+      responseStatus: delivery.responseStatus
+    });
+  }
+  return timeline;
+}
+
+function deliveryAttemptStage(status) {
+  if (status === 'sent') return 'delivered';
+  if (status === 'deferred') return 'pending';
+  if (status === 'bounced' || status === 'failed') return 'failed';
+  return 'pending';
+}
+
+function deliveryStageTone(stage) {
+  if (stage === 'delivered') return 'success';
+  if (stage === 'pending') return 'warning';
+  if (stage === 'failed') return 'error';
+  if (stage === 'submitted' || stage === 'accepted') return 'info';
+  return 'neutral';
+}
+
+function webhookDeliveryTone(status) {
+  if (status === 'success') return 'success';
+  if (status === 'dead') return 'error';
+  if (status === 'pending' || status === 'processing') return 'warning';
+  return 'neutral';
 }

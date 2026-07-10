@@ -1,5 +1,5 @@
 import { Area, Bar, Column, Pie } from '@ant-design/plots';
-import { Alert, Col, List, Row, Space, Table, Typography } from 'antd';
+import { Alert, Col, List, Progress, Row, Space, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 
 import { EmptyState } from '../components/common/EmptyState';
@@ -9,6 +9,7 @@ import { SectionCard } from '../components/common/SectionCard';
 import { StatusPill } from '../components/common/StatusPill';
 import {
   buildDashboardSummary,
+  buildDeliveryFunnel,
   buildDomainRanking,
   buildHourlyHeatmap,
   buildStatusDistribution,
@@ -42,6 +43,8 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
   }));
   const rankingData = buildDomainRanking(analytics);
   const hourlyData = buildHourlyHeatmap(analytics);
+  const deliveryFunnel = buildDeliveryFunnel(analytics);
+  const failureReasons = analytics?.failureReasons || [];
   const lastSentLabel = summary.lastSentAt
     ? new Date(summary.lastSentAt).toLocaleString()
     : t('common.notFound');
@@ -97,6 +100,52 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
             tone={summary.dnsIssues > 0 ? 'warning' : 'default'}
             hint={summary.dnsIssues > 0 ? t('dashboard.dnsActionHint') : undefined}
           />
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]}>
+        <Col xs={24} xl={15}>
+          <SectionCard title={t('dashboard.deliveryFunnel')}>
+            {deliveryFunnel.length ? (
+              <div className="delivery-funnel">
+                {deliveryFunnel.map((item) => (
+                  <div className="delivery-funnel-row" key={item.stage}>
+                    <div className="delivery-funnel-row__meta">
+                      <StatusPill tone={item.tone}>{deliveryStageLabel(item.stage, t)}</StatusPill>
+                      <Typography.Text strong>{item.total}</Typography.Text>
+                    </div>
+                    <Progress percent={item.rate} size="small" showInfo={false} status={item.tone === 'error' ? 'exception' : 'normal'} />
+                    <Typography.Text type="secondary">{item.rate}%</Typography.Text>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <EmptyState description={t('dashboard.noTrend')} />
+            )}
+          </SectionCard>
+        </Col>
+        <Col xs={24} xl={9}>
+          <SectionCard title={t('dashboard.failureReasons')}>
+            {failureReasons.length ? (
+              <List
+                dataSource={failureReasons}
+                renderItem={(item) => (
+                  <List.Item>
+                    <List.Item.Meta
+                      title={<Typography.Text ellipsis>{item.reason}</Typography.Text>}
+                      description={
+                        <Typography.Text type="secondary">
+                          {t('metrics.total')}: {item.total} · {item.lastSeenAt ? new Date(item.lastSeenAt).toLocaleString() : '-'}
+                        </Typography.Text>
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            ) : (
+              <EmptyState description={t('dashboard.noFailures')} />
+            )}
+          </SectionCard>
         </Col>
       </Row>
 
@@ -303,4 +352,13 @@ function domainHealthTone(status: string): 'success' | 'warning' | 'error' {
   if (status === 'success') return 'success';
   if (status === 'warning') return 'warning';
   return 'error';
+}
+
+function deliveryStageLabel(stage: string, t: (key: string) => string) {
+  if (stage === 'submitted') return t('dashboard.stageSubmitted');
+  if (stage === 'accepted') return t('dashboard.stageAccepted');
+  if (stage === 'delivered') return t('dashboard.stageDelivered');
+  if (stage === 'pending') return t('dashboard.stagePending');
+  if (stage === 'failed') return t('dashboard.stageFailed');
+  return stage;
 }

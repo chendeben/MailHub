@@ -250,6 +250,11 @@ function MailHubConsole() {
     setData((current) => ({ ...current, events: events.events || [], analytics: analytics.analytics || current.analytics }));
   }
 
+  async function loadSendEvent(id: number) {
+    const result = await api.event(id);
+    return result.event;
+  }
+
   async function copy(value: string) {
     if (!value || value === '-') return;
     await navigator.clipboard.writeText(value);
@@ -560,7 +565,7 @@ function MailHubConsole() {
       );
     }
     if (activeView === 'logs') {
-      return <SendingLogs events={data.events} domains={data.domains} onCopy={copy} />;
+      return <SendingLogs events={data.events} domains={data.domains} onCopy={copy} onLoadEvent={loadSendEvent} />;
     }
     if (activeView === 'webhooks') {
       return <Webhooks domains={data.domains} onCopy={copy} />;

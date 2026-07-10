@@ -276,7 +276,17 @@ test('users can manage outbound smtp relays with recoverable passwords and send 
 
     const events = await fetch(`${baseUrl}/api/events`, { headers: { Cookie: cookie } });
     assert.equal(events.status, 200);
-    assert.equal((await events.json()).events[0].smtpRelayId, created.relay.id);
+    const eventsBody = await events.json();
+    assert.equal(eventsBody.events[0].smtpRelayId, created.relay.id);
+
+    const eventDetail = await fetch(`${baseUrl}/api/events/${eventsBody.events[0].id}`, {
+      headers: { Cookie: cookie }
+    });
+    assert.equal(eventDetail.status, 200);
+    const eventDetailBody = await eventDetail.json();
+    assert.equal(eventDetailBody.event.id, eventsBody.events[0].id);
+    assert.equal(eventDetailBody.event.smtpRelayId, created.relay.id);
+    assert.equal(Array.isArray(eventDetailBody.event.webhookDeliveries), true);
   } finally {
     child.kill('SIGTERM');
     await waitForExit(child, 1000);

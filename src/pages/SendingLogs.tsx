@@ -1,5 +1,5 @@
 import { CopyOutlined, SearchOutlined } from '@ant-design/icons';
-import { Button, DatePicker, Descriptions, Drawer, Input, Select, Space, Table, Tag, Timeline, Typography } from 'antd';
+import { Alert, Button, DatePicker, Descriptions, Drawer, Input, Select, Space, Spin, Table, Tag, Timeline, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useMemo, useState } from 'react';
 
@@ -7,8 +7,9 @@ import { EmptyState } from '../components/common/EmptyState';
 import { PageHeader } from '../components/common/PageHeader';
 import { SectionCard } from '../components/common/SectionCard';
 import { StatusPill } from '../components/common/StatusPill';
+import { buildEventTimeline } from '../frontend/analytics-model.js';
 import { useI18n } from '../frontend/i18n/react';
-import type { DeliveryAttempt, DeliveryLogEntry, Domain, SendEvent } from '../frontend/types';
+import type { DeliveryAttempt, DeliveryLogEntry, Domain, SendEvent, SendEventTimelineEntry, WebhookDelivery } from '../frontend/types';
 
 const { RangePicker } = DatePicker;
 
@@ -16,15 +17,18 @@ interface SendingLogsProps {
   events: SendEvent[];
   domains: Domain[];
   onCopy: (value: string) => void;
+  onLoadEvent?: (id: number) => Promise<SendEvent | null>;
 }
 
-export default function SendingLogs({ events, domains, onCopy }: SendingLogsProps) {
+export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: SendingLogsProps) {
   const { t } = useI18n();
   const [domain, setDomain] = useState<string>();
   const [status, setStatus] = useState<string>();
   const [recipient, setRecipient] = useState('');
   const [range, setRange] = useState<[number, number] | null>(null);
   const [selected, setSelected] = useState<SendEvent | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
 
   const filtered = useMemo(() => {
     return events.filter((event) => {
@@ -50,7 +54,7 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
     },
     { title: 'Message ID', dataIndex: 'id', render: (value) => <span>mh-{value}</span>, width: 140 },
     { title: t('logs.errorReason'), dataIndex: 'detail', ellipsis: true },
-    { title: t('domains.actions'), render: (_, event) => <Button onClick={() => setSelected(event)}>{t('logs.viewDetail')}</Button>, width: 120 }
+    { title: t('domains.actions'), render: (_, event) => <Button onClick={() => void openDetail(event)}>{t('logs.viewDetail')}</Button>, width: 120 }
   ];
 
   return (
@@ -116,22 +120,45 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
 
       <DeliveryLogDrawer
         event={selected}
+        loading={detailLoading}
+        error={detailError}
         onClose={() => setSelected(null)}
         onCopy={onCopy}
       />
     </>
   );
 
+  async function openDetail(event: SendEvent) {
+    setSelected(event);
+    setDetailError('');
+    if (!onLoadEvent) return;
+    setDetailLoading(true);
+    try {
+      const detail = await onLoadEvent(event.id);
+      if (detail) setSelected(detail);
+      if (!detail) setDetailError(t('logs.detailNotFound'));
+    } catch (error) {
+      setDetailError(error instanceof Error ? error.message : t('logs.detailLoadFailed'));
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
   function DeliveryLogDrawer({
     event,
+    loading,
+    error,
     onClose,
     onCopy
   }: {
     event: SendEvent | null;
+    loading: boolean;
+    error: string;
     onClose: () => void;
     onCopy: (value: string) => void;
   }) {
     const deliveryLog = event?.deliveryLog || [];
+    const trackingTimeline = buildEventTimeline(event);
     return (
       <Drawer
         title={event ? `${t('logs.detailTitle')} · mh-${event.id}` : t('logs.detailTitle')}
@@ -145,57 +172,119 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
         ) : null}
       >
         {event ? (
-          <Space direction="vertical" size={16} className="full-width">
-            <Descriptions bordered size="small" column={1}>
-              <Descriptions.Item label={t('logs.time')}>{new Date(event.createdAt).toLocaleString()}</Descriptions.Item>
-              <Descriptions.Item label={t('logs.sender')}>{event.sender}</Descriptions.Item>
-              <Descriptions.Item label={t('logs.recipient')}>{event.recipients.join(', ')}</Descriptions.Item>
-              <Descriptions.Item label={t('logs.domain')}>{event.domain || '-'}</Descriptions.Item>
-              <Descriptions.Item label={t('logs.subject')}>{event.subject || '-'}</Descriptions.Item>
-              <Descriptions.Item label={t('common.status')}>
-                <StatusTag status={event.status} />
-              </Descriptions.Item>
-              <Descriptions.Item label={t('logs.messageId')}>mh-{event.id}</Descriptions.Item>
-              <Descriptions.Item label={t('logs.queueId')}>
-                <Typography.Text code>{event.queueId || '-'}</Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label={t('logs.deliveredAt')}>
-                {event.deliveredAt ? new Date(event.deliveredAt).toLocaleString() : '-'}
-              </Descriptions.Item>
-              <Descriptions.Item label={t('logs.finalResponse')}>
-                <Typography.Text code className="inline-code-value">{event.detail || '-'}</Typography.Text>
-              </Descriptions.Item>
-            </Descriptions>
-            <SectionCard title={t('logs.deliveryAttempts')} className="delivery-log-card">
-              {event.deliveryAttempts?.length ? (
-                <Timeline
-                  items={event.deliveryAttempts.map((attempt, index) => ({
-                    key: `${attempt.raw || attempt.at}-${index}`,
-                    color: deliveryAttemptColor(attempt.status),
-                    children: <DeliveryAttemptTimelineItem attempt={attempt} />
-                  }))}
-                />
-              ) : (
-                <EmptyState description={t('logs.noDeliveryAttempts')} />
-              )}
-            </SectionCard>
-            <SectionCard title={t('logs.deliveryLog')} className="delivery-log-card">
-              {deliveryLog.length ? (
-                <Timeline
-                  items={deliveryLog.map((entry, index) => ({
-                    key: `${entry.at}-${index}`,
-                    color: timelineColor(entry),
-                    children: <DeliveryLogTimelineItem entry={entry} />
-                  }))}
-                />
-              ) : (
-                <EmptyState description={t('logs.noDeliveryLog')} />
-              )}
-            </SectionCard>
-          </Space>
+          <Spin spinning={loading}>
+            <Space direction="vertical" size={16} className="full-width">
+              {error ? <Alert type="error" showIcon message={error} /> : null}
+              <Descriptions bordered size="small" column={1}>
+                <Descriptions.Item label={t('logs.time')}>{new Date(event.createdAt).toLocaleString()}</Descriptions.Item>
+                <Descriptions.Item label={t('logs.sender')}>{event.sender}</Descriptions.Item>
+                <Descriptions.Item label={t('logs.recipient')}>{event.recipients.join(', ')}</Descriptions.Item>
+                <Descriptions.Item label={t('logs.domain')}>{event.domain || '-'}</Descriptions.Item>
+                <Descriptions.Item label={t('logs.subject')}>{event.subject || '-'}</Descriptions.Item>
+                <Descriptions.Item label={t('common.status')}>
+                  <StatusTag status={event.status} />
+                </Descriptions.Item>
+                <Descriptions.Item label={t('logs.messageId')}>mh-{event.id}</Descriptions.Item>
+                <Descriptions.Item label={t('logs.queueId')}>
+                  <Typography.Text code>{event.queueId || '-'}</Typography.Text>
+                </Descriptions.Item>
+                <Descriptions.Item label={t('logs.deliveredAt')}>
+                  {event.deliveredAt ? new Date(event.deliveredAt).toLocaleString() : '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label={t('logs.finalResponse')}>
+                  <Typography.Text code className="inline-code-value">{event.detail || '-'}</Typography.Text>
+                </Descriptions.Item>
+              </Descriptions>
+              <SectionCard title={t('logs.trackingTimeline')} className="delivery-log-card">
+                {trackingTimeline.length ? (
+                  <Timeline
+                    items={trackingTimeline.map((item, index) => ({
+                      key: `${item.stage}-${item.at}-${index}`,
+                      color: timelineToneColor(item.tone),
+                      children: <TrackingTimelineItem item={item} />
+                    }))}
+                  />
+                ) : (
+                  <EmptyState description={t('logs.noTrackingTimeline')} />
+                )}
+              </SectionCard>
+              <SectionCard title={t('logs.deliveryAttempts')} className="delivery-log-card">
+                {event.deliveryAttempts?.length ? (
+                  <Timeline
+                    items={event.deliveryAttempts.map((attempt, index) => ({
+                      key: `${attempt.raw || attempt.at}-${index}`,
+                      color: deliveryAttemptColor(attempt.status),
+                      children: <DeliveryAttemptTimelineItem attempt={attempt} />
+                    }))}
+                  />
+                ) : (
+                  <EmptyState description={t('logs.noDeliveryAttempts')} />
+                )}
+              </SectionCard>
+              <SectionCard title={t('logs.webhookDeliveries')} className="delivery-log-card">
+                {event.webhookDeliveries?.length ? (
+                  <WebhookDeliveriesTable deliveries={event.webhookDeliveries} />
+                ) : (
+                  <EmptyState description={t('logs.noWebhookDeliveries')} />
+                )}
+              </SectionCard>
+              <SectionCard title={t('logs.deliveryLog')} className="delivery-log-card">
+                {deliveryLog.length ? (
+                  <Timeline
+                    items={deliveryLog.map((entry, index) => ({
+                      key: `${entry.at}-${index}`,
+                      color: timelineColor(entry),
+                      children: <DeliveryLogTimelineItem entry={entry} />
+                    }))}
+                  />
+                ) : (
+                  <EmptyState description={t('logs.noDeliveryLog')} />
+                )}
+              </SectionCard>
+            </Space>
+          </Spin>
         ) : null}
       </Drawer>
     );
+  }
+
+  function TrackingTimelineItem({ item }: { item: SendEventTimelineEntry }) {
+    return (
+      <div className="delivery-log-entry">
+        <Space wrap size={8}>
+          <Typography.Text strong>{timelineStageLabel(item.stage)}</Typography.Text>
+          {item.status ? <StatusPill tone={item.tone}>{webhookStatusLabel(item.status)}</StatusPill> : null}
+          <Typography.Text type="secondary">{item.at ? new Date(item.at).toLocaleString() : '-'}</Typography.Text>
+        </Space>
+        {item.queueId ? <LogLine label="Q" value={item.queueId} /> : null}
+        {item.recipient ? <LogLine label="To" value={item.recipient} /> : null}
+        {item.relay ? <LogLine label="MX" value={item.relay} /> : null}
+        {item.response ? <LogLine label="S" value={item.response} /> : null}
+        {item.webhookId ? <LogLine label="WH" value={`#${item.webhookId}${item.responseStatus ? ` · HTTP ${item.responseStatus}` : ''}`} /> : null}
+      </div>
+    );
+  }
+
+  function WebhookDeliveriesTable({ deliveries }: { deliveries: WebhookDelivery[] }) {
+    const columns: ColumnsType<WebhookDelivery> = [
+      { title: t('webhooks.events'), dataIndex: 'eventType', width: 120 },
+      {
+        title: t('common.status'),
+        dataIndex: 'status',
+        width: 130,
+        render: (value: string) => <StatusPill tone={webhookTone(value)}>{webhookStatusLabel(value)}</StatusPill>
+      },
+      { title: t('webhooks.attemptCount'), dataIndex: 'attemptCount', width: 90 },
+      { title: 'HTTP', dataIndex: 'responseStatus', width: 90, render: (value) => value ?? '-' },
+      {
+        title: t('logs.time'),
+        dataIndex: 'lastAttemptAt',
+        width: 180,
+        render: (value, record) => new Date(value || record.createdAt).toLocaleString()
+      },
+      { title: t('logs.errorReason'), dataIndex: 'error', ellipsis: true, render: (value) => value || '-' }
+    ];
+    return <Table rowKey="id" size="small" columns={columns} dataSource={deliveries} pagination={false} scroll={{ x: 760 }} />;
   }
 
   function DeliveryLogTimelineItem({ entry }: { entry: DeliveryLogEntry }) {
@@ -266,6 +355,17 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
         lines.push('');
       }
     }
+    if (event.webhookDeliveries?.length) {
+      lines.push(t('logs.webhookDeliveries'));
+      for (const delivery of event.webhookDeliveries) {
+        lines.push(`[${delivery.lastAttemptAt || delivery.createdAt || '-'}] ${delivery.eventType} ${webhookStatusLabel(delivery.status)}`);
+        lines.push(`Webhook: #${delivery.webhookId}`);
+        lines.push(`Attempts: ${delivery.attemptCount}`);
+        if (delivery.responseStatus) lines.push(`HTTP: ${delivery.responseStatus}`);
+        if (delivery.error) lines.push(`${t('logs.errorReason')}: ${delivery.error}`);
+        lines.push('');
+      }
+    }
     const entries = event.deliveryLog?.length ? event.deliveryLog : [{
       at: event.createdAt,
       phase: 'legacy',
@@ -305,6 +405,40 @@ export default function SendingLogs({ events, domains, onCopy }: SendingLogsProp
       bounced: 'error',
       failed: 'error'
     }[status] as 'success' | 'warning' | 'error' | 'info' | 'neutral' || 'neutral';
+  }
+
+  function timelineStageLabel(stage: string) {
+    return {
+      submitted: t('logs.stageSubmitted'),
+      accepted: t('logs.stageAccepted'),
+      delivered: t('logs.stageDelivered'),
+      pending: t('logs.stagePending'),
+      failed: t('logs.stageFailed'),
+      webhook: t('logs.stageWebhook')
+    }[stage] || stage;
+  }
+
+  function webhookStatusLabel(status: string) {
+    return {
+      pending: t('webhooks.statusPending'),
+      processing: t('webhooks.statusProcessing'),
+      success: t('webhooks.statusSuccess'),
+      dead: t('webhooks.statusDead')
+    }[status] || statusLabel(status);
+  }
+
+  function webhookTone(status: string): 'success' | 'warning' | 'error' | 'info' | 'neutral' {
+    if (status === 'success') return 'success';
+    if (status === 'dead') return 'error';
+    if (status === 'pending' || status === 'processing') return 'warning';
+    return statusTone(status);
+  }
+
+  function timelineToneColor(tone: string) {
+    if (tone === 'success') return 'green';
+    if (tone === 'warning') return 'gold';
+    if (tone === 'error') return 'red';
+    return 'blue';
   }
 
   function timelineColor(entry: DeliveryLogEntry) {

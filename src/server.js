@@ -25,6 +25,7 @@ import {
   getDnsCredential,
   getDomain,
   getDomainByName,
+  getSendEvent,
   getSendAnalytics,
   getSettings,
   getDefaultSmtpRelay,
@@ -294,6 +295,11 @@ async function handleApi(req, res, url, user) {
   }
   if (method === 'GET' && pathname === '/api/events') {
     return sendJson(res, 200, { events: listSendEvents(user.id) });
+  }
+  const sendEventMatch = pathname.match(/^\/api\/events\/(\d+)$/);
+  if (sendEventMatch && method === 'GET') {
+    const event = getSendEvent(user.id, Number(sendEventMatch[1]));
+    return sendJson(res, event ? 200 : 404, { event });
   }
   if (method === 'GET' && pathname === '/api/analytics') {
     return sendJson(res, 200, { analytics: getSendAnalytics(user.id, { days: Number(url.searchParams.get('days') || 7) }) });

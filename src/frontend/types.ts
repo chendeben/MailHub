@@ -279,6 +279,19 @@ export interface DeliveryAttempt {
   raw?: string;
 }
 
+export interface SendEventTimelineEntry {
+  stage: string;
+  at: string;
+  tone: 'success' | 'warning' | 'error' | 'info' | 'neutral';
+  status?: string;
+  queueId?: string;
+  recipient?: string;
+  relay?: string;
+  response?: string;
+  webhookId?: number;
+  responseStatus?: number | null;
+}
+
 export interface SendEvent {
   id: number;
   userId: number;
@@ -293,6 +306,7 @@ export interface SendEvent {
   queueId?: string;
   deliveryLog?: DeliveryLogEntry[];
   deliveryAttempts?: DeliveryAttempt[];
+  webhookDeliveries?: WebhookDelivery[];
   deliveredAt?: string;
   createdAt: string;
 }
@@ -301,21 +315,40 @@ export interface Analytics {
   windowDays: number;
   summary: {
     total: number;
+    submitted: number;
     queued: number;
     failed: number;
+    accepted: number;
+    delivered: number;
+    pending: number;
+    deferred: number;
+    bounced: number;
+    terminalFailed: number;
     recipients: number;
     today: number;
     last7Days: number;
     successRate: number;
+    acceptanceRate: number;
+    deliveryRate: number;
+    failureRate: number;
     domains: number;
     verifiedDomains: number;
   };
+  deliveryFunnel: Array<{
+    stage: string;
+    total: number;
+    rate: number;
+  }>;
   byDay: Array<{
     day: string;
     date?: string;
     total: number;
     queued: number;
     failed: number;
+    accepted?: number;
+    delivered?: number;
+    pending?: number;
+    terminalFailed?: number;
     recipients: number;
   }>;
   byDomain: Array<{
@@ -323,10 +356,29 @@ export interface Analytics {
     total: number;
     queued: number;
     failed: number;
+    accepted?: number;
+    delivered?: number;
+    pending?: number;
+    terminalFailed?: number;
     recipients: number;
   }>;
   byStatus: Array<{ status: string; total: number }>;
-  hourly: Array<{ hour: number; total: number; queued: number; failed: number }>;
+  hourly: Array<{
+    hour: number;
+    total: number;
+    queued: number;
+    failed: number;
+    accepted?: number;
+    delivered?: number;
+    pending?: number;
+    terminalFailed?: number;
+  }>;
+  failureReasons: Array<{
+    reason: string;
+    total: number;
+    statuses: Record<string, number>;
+    lastSeenAt: string;
+  }>;
   recentFailures: SendEvent[];
 }
 

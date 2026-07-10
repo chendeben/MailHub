@@ -94,6 +94,7 @@ export const api = {
   config: () => request<RuntimeConfig>('/api/config'),
   domains: () => request<{ domains: Domain[] }>('/api/domains'),
   events: () => request<{ events: SendEvent[] }>('/api/events'),
+  event: (id: number) => request<{ event: SendEvent | null }>(`/api/events/${id}`),
   analytics: (days = 7) => request<{ analytics: Analytics }>(`/api/analytics?days=${days}`),
   smtpCredential: () => request<{ credential: SmtpCredential | null }>('/api/smtp-credential'),
   saveSmtpCredential: (data: { username: string; password?: string }) =>
