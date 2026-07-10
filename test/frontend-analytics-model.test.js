@@ -4,10 +4,13 @@ import { test } from 'node:test';
 import {
   buildDashboardSummary,
   buildDeliveryFunnel,
+  buildEngagementSummary,
+  buildEngagementTrend,
   buildEventTimeline,
   buildDomainRanking,
   buildHourlyHeatmap,
   buildStatusDistribution,
+  buildTopLinks,
   buildTrendSeries
 } from '../src/frontend/analytics-model.js';
 
@@ -141,6 +144,73 @@ test('builds delivery funnel and event timeline models', () => {
   assert.equal(timeline[1].queueId, 'Q7');
   assert.equal(timeline[2].tone, 'success');
   assert.equal(timeline[3].status, 'success');
+});
+
+test('normalizes engagement KPIs trends links and timeline events', () => {
+  const analytics = {
+    engagement: {
+      trackedDelivered: 10,
+      totalOpens: 8,
+      uniqueOpens: 6,
+      proxyOpens: 2,
+      totalClicks: 5,
+      uniqueClicks: 4,
+      scannerEvents: 3,
+      openRate: 60,
+      clickRate: 40,
+      clickToOpenRate: 66.7
+    },
+    engagementByDay: [
+      { day: '2026-07-08', opens: 3, uniqueOpens: 2, clicks: 1, uniqueClicks: 1, scannerEvents: 1 },
+      { day: '2026-07-09', opens: 5, uniqueOpens: 4, clicks: 4, uniqueClicks: 3, scannerEvents: 2 }
+    ],
+    topLinks: [{
+      fingerprint: 'abc',
+      target: 'https://example.com/path',
+      targetOrigin: 'https://example.com',
+      clicks: 5,
+      uniqueClicks: 4,
+      lastClickedAt: '2026-07-09T12:00:00.000Z'
+    }]
+  };
+
+  assert.deepEqual(buildEngagementSummary(analytics), analytics.engagement);
+  assert.deepEqual(buildEngagementTrend(analytics)[0], {
+    date: '2026-07-08',
+    opens: 3,
+    uniqueOpens: 2,
+    clicks: 1,
+    uniqueClicks: 1,
+    scannerEvents: 1
+  });
+  assert.equal(buildTopLinks(analytics)[0].target, 'https://example.com/path');
+
+  const timeline = buildEventTimeline({
+    id: 9,
+    status: 'sent',
+    createdAt: '2026-07-09T11:00:00.000Z',
+    deliveryAttempts: [{
+      at: '2026-07-09T12:02:00.000Z',
+      status: 'sent',
+      recipient: 'user@example.com',
+      response: '250 ok'
+    }],
+    tracking: {
+      events: [
+        { id: 1, eventType: 'open', source: 'proxy', occurredAt: '2026-07-09T12:00:00.000Z' },
+        {
+          id: 2,
+          eventType: 'click',
+          source: 'direct',
+          targetOrigin: 'https://example.com',
+          occurredAt: '2026-07-09T12:01:00.000Z'
+        }
+      ]
+    }
+  });
+  assert.deepEqual(timeline.map((item) => item.stage), ['submitted', 'opened', 'clicked', 'delivered']);
+  assert.equal(timeline[1].source, 'proxy');
+  assert.equal(timeline[2].targetOrigin, 'https://example.com');
 });
 
 function domain(verified, records) {

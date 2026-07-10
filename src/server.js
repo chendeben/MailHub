@@ -11,6 +11,8 @@ import {
   createApiToken,
   createAccountToken,
   createDomain,
+  createSendEvent,
+  createTrackingLink,
   createUserWithAccountToken,
   createWebhook,
   consumeAccountToken,
@@ -69,6 +71,10 @@ import {
   updateUser,
   updateWebhook,
   executeUserMerge,
+  finalizeSendEvent,
+  findSendEventByTrackingToken,
+  findTrackingLinkByToken,
+  recordTrackingEvent,
   verifyApiToken,
   verifyUserCredentials
 } from './db.js';
@@ -96,9 +102,24 @@ import {
   buildVerificationEmail,
   sendSystemEmail
 } from './system-mail.js';
+import {
+  classifyTrackingSource,
+  createTrackingToken,
+  decryptTrackingTarget,
+  encryptTrackingTarget,
+  hashTrackingClientIp,
+  instrumentHtml,
+  trackingTargetFingerprint,
+  trackingReplayKey
+} from './tracking.js';
+import { startTrackingRetentionWorker } from './tracking-retention.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadDotEnv();
+const fallbackSecret = crypto
+  .createHash('sha256')
+  .update(`${process.env.ADMIN_PASSWORD || 'change-this-admin-password'}:${process.env.API_TOKEN || ''}`)
+  .digest('hex');
 
 const envConfig = {
   port: Number(process.env.PORT || 3000),
@@ -132,10 +153,10 @@ const envConfig = {
   submissionAllowInsecureAuth: String(process.env.SUBMISSION_ALLOW_INSECURE_AUTH || '').toLowerCase() === 'true',
   submissionTlsCert: process.env.SUBMISSION_TLS_CERT || '',
   submissionTlsKey: process.env.SUBMISSION_TLS_KEY || '',
-  sessionSecret: process.env.SESSION_SECRET || crypto
-    .createHash('sha256')
-    .update(`${process.env.ADMIN_PASSWORD || 'change-this-admin-password'}:${process.env.API_TOKEN || ''}`)
-    .digest('hex')
+  sessionSecret: process.env.SESSION_SECRET || fallbackSecret,
+  trackingSecret: process.env.TRACKING_SECRET || process.env.SESSION_SECRET || fallbackSecret,
+  trustProxy: String(process.env.TRUST_PROXY || '').toLowerCase() === 'true',
+  trackingRetentionDays: Math.max(1, Number(process.env.TRACKING_RETENTION_DAYS || 180))
 };
 
 const defaultSettings = {
@@ -145,7 +166,9 @@ const defaultSettings = {
   defaultSpfMechanisms: process.env.DEFAULT_SPF_MECHANISMS || 'include:spf.mailjet.com',
   dmarcPolicy: process.env.DMARC_POLICY || 'none',
   dmarcRua: process.env.DMARC_RUA || '',
-  sendRequiresVerified: String(process.env.SEND_REQUIRES_VERIFIED || '').toLowerCase() === 'true' ? 'true' : 'false'
+  sendRequiresVerified: String(process.env.SEND_REQUIRES_VERIFIED || '').toLowerCase() === 'true' ? 'true' : 'false',
+  engagementTrackingEnabled:
+    String(process.env.ENGAGEMENT_TRACKING_ENABLED || '').toLowerCase() === 'true' ? 'true' : 'false'
 };
 
 const emailVerificationPurpose = 'email_verification';
@@ -178,12 +201,17 @@ startWebhookWorker({
   batchSize: envConfig.webhookWorkerBatchSize
 });
 
+startTrackingRetentionWorker({
+  days: envConfig.trackingRetentionDays
+});
+
 const server = http.createServer(async (req, res) => {
   try {
     setSecurityHeaders(res);
     if (req.method === 'OPTIONS') return handleOptions(res);
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (url.pathname === '/healthz') return sendJson(res, 200, { ok: true });
+    if (url.pathname.startsWith('/t/') && await handleTrackingRequest(req, res, url)) return;
     if (req.method === 'POST' && (url.pathname === '/api/register' || url.pathname === '/register')) return await handleRegister(req, res);
     if (req.method === 'POST' && (url.pathname === '/api/login' || url.pathname === '/login')) return await handleLogin(req, res);
     if (req.method === 'POST' && url.pathname === '/api/logout') return handleLogout(res);
@@ -240,7 +268,15 @@ startSubmissionServer({
   relaySecure: envConfig.smtpSecure,
   relayUsername: envConfig.smtpUser,
   relayPassword: envConfig.smtpPassword,
-  relayHelo: envConfig.smtpHelo
+  relayHelo: envConfig.smtpHelo,
+  getTrackingSettings() {
+    const settings = runtimeSettings();
+    return {
+      enabled: settings.engagementTrackingEnabled,
+      appBaseUrl: settings.appBaseUrl,
+      secret: envConfig.trackingSecret
+    };
+  }
 });
 
 async function handleApi(req, res, url, user) {
@@ -298,11 +334,16 @@ async function handleApi(req, res, url, user) {
   }
   const sendEventMatch = pathname.match(/^\/api\/events\/(\d+)$/);
   if (sendEventMatch && method === 'GET') {
-    const event = getSendEvent(user.id, Number(sendEventMatch[1]));
+    const event = getSendEvent(user.id, Number(sendEventMatch[1]), { trackingSecret: envConfig.trackingSecret });
     return sendJson(res, event ? 200 : 404, { event });
   }
   if (method === 'GET' && pathname === '/api/analytics') {
-    return sendJson(res, 200, { analytics: getSendAnalytics(user.id, { days: Number(url.searchParams.get('days') || 7) }) });
+    return sendJson(res, 200, {
+      analytics: getSendAnalytics(user.id, {
+        days: Number(url.searchParams.get('days') || 7),
+        trackingSecret: envConfig.trackingSecret
+      })
+    });
   }
   if (method === 'GET' && pathname === '/api/smtp-credential') {
     return sendJson(res, 200, { credential: getSmtpCredential(user.id, { includePassword: true }) });
@@ -765,15 +806,7 @@ async function handleAdminApi(req, res, url, user) {
   }
   if ((method === 'PATCH' || method === 'PUT') && pathname === '/api/admin/settings') {
     const body = await readJson(req);
-    saveSettings({
-      appBaseUrl: body.appBaseUrl,
-      mailHostname: body.mailHostname,
-      sendingIp: body.sendingIp,
-      defaultSpfMechanisms: body.defaultSpfMechanisms,
-      dmarcPolicy: normalizeDmarcPolicy(body.dmarcPolicy),
-      dmarcRua: body.dmarcRua,
-      sendRequiresVerified: boolString(body.sendRequiresVerified)
-    });
+    saveSettings(settingsPatchFromBody(body));
     return sendJson(res, 200, { settings: await adminRuntimeSettings() });
   }
   if (method === 'GET' && pathname === '/api/admin/users') {
@@ -976,17 +1009,58 @@ async function sendMailFromBody(body, user) {
     throw new Error(`发件域名 ${fromDomain} 尚未完成验证。`);
   }
 
-  const rawMessage = buildMessage({
-    from,
-    to: recipients,
-    subject: body.subject || '(no subject)',
-    text: body.text || '',
-    html: body.html || '',
-    baseUrl: settings.appBaseUrl
-  });
-  const signed = signMessageForDomain(rawMessage, domain);
   const smtpTransport = smtpTransportForSend(body, domain, user);
+  const subject = body.subject || '(no subject)';
+  const tracking = resolveSendTracking(body, settings, recipients);
+  const openToken = tracking.opens ? createTrackingToken() : '';
+  const eventId = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    smtpRelayId: smtpTransport.smtpRelayId,
+    sender: from,
+    recipients,
+    subject,
+    trackingToken: openToken,
+    trackingOpens: tracking.opens,
+    trackingClicks: tracking.clicks
+  });
+  let actualTracking = {
+    ...tracking,
+    enabled: false,
+    opens: false,
+    clicks: false
+  };
   try {
+    let html = body.html || '';
+    if (tracking.enabled) {
+      const result = instrumentHtml(html, {
+        openPixelUrl: tracking.opens ? trackingOpenUrl(settings.appBaseUrl, openToken) : '',
+        createClickUrl: tracking.clicks
+          ? (target) => createTrackedClickUrl({
+              appBaseUrl: settings.appBaseUrl,
+              userId: user.id,
+              eventId,
+              target
+            })
+          : null
+      });
+      html = result.html;
+      actualTracking = {
+        ...tracking,
+        enabled: (tracking.opens && result.pixelAdded) || (tracking.clicks && result.linkCount > 0),
+        opens: tracking.opens && result.pixelAdded,
+        clicks: tracking.clicks && result.linkCount > 0
+      };
+    }
+    const rawMessage = buildMessage({
+      from,
+      to: recipients,
+      subject,
+      text: body.text || '',
+      html,
+      baseUrl: settings.appBaseUrl
+    });
+    const signed = signMessageForDomain(rawMessage, domain);
     const smtpResult = await sendViaSmtp({
       host: smtpTransport.host,
       port: smtpTransport.port,
@@ -998,40 +1072,77 @@ async function sendMailFromBody(body, user) {
       recipients,
       rawMessage: signed
     });
-    logSendEvent({
-      userId: user.id,
-      domainId: domain.id,
+    finalizeSendEvent(eventId, user.id, {
       smtpRelayId: smtpTransport.smtpRelayId,
-      sender: from,
-      recipients,
-      subject: body.subject || '(no subject)',
       status: 'queued',
       detail: smtpResult.message,
       queueId: smtpResult.queueId,
-      deliveryLog: smtpResult.deliveryLog
+      deliveryLog: smtpResult.deliveryLog,
+      trackingOpens: actualTracking.opens,
+      trackingClicks: actualTracking.clicks
     });
     return {
+      eventId,
       queued: true,
       domain: domain.domain,
       recipients,
       smtp: smtpResult.message,
       queueId: smtpResult.queueId,
-      smtpRelayId: smtpTransport.smtpRelayId
+      smtpRelayId: smtpTransport.smtpRelayId,
+      tracking: actualTracking
     };
   } catch (error) {
-    logSendEvent({
-      userId: user.id,
-      domainId: domain.id,
+    finalizeSendEvent(eventId, user.id, {
       smtpRelayId: smtpTransport.smtpRelayId,
-      sender: from,
-      recipients,
-      subject: body.subject || '(no subject)',
       status: 'failed',
       detail: error.message,
-      deliveryLog: deliveryLogFromError(error)
+      deliveryLog: deliveryLogFromError(error),
+      trackingOpens: actualTracking.opens,
+      trackingClicks: actualTracking.clicks
     });
     throw error;
   }
+}
+
+function resolveSendTracking(body, settings, recipients) {
+  if (!body.html) return { enabled: false, opens: false, clicks: false, messageLevel: recipients.length > 1 };
+  const configured = Boolean(settings.engagementTrackingEnabled);
+  const requested = body.tracking;
+  let opens = configured;
+  let clicks = configured;
+  if (typeof requested === 'boolean') {
+    opens = requested;
+    clicks = requested;
+  } else if (requested && typeof requested === 'object') {
+    if (Object.hasOwn(requested, 'opens')) opens = Boolean(requested.opens);
+    if (Object.hasOwn(requested, 'clicks')) clicks = Boolean(requested.clicks);
+  }
+  return {
+    enabled: opens || clicks,
+    opens,
+    clicks,
+    messageLevel: recipients.length > 1
+  };
+}
+
+function createTrackedClickUrl({ appBaseUrl, userId, eventId, target }) {
+  const normalizedTarget = new URL(target).toString();
+  const token = createTrackingToken();
+  createTrackingLink(userId, eventId, {
+    token,
+    targetCiphertext: encryptTrackingTarget(normalizedTarget, envConfig.trackingSecret),
+    targetFingerprint: trackingTargetFingerprint(normalizedTarget, envConfig.trackingSecret),
+    targetOrigin: new URL(normalizedTarget).origin
+  });
+  return `${trackingUrlBase(appBaseUrl)}/t/c/${token}`;
+}
+
+function trackingOpenUrl(appBaseUrl, token) {
+  return `${trackingUrlBase(appBaseUrl)}/t/o/${token}.gif`;
+}
+
+function trackingUrlBase(appBaseUrl) {
+  return String(appBaseUrl || '').replace(/\/+$/, '');
 }
 
 function deliveryLogFromError(error) {
@@ -1352,7 +1463,8 @@ function runtimeSettings() {
     defaultSpfMechanisms: settings.defaultSpfMechanisms,
     dmarcPolicy: normalizeDmarcPolicy(settings.dmarcPolicy),
     dmarcRua: settings.dmarcRua,
-    sendRequiresVerified: String(settings.sendRequiresVerified).toLowerCase() === 'true'
+    sendRequiresVerified: String(settings.sendRequiresVerified).toLowerCase() === 'true',
+    engagementTrackingEnabled: String(settings.engagementTrackingEnabled).toLowerCase() === 'true'
   };
 }
 
@@ -1402,6 +1514,131 @@ async function readJson(req) {
     return Object.fromEntries(new URLSearchParams(raw).entries());
   }
   return JSON.parse(raw);
+}
+
+const trackingPixel = Buffer.from(
+  'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+  'base64'
+);
+
+async function handleTrackingRequest(req, res, url) {
+  const openMatch = url.pathname.match(/^\/t\/o\/([A-Za-z0-9_-]{20,128})\.gif$/);
+  if (openMatch) {
+    if (!['GET', 'HEAD'].includes(req.method)) return sendTrackingStatus(res, 405, 'Method not allowed.');
+    if (req.method === 'GET') {
+      const sendEvent = findSendEventByTrackingToken(openMatch[1]);
+      if (sendEvent?.tracking?.opens) {
+        recordPublicTrackingEvent(req, {
+          sendEvent,
+          eventType: 'open'
+        });
+      }
+    }
+    return sendTrackingPixel(res, req.method === 'HEAD');
+  }
+  if (url.pathname.startsWith('/t/o/')) {
+    if (!['GET', 'HEAD'].includes(req.method)) return sendTrackingStatus(res, 405, 'Method not allowed.');
+    return sendTrackingPixel(res, req.method === 'HEAD');
+  }
+
+  const clickMatch = url.pathname.match(/^\/t\/c\/([A-Za-z0-9_-]{20,128})$/);
+  if (!clickMatch) {
+    if (url.pathname.startsWith('/t/c/')) return sendTrackingStatus(res, 404, 'Not found.');
+    return false;
+  }
+  if (req.method !== 'GET') return sendTrackingStatus(res, 405, 'Method not allowed.');
+  const link = findTrackingLinkByToken(clickMatch[1]);
+  if (!link?.trackingClicks) return sendTrackingStatus(res, 404, 'Not found.');
+  let target;
+  try {
+    target = decryptTrackingTarget(link.targetCiphertext, envConfig.trackingSecret);
+  } catch {
+    return sendTrackingStatus(res, 410, 'Link is no longer available.');
+  }
+  recordPublicTrackingEvent(req, {
+    sendEvent: {
+      id: link.sendEventId,
+      userId: link.userId
+    },
+    eventType: 'click',
+    trackingLinkId: link.id
+  });
+  res.writeHead(302, {
+    Location: target,
+    'Cache-Control': 'private, no-store, no-cache, max-age=0',
+    Pragma: 'no-cache',
+    'Referrer-Policy': 'no-referrer'
+  });
+  res.end();
+  return true;
+}
+
+function recordPublicTrackingEvent(req, { sendEvent, eventType, trackingLinkId = null }) {
+  const occurredAt = new Date().toISOString();
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 500);
+  const source = classifyTrackingSource(userAgent);
+  const ipHash = hashTrackingClientIp({
+    ip: requestClientIp(req),
+    secret: envConfig.trackingSecret,
+    userId: sendEvent.userId,
+    sendEventId: sendEvent.id,
+    occurredAt
+  });
+  const replayKey = trackingReplayKey({
+    secret: envConfig.trackingSecret,
+    sendEventId: sendEvent.id,
+    eventType,
+    trackingLinkId,
+    ipHash,
+    userAgent,
+    occurredAt
+  });
+  try {
+    recordTrackingEvent({
+      sendEventId: sendEvent.id,
+      trackingLinkId,
+      eventType,
+      source,
+      occurredAt,
+      userAgent,
+      ipHash,
+      replayKey
+    });
+  } catch (error) {
+    console.warn(`Tracking event could not be recorded: ${error.message}`);
+  }
+}
+
+function requestClientIp(req) {
+  if (envConfig.trustProxy) {
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (forwarded) return forwarded;
+  }
+  return req.socket?.remoteAddress || '';
+}
+
+function sendTrackingPixel(res, headOnly = false) {
+  res.writeHead(200, {
+    'Content-Type': 'image/gif',
+    'Content-Length': String(trackingPixel.length),
+    'Cache-Control': 'private, no-store, no-cache, max-age=0',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Referrer-Policy': 'no-referrer'
+  });
+  res.end(headOnly ? undefined : trackingPixel);
+  return true;
+}
+
+function sendTrackingStatus(res, status, message) {
+  res.writeHead(status, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'private, no-store, no-cache, max-age=0',
+    Pragma: 'no-cache',
+    'Referrer-Policy': 'no-referrer'
+  });
+  res.end(message);
+  return true;
 }
 
 function sendJson(res, status, payload) {
@@ -1478,6 +1715,25 @@ function smtpRelayPatch(body) {
   const patch = {};
   for (const key of ['name', 'host', 'port', 'secure', 'username', 'password', 'helo', 'isDefault']) {
     if (Object.hasOwn(body, key)) patch[key] = body[key];
+  }
+  return patch;
+}
+
+function settingsPatchFromBody(body) {
+  const patch = {};
+  for (const key of [
+    'appBaseUrl',
+    'mailHostname',
+    'sendingIp',
+    'defaultSpfMechanisms',
+    'dmarcRua'
+  ]) {
+    if (Object.hasOwn(body, key)) patch[key] = body[key];
+  }
+  if (Object.hasOwn(body, 'dmarcPolicy')) patch.dmarcPolicy = normalizeDmarcPolicy(body.dmarcPolicy);
+  if (Object.hasOwn(body, 'sendRequiresVerified')) patch.sendRequiresVerified = boolString(body.sendRequiresVerified);
+  if (Object.hasOwn(body, 'engagementTrackingEnabled')) {
+    patch.engagementTrackingEnabled = boolString(body.engagementTrackingEnabled);
   }
   return patch;
 }

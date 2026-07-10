@@ -48,6 +48,10 @@ body {
   z-index: 20;
 }
 
+.admin-sider.ant-layout-sider-zero-width {
+  overflow: visible;
+}
+
 .admin-sider-inner {
   display: flex;
   flex-direction: column;
@@ -503,6 +507,10 @@ body {
   margin-top: 6px;
 }
 
+.delivery-log-card .ant-table-wrapper {
+  margin-top: 16px;
+}
+
 .delivery-log-entry {
   display: grid;
   gap: 8px;
@@ -822,7 +830,6 @@ body {
   .admin-sider {
     height: auto;
     max-height: none;
-    position: static !important;
   }
 
   .admin-content {

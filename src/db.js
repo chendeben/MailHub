@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { dkimPublicFromPrivateKey } from './dkim.js';
+import { decryptTrackingTarget, hashTrackingToken } from './tracking.js';
 import {
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_LEASE_MS,
@@ -29,6 +30,9 @@ export function initDatabase(dataDir, secret = '') {
   secretKey = String(secret || process.env.SESSION_SECRET || process.env.API_TOKEN || process.env.ADMIN_PASSWORD || '');
   mkdirSync(dataDir, { recursive: true });
   db = new DatabaseSync(path.join(dataDir, 'mailhub.sqlite'));
+  db.function('normalize_failure_reason', { deterministic: true }, (detail, status) => (
+    String(detail || '').replace(/\s+/g, ' ').trim() || String(status || 'unknown failure')
+  ));
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   migrateLegacySmtpTable();
   db.exec(`
@@ -75,8 +79,37 @@ export function initDatabase(dataDir, secret = '') {
       delivery_log_json TEXT NOT NULL DEFAULT '[]',
       delivery_attempts_json TEXT NOT NULL DEFAULT '[]',
       delivered_at TEXT,
+      tracking_token_hash TEXT,
+      tracking_opens TEXT NOT NULL DEFAULT 'false',
+      tracking_clicks TEXT NOT NULL DEFAULT 'false',
       created_at TEXT NOT NULL,
       FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS tracking_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      send_event_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      target_ciphertext TEXT NOT NULL,
+      target_fingerprint TEXT NOT NULL,
+      target_origin TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(send_event_id) REFERENCES send_events(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS tracking_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      send_event_id INTEGER NOT NULL,
+      tracking_link_id INTEGER,
+      event_type TEXT NOT NULL,
+      source TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      user_agent TEXT NOT NULL DEFAULT '',
+      ip_hash TEXT NOT NULL,
+      replay_key TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(send_event_id) REFERENCES send_events(id) ON DELETE CASCADE,
+      FOREIGN KEY(tracking_link_id) REFERENCES tracking_links(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -204,6 +237,11 @@ export function initDatabase(dataDir, secret = '') {
     CREATE INDEX IF NOT EXISTS idx_webhooks_user_domain ON webhooks(user_id, domain_id);
     CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next ON webhook_deliveries(status, next_attempt_at);
     CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_user_created ON webhook_deliveries(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_tracking_links_event ON tracking_links(send_event_id);
+    CREATE INDEX IF NOT EXISTS idx_tracking_links_fingerprint ON tracking_links(target_fingerprint);
+    CREATE INDEX IF NOT EXISTS idx_tracking_events_event_time ON tracking_events(send_event_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_tracking_events_link_time ON tracking_events(tracking_link_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_tracking_events_type_time ON tracking_events(event_type, occurred_at);
   `);
   ensureColumn('domains', 'user_id', 'INTEGER');
   ensureColumn('domains', 'dns_credential_id', 'INTEGER');
@@ -214,14 +252,21 @@ export function initDatabase(dataDir, secret = '') {
   ensureColumn('send_events', 'delivery_log_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('send_events', 'delivery_attempts_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('send_events', 'delivered_at', 'TEXT');
+  ensureColumn('send_events', 'tracking_token_hash', 'TEXT');
+  ensureColumn('send_events', 'tracking_opens', "TEXT NOT NULL DEFAULT 'false'");
+  ensureColumn('send_events', 'tracking_clicks', "TEXT NOT NULL DEFAULT 'false'");
   migrateSmtpCredentialsToMultiplePerUser();
   ensureColumn('smtp_credentials', 'password_secret', "TEXT NOT NULL DEFAULT ''");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_domains_user_id ON domains(user_id);
     CREATE INDEX IF NOT EXISTS idx_domains_smtp_relay_id ON domains(smtp_relay_id);
     CREATE INDEX IF NOT EXISTS idx_events_user_id ON send_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_events_user_created ON send_events(user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_events_smtp_relay_id ON send_events(smtp_relay_id);
     CREATE INDEX IF NOT EXISTS idx_events_queue_id ON send_events(queue_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_events_tracking_token_hash
+      ON send_events(tracking_token_hash)
+      WHERE tracking_token_hash IS NOT NULL AND tracking_token_hash != '';
     CREATE INDEX IF NOT EXISTS idx_smtp_credentials_user_id ON smtp_credentials(user_id);
     CREATE INDEX IF NOT EXISTS idx_smtp_relays_user_id ON smtp_relays(user_id);
   `);
@@ -795,16 +840,19 @@ export function listAuditLogs(filters = {}) {
   return requireDb().prepare(query).all(...params).map(publicAuditLog);
 }
 
-export function logSendEvent(event) {
+export function createSendEvent(event) {
   const queueId = normalizeQueueId(event.queueId || extractQueueIdFromText(event.detail));
   const recipients = Array.isArray(event.recipients) ? event.recipients : [];
+  const status = event.status || 'submitting';
+  const trackingTokenHash = event.trackingToken ? hashTrackingToken(event.trackingToken) : null;
   const result = requireDb()
     .prepare(`
       INSERT INTO send_events (
         user_id, domain_id, smtp_relay_id, sender, recipients, subject, status, detail, queue_id,
-        delivery_log_json, delivery_attempts_json, delivered_at, created_at
+        delivery_log_json, delivery_attempts_json, delivered_at,
+        tracking_token_hash, tracking_opens, tracking_clicks, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       event.userId ?? null,
@@ -813,23 +861,26 @@ export function logSendEvent(event) {
       event.sender,
       JSON.stringify(recipients),
       event.subject,
-      event.status,
+      status,
       event.detail ?? '',
       queueId,
       JSON.stringify(Array.isArray(event.deliveryLog) ? event.deliveryLog : []),
       JSON.stringify(Array.isArray(event.deliveryAttempts) ? event.deliveryAttempts : []),
       event.deliveredAt ?? null,
+      trackingTokenHash,
+      boolString(event.trackingOpens),
+      boolString(event.trackingClicks),
       now()
     );
   const id = result.lastInsertRowid;
-  if (isTerminalWebhookStatus(event.status)) {
+  if (isTerminalWebhookStatus(status)) {
     try {
       enqueueWebhookDeliveries({
         id,
         userId: event.userId,
         domainId: event.domainId ?? null,
         domain: event.domain,
-        status: event.status,
+        status,
         sender: event.sender,
         recipients,
         subject: event.subject,
@@ -842,6 +893,67 @@ export function logSendEvent(event) {
     }
   }
   return id;
+}
+
+export function logSendEvent(event) {
+  return createSendEvent(event);
+}
+
+export function finalizeSendEvent(id, userId, patch = {}) {
+  const row = requireDb().prepare('SELECT * FROM send_events WHERE id = ? AND user_id = ?').get(Number(id), userId);
+  if (!row) return null;
+  const recipients = safeJson(row.recipients, []);
+  const status = patch.status || row.status;
+  const detail = patch.detail ?? row.detail;
+  const queueId = normalizeQueueId(patch.queueId || extractQueueIdFromText(detail) || row.queue_id);
+  const deliveryLog = Array.isArray(patch.deliveryLog) ? patch.deliveryLog : safeJson(row.delivery_log_json, []);
+  const deliveryAttempts = Array.isArray(patch.deliveryAttempts)
+    ? patch.deliveryAttempts
+    : safeJson(row.delivery_attempts_json, []);
+  const deliveredAt = patch.deliveredAt === undefined ? row.delivered_at : patch.deliveredAt;
+  const smtpRelayId = patch.smtpRelayId === undefined ? row.smtp_relay_id : patch.smtpRelayId;
+  const trackingOpens = patch.trackingOpens === undefined ? row.tracking_opens : boolString(patch.trackingOpens);
+  const trackingClicks = patch.trackingClicks === undefined ? row.tracking_clicks : boolString(patch.trackingClicks);
+  requireDb()
+    .prepare(`
+      UPDATE send_events
+      SET smtp_relay_id = ?, status = ?, detail = ?, queue_id = ?,
+          delivery_log_json = ?, delivery_attempts_json = ?, delivered_at = ?,
+          tracking_opens = ?, tracking_clicks = ?
+      WHERE id = ? AND user_id = ?
+    `)
+    .run(
+      smtpRelayId ?? null,
+      status,
+      detail,
+      queueId,
+      JSON.stringify(deliveryLog),
+      JSON.stringify(deliveryAttempts),
+      deliveredAt ?? null,
+      trackingOpens,
+      trackingClicks,
+      row.id,
+      userId
+    );
+  if (isTerminalWebhookStatus(status) && status !== row.status) {
+    try {
+      enqueueWebhookDeliveries({
+        id: row.id,
+        userId: row.user_id,
+        domainId: row.domain_id,
+        status,
+        sender: row.sender,
+        recipients,
+        subject: row.subject,
+        detail,
+        queueId,
+        deliveredAt
+      });
+    } catch (error) {
+      console.error('webhook enqueue after finalizeSendEvent failed', error);
+    }
+  }
+  return getSendEvent(userId, row.id);
 }
 
 export function updateSendEventDelivery(queueId, attempt) {
@@ -887,7 +999,7 @@ export function updateSendEventDelivery(queueId, attempt) {
 }
 
 export function listSendEvents(userId, limit = 30) {
-  return requireDb()
+  const rows = requireDb()
     .prepare(`
       SELECT e.*, d.domain
       FROM send_events e
@@ -896,11 +1008,21 @@ export function listSendEvents(userId, limit = 30) {
       ORDER BY e.created_at DESC
       LIMIT ?
     `)
-    .all(userId, limit)
-    .map(publicSendEvent);
+    .all(userId, limit);
+  const trackingAggregates = listTrackingAggregates(rows.map((row) => row.id));
+  return rows.map((row) => {
+      const event = publicSendEvent(row);
+      return {
+        ...event,
+        tracking: {
+          ...event.tracking,
+          summary: trackingAggregates.get(event.id)?.summary || emptyTrackingSummary()
+        }
+      };
+    });
 }
 
-export function getSendEvent(userId, eventId) {
+export function getSendEvent(userId, eventId, { trackingSecret = '' } = {}) {
   const event = publicSendEvent(
     requireDb()
       .prepare(`
@@ -912,13 +1034,219 @@ export function getSendEvent(userId, eventId) {
       .get(userId, Number(eventId))
   );
   if (!event) return null;
+  const trackingAggregate = listTrackingAggregates([event.id]).get(event.id) || {
+    eventCount: 0,
+    summary: emptyTrackingSummary()
+  };
+  const trackingEvents = listTrackingEventsForSendEvent(event.id, 500);
+  const linkCount = countTrackingLinksForSendEvent(event.id);
+  const trackingLinks = listTrackingLinksForSendEvent(event.id, trackingSecret, 200);
   return {
     ...event,
+    tracking: {
+      ...event.tracking,
+      summary: trackingAggregate.summary,
+      events: trackingEvents,
+      eventCount: trackingAggregate.eventCount,
+      eventsTruncated: trackingAggregate.eventCount > trackingEvents.length,
+      links: trackingLinks,
+      linkCount,
+      linksTruncated: linkCount > trackingLinks.length
+    },
     webhookDeliveries: listWebhookDeliveries(userId, {
       sendEventId: event.id,
       limit: 50
     })
   };
+}
+
+export function findSendEventByTrackingToken(token) {
+  if (!token) return null;
+  return publicSendEvent(
+    requireDb()
+      .prepare(`
+        SELECT e.*, d.domain
+        FROM send_events e
+        LEFT JOIN domains d ON d.id = e.domain_id
+        WHERE e.tracking_token_hash = ?
+      `)
+      .get(hashTrackingToken(token))
+  );
+}
+
+export function createTrackingLink(userId, sendEventId, link) {
+  const event = requireDb()
+    .prepare('SELECT id FROM send_events WHERE id = ? AND user_id = ?')
+    .get(Number(sendEventId), userId);
+  if (!event) throw new Error('Send event not found.');
+  if (!link?.token) throw new Error('Tracking link token is required.');
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO tracking_links (
+        send_event_id, token_hash, target_ciphertext, target_fingerprint, target_origin, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      event.id,
+      hashTrackingToken(link.token),
+      String(link.targetCiphertext || ''),
+      String(link.targetFingerprint || ''),
+      String(link.targetOrigin || ''),
+      now()
+    );
+  return result.lastInsertRowid;
+}
+
+export function findTrackingLinkByToken(token) {
+  if (!token) return null;
+  const row = requireDb()
+    .prepare(`
+      SELECT l.*, e.user_id, e.domain_id, e.sender, e.recipients, e.subject,
+             e.status, e.tracking_clicks, d.domain
+      FROM tracking_links l
+      JOIN send_events e ON e.id = l.send_event_id
+      LEFT JOIN domains d ON d.id = e.domain_id
+      WHERE l.token_hash = ?
+    `)
+    .get(hashTrackingToken(token));
+  return publicTrackingLink(row);
+}
+
+export function recordTrackingEvent(input) {
+  const database = requireDb();
+  const sendEventId = Number(input.sendEventId);
+  const eventType = String(input.eventType || '').toLowerCase();
+  const source = normalizeTrackingSource(input.source);
+  const occurredAt = normalizeIsoDate(input.occurredAt);
+  const trackingLinkId = input.trackingLinkId == null ? null : Number(input.trackingLinkId);
+  const maxPerDay = Math.max(1, Math.min(1000, Number(input.maxPerDay) || 1000));
+  if (!['open', 'click'].includes(eventType)) throw new Error('Invalid tracking event type.');
+  const sendEvent = database.prepare('SELECT * FROM send_events WHERE id = ?').get(sendEventId);
+  if (!sendEvent) return { recorded: false, notFound: true, firstQualifying: false };
+  if (eventType === 'open' && sendEvent.tracking_opens !== 'true') {
+    return { recorded: false, disabled: true, firstQualifying: false };
+  }
+  if (eventType === 'click') {
+    if (sendEvent.tracking_clicks !== 'true') return { recorded: false, disabled: true, firstQualifying: false };
+    const link = database
+      .prepare('SELECT id FROM tracking_links WHERE id = ? AND send_event_id = ?')
+      .get(trackingLinkId, sendEventId);
+    if (!link) return { recorded: false, notFound: true, firstQualifying: false };
+  }
+
+  const dayStart = `${occurredAt.slice(0, 10)}T00:00:00.000Z`;
+  const dayEndDate = new Date(dayStart);
+  dayEndDate.setUTCDate(dayEndDate.getUTCDate() + 1);
+  const dayEnd = dayEndDate.toISOString();
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const existing = database.prepare('SELECT id FROM tracking_events WHERE replay_key = ?').get(String(input.replayKey || ''));
+    if (existing) {
+      database.exec('COMMIT');
+      return { recorded: false, duplicate: true, firstQualifying: false };
+    }
+    const dailyCount = database
+      .prepare(`
+        SELECT COUNT(*) AS total
+        FROM tracking_events
+        WHERE send_event_id = ? AND occurred_at >= ? AND occurred_at < ?
+      `)
+      .get(sendEventId, dayStart, dayEnd)?.total || 0;
+    if (dailyCount >= maxPerDay) {
+      database.exec('COMMIT');
+      return { recorded: false, capped: true, firstQualifying: false };
+    }
+    const qualifies = isQualifyingTrackingEvent(eventType, source);
+    const qualifyingBefore = qualifies
+      ? database
+          .prepare(`
+            SELECT COUNT(*) AS total
+            FROM tracking_events
+            WHERE send_event_id = ? AND event_type = ?
+              AND ${eventType === 'click' ? "source = 'direct'" : "source != 'scanner'"}
+          `)
+          .get(sendEventId, eventType)?.total || 0
+      : 0;
+    const result = database
+      .prepare(`
+        INSERT INTO tracking_events (
+          send_event_id, tracking_link_id, event_type, source, occurred_at,
+          user_agent, ip_hash, replay_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        sendEventId,
+        trackingLinkId,
+        eventType,
+        source,
+        occurredAt,
+        String(input.userAgent || '').slice(0, 500),
+        String(input.ipHash || ''),
+        String(input.replayKey || ''),
+        now()
+      );
+    const row = database
+      .prepare(`
+        SELECT te.*, tl.target_origin
+        FROM tracking_events te
+        LEFT JOIN tracking_links tl ON tl.id = te.tracking_link_id
+        WHERE te.id = ?
+      `)
+      .get(result.lastInsertRowid);
+    const firstQualifying = qualifies && qualifyingBefore === 0;
+    if (firstQualifying) {
+      enqueueWebhookDeliveries(
+        {
+          id: sendEvent.id,
+          userId: sendEvent.user_id,
+          domainId: sendEvent.domain_id,
+          status: sendEvent.status,
+          sender: sendEvent.sender,
+          recipients: safeJson(sendEvent.recipients, []),
+          subject: sendEvent.subject,
+          detail: sendEvent.detail,
+          queueId: sendEvent.queue_id,
+          deliveredAt: sendEvent.delivered_at
+        },
+        {
+          database,
+          manageTransactions: false,
+          eventType: eventType === 'open' ? 'opened' : 'clicked',
+          engagement: {
+            type: eventType,
+            occurredAt,
+            source,
+            linkId: trackingLinkId,
+            targetOrigin: row.target_origin || ''
+          }
+        }
+      );
+    }
+    database.exec('COMMIT');
+    return {
+      recorded: true,
+      firstQualifying,
+      event: publicTrackingEvent(row)
+    };
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // ignore rollback errors when no transaction is active
+    }
+    if (/UNIQUE constraint failed: tracking_events\.replay_key/i.test(String(error?.message || ''))) {
+      return { recorded: false, duplicate: true, firstQualifying: false };
+    }
+    throw error;
+  }
+}
+
+export function pruneTrackingEvents({ days = 180, now: currentTime } = {}) {
+  const retentionDays = Math.max(1, Number(days) || 180);
+  const cutoff = new Date(currentTime || Date.now());
+  if (Number.isNaN(cutoff.getTime())) throw new Error('Invalid tracking retention time.');
+  cutoff.setUTCDate(cutoff.getUTCDate() - retentionDays);
+  return Number(requireDb().prepare('DELETE FROM tracking_events WHERE occurred_at < ?').run(cutoff.toISOString()).changes || 0);
 }
 
 export function listWebhooks(userId, { domainId } = {}) {
@@ -1031,14 +1359,14 @@ export function deleteWebhook(userId, id) {
 }
 
 /**
- * Enqueue pending webhook deliveries for a terminal send event.
+ * Enqueue pending webhook deliveries for a delivery or engagement event.
  * Idempotent on (webhook_id, send_event_id, event_type).
  */
-export function enqueueWebhookDeliveries(sendEvent) {
+export function enqueueWebhookDeliveries(sendEvent, options = {}) {
   if (!sendEvent?.userId) return [];
-  if (!isTerminalWebhookStatus(sendEvent.status)) return [];
+  const eventType = options.eventType || sendEvent.status;
+  if (!options.eventType && !isTerminalWebhookStatus(sendEvent.status)) return [];
 
-  const eventType = sendEvent.status;
   const externalType = eventTypeForStatus(eventType);
   if (!externalType) return [];
 
@@ -1052,7 +1380,7 @@ export function enqueueWebhookDeliveries(sendEvent) {
     userId: sendEvent.userId,
     domainId,
     domain: domainName,
-    status: eventType,
+    status: sendEvent.status,
     sender: sendEvent.sender || '',
     recipients,
     subject: sendEvent.subject || '',
@@ -1072,9 +1400,10 @@ export function enqueueWebhookDeliveries(sendEvent) {
   });
 
   const created = [];
-  const database = requireDb();
+  const database = options.database || requireDb();
+  const manageTransactions = options.manageTransactions !== false;
   for (const webhook of targets) {
-    database.exec('BEGIN');
+    if (manageTransactions) database.exec('BEGIN');
     try {
       const existing = database
         .prepare(`
@@ -1083,7 +1412,7 @@ export function enqueueWebhookDeliveries(sendEvent) {
         `)
         .get(webhook.id, normalizedEvent.id, eventType);
       if (existing) {
-        database.exec('COMMIT');
+        if (manageTransactions) database.exec('COMMIT');
         continue;
       }
 
@@ -1105,7 +1434,7 @@ export function enqueueWebhookDeliveries(sendEvent) {
           createdAt
         );
       if (insert.changes !== 1) {
-        database.exec('ROLLBACK');
+        if (manageTransactions) database.exec('ROLLBACK');
         continue;
       }
       const deliveryId = insert.lastInsertRowid;
@@ -1114,20 +1443,23 @@ export function enqueueWebhookDeliveries(sendEvent) {
         eventType: externalType,
         createdAt,
         sendEvent: normalizedEvent,
+        engagement: options.engagement || null,
         test: false
       });
       database
         .prepare('UPDATE webhook_deliveries SET payload_json = ? WHERE id = ?')
         .run(JSON.stringify(payload), deliveryId);
-      database.exec('COMMIT');
+      if (manageTransactions) database.exec('COMMIT');
       created.push(publicWebhookDelivery(
         database.prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(deliveryId)
       ));
     } catch (error) {
-      try {
-        database.exec('ROLLBACK');
-      } catch {
-        // ignore rollback errors when no transaction is open
+      if (manageTransactions) {
+        try {
+          database.exec('ROLLBACK');
+        } catch {
+          // ignore rollback errors when no transaction is open
+        }
       }
       throw error;
     }
@@ -1430,25 +1762,15 @@ export function enqueueWebhookTestDelivery(userId, webhookId) {
   }
 }
 
-export function getSendAnalytics(userId, { days = 7 } = {}) {
+export function getSendAnalytics(userId, { days = 7, trackingSecret = '' } = {}) {
   const windowDays = clampAnalyticsDays(days);
   const since = new Date();
   since.setUTCHours(0, 0, 0, 0);
   since.setUTCDate(since.getUTCDate() - (windowDays - 1));
-  const rows = requireDb()
-    .prepare(`
-      SELECT e.*, d.domain
-      FROM send_events e
-      LEFT JOIN domains d ON d.id = e.domain_id
-      WHERE e.user_id = ? AND e.created_at >= ?
-      ORDER BY e.created_at ASC
-      LIMIT 5000
-    `)
-    .all(userId, since.toISOString());
+  const database = requireDb();
+  const sinceIso = since.toISOString();
   const domains = listDomains(userId);
   const dayBuckets = buildDayBuckets(windowDays);
-  const byStatus = {};
-  const byDomain = new Map();
   const hourly = Array.from({ length: 24 }, (_, hour) => ({
     hour,
     total: 0,
@@ -1459,94 +1781,134 @@ export function getSendAnalytics(userId, { days = 7 } = {}) {
     pending: 0,
     terminalFailed: 0
   }));
-  let recipients = 0;
-  let queued = 0;
-  let failed = 0;
-  let accepted = 0;
-  let delivered = 0;
-  let pending = 0;
-  let deferred = 0;
-  let bounced = 0;
-  let terminalFailed = 0;
-  let today = 0;
-  let last7Days = 0;
-  const failureReasons = new Map();
   const todayKey = new Date().toISOString().slice(0, 10);
   const weekStart = new Date();
   weekStart.setUTCHours(0, 0, 0, 0);
   weekStart.setUTCDate(weekStart.getUTCDate() - 6);
+  const status = "LOWER(COALESCE(e.status, 'unknown'))";
+  const recipients = "CASE WHEN json_valid(e.recipients) THEN json_array_length(e.recipients) ELSE 0 END";
+  const accepted = `(COALESCE(TRIM(e.queue_id), '') != '' OR ${status} IN ('queued', 'sent', 'deferred', 'bounced'))`;
+  const aggregateColumns = `
+    COUNT(*) AS total,
+    COALESCE(SUM(${recipients}), 0) AS recipients,
+    SUM(CASE WHEN ${status} IN ('queued', 'sent') THEN 1 ELSE 0 END) AS queued,
+    SUM(CASE WHEN ${status} IN ('queued', 'sent') THEN 0 ELSE 1 END) AS failed,
+    SUM(CASE WHEN ${accepted} THEN 1 ELSE 0 END) AS accepted,
+    SUM(CASE WHEN ${status} = 'sent' THEN 1 ELSE 0 END) AS delivered,
+    SUM(CASE WHEN ${status} IN ('queued', 'deferred') THEN 1 ELSE 0 END) AS pending,
+    SUM(CASE WHEN ${status} = 'deferred' THEN 1 ELSE 0 END) AS deferred,
+    SUM(CASE WHEN ${status} = 'bounced' THEN 1 ELSE 0 END) AS bounced,
+    SUM(CASE WHEN ${status} IN ('bounced', 'failed') THEN 1 ELSE 0 END) AS terminal_failed
+  `;
+  const summaryRow = database
+    .prepare(`
+      SELECT
+        ${aggregateColumns},
+        SUM(CASE WHEN substr(e.created_at, 1, 10) = ? THEN 1 ELSE 0 END) AS today,
+        SUM(CASE WHEN e.created_at >= ? THEN 1 ELSE 0 END) AS last_7_days
+      FROM send_events e
+      WHERE e.user_id = ? AND e.created_at >= ?
+    `)
+    .get(todayKey, weekStart.toISOString(), userId, sinceIso);
+  const summary = analyticsAggregateRow(summaryRow);
 
-  for (const row of rows) {
-    const status = row.status || 'unknown';
-    const recipientList = safeJson(row.recipients, []);
-    const recipientCount = Array.isArray(recipientList) ? recipientList.length : 0;
-    const domainName = row.domain || (String(row.sender || '').split('@')[1] || 'unknown');
-    const createdAt = new Date(row.created_at);
-    const dayKey = row.created_at.slice(0, 10);
-    const hour = Number.isInteger(createdAt.getUTCHours()) ? createdAt.getUTCHours() : 0;
-    const isQueued = ['queued', 'sent'].includes(status);
-    const classification = classifySendEvent(row);
-
-    recipients += recipientCount;
-    queued += isQueued ? 1 : 0;
-    failed += isQueued ? 0 : 1;
-    accepted += classification.accepted ? 1 : 0;
-    delivered += classification.delivered ? 1 : 0;
-    pending += classification.pending ? 1 : 0;
-    deferred += classification.deferred ? 1 : 0;
-    bounced += classification.bounced ? 1 : 0;
-    terminalFailed += classification.terminalFailed ? 1 : 0;
-    today += dayKey === todayKey ? 1 : 0;
-    last7Days += createdAt >= weekStart ? 1 : 0;
-    byStatus[status] = (byStatus[status] || 0) + 1;
-    if (isDeliveryFailureStatus(status)) addFailureReason(failureReasons, row);
-
-    if (dayBuckets.has(dayKey)) {
-      const bucket = dayBuckets.get(dayKey);
-      bucket.total += 1;
-      bucket.queued += isQueued ? 1 : 0;
-      bucket.failed += isQueued ? 0 : 1;
-      bucket.accepted += classification.accepted ? 1 : 0;
-      bucket.delivered += classification.delivered ? 1 : 0;
-      bucket.pending += classification.pending ? 1 : 0;
-      bucket.terminalFailed += classification.terminalFailed ? 1 : 0;
-      bucket.recipients += recipientCount;
-    }
-
-    const domainBucket = byDomain.get(domainName) || {
-      domain: domainName,
-      total: 0,
-      queued: 0,
-      failed: 0,
-      accepted: 0,
-      delivered: 0,
-      pending: 0,
-      terminalFailed: 0,
-      recipients: 0
-    };
-    domainBucket.total += 1;
-    domainBucket.queued += isQueued ? 1 : 0;
-    domainBucket.failed += isQueued ? 0 : 1;
-    domainBucket.accepted += classification.accepted ? 1 : 0;
-    domainBucket.delivered += classification.delivered ? 1 : 0;
-    domainBucket.pending += classification.pending ? 1 : 0;
-    domainBucket.terminalFailed += classification.terminalFailed ? 1 : 0;
-    domainBucket.recipients += recipientCount;
-    byDomain.set(domainName, domainBucket);
-
-    hourly[hour].total += 1;
-    hourly[hour].queued += isQueued ? 1 : 0;
-    hourly[hour].failed += isQueued ? 0 : 1;
-    hourly[hour].accepted += classification.accepted ? 1 : 0;
-    hourly[hour].delivered += classification.delivered ? 1 : 0;
-    hourly[hour].pending += classification.pending ? 1 : 0;
-    hourly[hour].terminalFailed += classification.terminalFailed ? 1 : 0;
+  const dayRows = database
+    .prepare(`
+      SELECT substr(e.created_at, 1, 10) AS day, ${aggregateColumns}
+      FROM send_events e
+      WHERE e.user_id = ? AND e.created_at >= ?
+      GROUP BY substr(e.created_at, 1, 10)
+    `)
+    .all(userId, sinceIso);
+  for (const row of dayRows) {
+    if (!dayBuckets.has(row.day)) continue;
+    dayBuckets.set(row.day, { day: row.day, ...analyticsAggregateRow(row) });
   }
 
-  const recentFailures = [...rows]
-    .reverse()
-    .filter((row) => isDeliveryFailureStatus(row.status))
-    .slice(0, 8)
+  const byStatus = database
+    .prepare(`
+      SELECT ${status} AS status, COUNT(*) AS total
+      FROM send_events e
+      WHERE e.user_id = ? AND e.created_at >= ?
+      GROUP BY ${status}
+      ORDER BY total DESC, status ASC
+    `)
+    .all(userId, sinceIso)
+    .map((row) => ({ status: row.status, total: Number(row.total || 0) }));
+
+  const domainName = `COALESCE(
+    NULLIF(d.domain, ''),
+    CASE WHEN instr(e.sender, '@') > 0 THEN substr(e.sender, instr(e.sender, '@') + 1) ELSE 'unknown' END
+  )`;
+  const byDomain = database
+    .prepare(`
+      SELECT ${domainName} AS domain, ${aggregateColumns}
+      FROM send_events e
+      LEFT JOIN domains d ON d.id = e.domain_id
+      WHERE e.user_id = ? AND e.created_at >= ?
+      GROUP BY ${domainName}
+      ORDER BY total DESC, domain ASC
+      LIMIT 10
+    `)
+    .all(userId, sinceIso)
+    .map((row) => ({ domain: row.domain, ...analyticsAggregateRow(row) }));
+
+  const hourlyRows = database
+    .prepare(`
+      SELECT CAST(strftime('%H', e.created_at) AS INTEGER) AS hour, ${aggregateColumns}
+      FROM send_events e
+      WHERE e.user_id = ? AND e.created_at >= ?
+      GROUP BY CAST(strftime('%H', e.created_at) AS INTEGER)
+    `)
+    .all(userId, sinceIso);
+  for (const row of hourlyRows) {
+    const hour = Number(row.hour);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+    hourly[hour] = { hour, ...analyticsAggregateRow(row) };
+  }
+
+  const failureReason = `normalize_failure_reason(e.detail, ${status})`;
+  const failureReasons = database
+    .prepare(`
+      WITH failures AS (
+        SELECT ${failureReason} AS reason, ${status} AS status, e.created_at
+        FROM send_events e
+        WHERE e.user_id = ? AND e.created_at >= ?
+          AND ${status} IN ('deferred', 'bounced', 'failed')
+      ), grouped AS (
+        SELECT reason, status, COUNT(*) AS total, MAX(created_at) AS last_seen_at
+        FROM failures
+        GROUP BY reason, status
+      )
+      SELECT
+        reason,
+        SUM(total) AS total,
+        json_group_object(status, total) AS statuses,
+        MAX(last_seen_at) AS last_seen_at
+      FROM grouped
+      GROUP BY reason
+      ORDER BY total DESC, last_seen_at DESC
+      LIMIT 10
+    `)
+    .all(userId, sinceIso)
+    .map((row) => ({
+      reason: row.reason,
+      total: Number(row.total || 0),
+      statuses: safeJson(row.statuses, {}),
+      lastSeenAt: row.last_seen_at
+    }));
+
+  const recentFailures = database
+    .prepare(`
+      SELECT e.id, d.domain, e.sender, e.subject, e.detail, e.created_at
+      FROM send_events e
+      LEFT JOIN domains d ON d.id = e.domain_id
+      WHERE e.user_id = ? AND e.created_at >= ?
+        AND ${status} IN ('deferred', 'bounced', 'failed')
+      ORDER BY e.created_at DESC, e.id DESC
+      LIMIT 8
+    `)
+    .all(userId, sinceIso)
     .map((row) => ({
       id: row.id,
       domain: row.domain || '',
@@ -1555,46 +1917,207 @@ export function getSendAnalytics(userId, { days = 7 } = {}) {
       detail: row.detail,
       createdAt: row.created_at
     }));
+  const engagementAnalytics = buildEngagementAnalytics(userId, {
+    since: sinceIso,
+    windowDays,
+    trackingSecret
+  });
 
   return {
     windowDays,
     summary: {
-      total: rows.length,
-      submitted: rows.length,
-      queued,
-      failed,
-      accepted,
-      delivered,
-      pending,
-      deferred,
-      bounced,
-      terminalFailed,
-      recipients,
-      today,
-      last7Days,
-      successRate: percent(queued, rows.length),
-      acceptanceRate: percent(accepted, rows.length),
-      deliveryRate: percent(delivered, rows.length),
-      failureRate: percent(terminalFailed, rows.length),
+      ...summary,
+      submitted: summary.total,
+      today: Number(summaryRow?.today || 0),
+      last7Days: Number(summaryRow?.last_7_days || 0),
+      successRate: percent(summary.queued, summary.total),
+      acceptanceRate: percent(summary.accepted, summary.total),
+      deliveryRate: percent(summary.delivered, summary.total),
+      failureRate: percent(summary.terminalFailed, summary.total),
       domains: domains.length,
       verifiedDomains: domains.filter((domain) => domain.status?.verified).length
     },
     deliveryFunnel: [
-      { stage: 'submitted', total: rows.length, rate: percent(rows.length, rows.length) },
-      { stage: 'accepted', total: accepted, rate: percent(accepted, rows.length) },
-      { stage: 'delivered', total: delivered, rate: percent(delivered, rows.length) },
-      { stage: 'pending', total: pending, rate: percent(pending, rows.length) },
-      { stage: 'failed', total: terminalFailed, rate: percent(terminalFailed, rows.length) }
+      { stage: 'submitted', total: summary.total, rate: percent(summary.total, summary.total) },
+      { stage: 'accepted', total: summary.accepted, rate: percent(summary.accepted, summary.total) },
+      { stage: 'delivered', total: summary.delivered, rate: percent(summary.delivered, summary.total) },
+      { stage: 'pending', total: summary.pending, rate: percent(summary.pending, summary.total) },
+      { stage: 'failed', total: summary.terminalFailed, rate: percent(summary.terminalFailed, summary.total) }
     ],
     byDay: [...dayBuckets.values()],
-    byDomain: [...byDomain.values()].sort((a, b) => b.total - a.total).slice(0, 10),
-    byStatus: Object.entries(byStatus).map(([status, total]) => ({ status, total })),
+    byDomain,
+    byStatus,
     hourly,
-    failureReasons: [...failureReasons.values()]
-      .sort((a, b) => b.total - a.total || String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)))
-      .slice(0, 10),
+    ...engagementAnalytics,
+    failureReasons,
     recentFailures
   };
+}
+
+function analyticsAggregateRow(row) {
+  return {
+    total: Number(row?.total || 0),
+    queued: Number(row?.queued || 0),
+    failed: Number(row?.failed || 0),
+    accepted: Number(row?.accepted || 0),
+    delivered: Number(row?.delivered || 0),
+    pending: Number(row?.pending || 0),
+    deferred: Number(row?.deferred || 0),
+    bounced: Number(row?.bounced || 0),
+    terminalFailed: Number(row?.terminal_failed || 0),
+    recipients: Number(row?.recipients || 0)
+  };
+}
+
+function buildEngagementAnalytics(userId, { since, windowDays, trackingSecret }) {
+  const database = requireDb();
+  const deliveredCte = `
+    WITH delivered AS (
+      SELECT e.id
+      FROM send_events e
+      WHERE e.user_id = ?
+        AND e.created_at >= ?
+        AND (e.tracking_opens = 'true' OR e.tracking_clicks = 'true')
+        AND (
+          e.status = 'sent'
+          OR EXISTS (
+            SELECT 1
+            FROM json_each(
+              CASE WHEN json_valid(e.delivery_attempts_json) THEN e.delivery_attempts_json ELSE '[]' END
+            ) attempt
+            WHERE json_extract(attempt.value, '$.status') = 'sent'
+          )
+        )
+    )
+  `;
+  const summary = database
+    .prepare(`
+      ${deliveredCte}
+      SELECT
+        (SELECT COUNT(*) FROM delivered) AS tracked_delivered,
+        COALESCE(SUM(CASE WHEN te.event_type = 'open' AND te.source != 'scanner' THEN 1 ELSE 0 END), 0) AS total_opens,
+        COUNT(DISTINCT CASE
+          WHEN (te.event_type = 'open' AND te.source != 'scanner')
+            OR (te.event_type = 'click' AND te.source = 'direct')
+          THEN te.send_event_id END
+        ) AS unique_opens,
+        COALESCE(SUM(CASE WHEN te.event_type = 'open' AND te.source = 'proxy' THEN 1 ELSE 0 END), 0) AS proxy_opens,
+        COALESCE(SUM(CASE WHEN te.event_type = 'click' AND te.source = 'direct' THEN 1 ELSE 0 END), 0) AS total_clicks,
+        COUNT(DISTINCT CASE
+          WHEN te.event_type = 'click' AND te.source = 'direct' THEN te.send_event_id END
+        ) AS unique_clicks,
+        COALESCE(SUM(CASE WHEN te.source = 'scanner' THEN 1 ELSE 0 END), 0) AS scanner_events
+      FROM tracking_events te
+      JOIN delivered d ON d.id = te.send_event_id
+    `)
+    .get(userId, since);
+  const trackedDelivered = Number(summary?.tracked_delivered || 0);
+  const uniqueOpens = Number(summary?.unique_opens || 0);
+  const uniqueClicks = Number(summary?.unique_clicks || 0);
+  const engagement = {
+    trackedDelivered,
+    totalOpens: Number(summary?.total_opens || 0),
+    uniqueOpens,
+    proxyOpens: Number(summary?.proxy_opens || 0),
+    totalClicks: Number(summary?.total_clicks || 0),
+    uniqueClicks,
+    scannerEvents: Number(summary?.scanner_events || 0),
+    openRate: percent(uniqueOpens, trackedDelivered),
+    clickRate: percent(uniqueClicks, trackedDelivered),
+    clickToOpenRate: percent(uniqueClicks, uniqueOpens)
+  };
+
+  const engagementByDay = buildEngagementDayBuckets(windowDays);
+  const dayRows = database
+    .prepare(`
+      ${deliveredCte}
+      SELECT
+        substr(te.occurred_at, 1, 10) AS day,
+        SUM(CASE WHEN te.event_type = 'open' AND te.source != 'scanner' THEN 1 ELSE 0 END) AS opens,
+        COUNT(DISTINCT CASE
+          WHEN (te.event_type = 'open' AND te.source != 'scanner')
+            OR (te.event_type = 'click' AND te.source = 'direct')
+          THEN te.send_event_id END
+        ) AS unique_opens,
+        SUM(CASE WHEN te.event_type = 'click' AND te.source = 'direct' THEN 1 ELSE 0 END) AS clicks,
+        COUNT(DISTINCT CASE
+          WHEN te.event_type = 'click' AND te.source = 'direct' THEN te.send_event_id END
+        ) AS unique_clicks,
+        SUM(CASE WHEN te.source = 'scanner' THEN 1 ELSE 0 END) AS scanner_events
+      FROM tracking_events te
+      JOIN delivered d ON d.id = te.send_event_id
+      WHERE te.occurred_at >= ?
+      GROUP BY substr(te.occurred_at, 1, 10)
+    `)
+    .all(userId, since, since);
+  for (const row of dayRows) {
+    if (!engagementByDay.has(row.day)) continue;
+    engagementByDay.set(row.day, {
+      day: row.day,
+      opens: Number(row.opens || 0),
+      uniqueOpens: Number(row.unique_opens || 0),
+      clicks: Number(row.clicks || 0),
+      uniqueClicks: Number(row.unique_clicks || 0),
+      scannerEvents: Number(row.scanner_events || 0)
+    });
+  }
+
+  const topLinks = database
+    .prepare(`
+      ${deliveredCte}
+      SELECT
+        tl.target_fingerprint,
+        MIN(tl.target_ciphertext) AS target_ciphertext,
+        MIN(tl.target_origin) AS target_origin,
+        COUNT(*) AS clicks,
+        COUNT(DISTINCT te.send_event_id) AS unique_clicks,
+        MAX(te.occurred_at) AS last_clicked_at
+      FROM tracking_events te
+      JOIN delivered d ON d.id = te.send_event_id
+      JOIN tracking_links tl ON tl.id = te.tracking_link_id
+      WHERE te.event_type = 'click' AND te.source = 'direct' AND te.occurred_at >= ?
+      GROUP BY tl.target_fingerprint
+      ORDER BY clicks DESC, last_clicked_at DESC
+      LIMIT 20
+    `)
+    .all(userId, since, since)
+    .map((row) => ({
+      fingerprint: row.target_fingerprint,
+      target: decryptTrackingTargetForOwner(row.target_ciphertext, row.target_origin, trackingSecret),
+      targetOrigin: row.target_origin,
+      clicks: Number(row.clicks || 0),
+      uniqueClicks: Number(row.unique_clicks || 0),
+      lastClickedAt: row.last_clicked_at
+    }));
+
+  return {
+    engagement,
+    engagementByDay: [...engagementByDay.values()],
+    topLinks
+  };
+}
+
+function buildEngagementDayBuckets(days) {
+  const buckets = new Map();
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+  for (let index = 0; index < days; index += 1) {
+    const date = new Date(start);
+    date.setUTCDate(date.getUTCDate() + index);
+    const day = date.toISOString().slice(0, 10);
+    buckets.set(day, { day, opens: 0, uniqueOpens: 0, clicks: 0, uniqueClicks: 0, scannerEvents: 0 });
+  }
+  return buckets;
+}
+
+function decryptTrackingTargetForOwner(ciphertext, fallback, trackingSecret) {
+  if (!trackingSecret) return fallback || '';
+  try {
+    return decryptTrackingTarget(ciphertext, trackingSecret);
+  } catch {
+    return fallback || '';
+  }
 }
 
 export function listSmtpCredentials(userId, { includePassword = false, includeSecret = false } = {}) {
@@ -1928,7 +2451,8 @@ export function saveSettings(patch) {
     'defaultSpfMechanisms',
     'dmarcPolicy',
     'dmarcRua',
-    'sendRequiresVerified'
+    'sendRequiresVerified',
+    'engagementTrackingEnabled'
   ]);
   const updatedAt = now();
   for (const [key, value] of Object.entries(patch)) {
@@ -2318,8 +2842,160 @@ function publicSendEvent(row) {
     queueId: row.queue_id,
     deliveryLog: safeJson(row.delivery_log_json, []),
     deliveryAttempts: safeJson(row.delivery_attempts_json, []),
+    tracking: {
+      enabled: row.tracking_opens === 'true' || row.tracking_clicks === 'true',
+      opens: row.tracking_opens === 'true',
+      clicks: row.tracking_clicks === 'true',
+      messageLevel: safeJson(row.recipients, []).length > 1
+    },
     deliveredAt: row.delivered_at,
     createdAt: row.created_at
+  };
+}
+
+function publicTrackingLink(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    sendEventId: row.send_event_id,
+    userId: row.user_id,
+    domainId: row.domain_id,
+    domain: row.domain || '',
+    sender: row.sender,
+    recipients: safeJson(row.recipients, []),
+    subject: row.subject,
+    status: row.status,
+    trackingClicks: row.tracking_clicks === 'true',
+    targetCiphertext: row.target_ciphertext,
+    targetFingerprint: row.target_fingerprint,
+    targetOrigin: row.target_origin,
+    createdAt: row.created_at
+  };
+}
+
+function listTrackingEventsForSendEvent(sendEventId, limit = 500) {
+  return requireDb()
+    .prepare(`
+      SELECT recent.*, tl.target_origin
+      FROM (
+        SELECT *
+        FROM tracking_events
+        WHERE send_event_id = ?
+        ORDER BY occurred_at DESC, id DESC
+        LIMIT ?
+      ) recent
+      LEFT JOIN tracking_links tl ON tl.id = recent.tracking_link_id
+      ORDER BY recent.occurred_at ASC, recent.id ASC
+    `)
+    .all(sendEventId, limit)
+    .map(publicTrackingEvent);
+}
+
+function listTrackingAggregates(sendEventIds) {
+  const ids = [...new Set(sendEventIds.map(Number).filter(Number.isInteger))];
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => '?').join(', ');
+  const rows = requireDb()
+    .prepare(`
+      SELECT
+        send_event_id,
+        COUNT(*) AS event_count,
+        SUM(CASE WHEN event_type = 'open' AND source != 'scanner' THEN 1 ELSE 0 END) AS total_opens,
+        SUM(CASE WHEN event_type = 'click' AND source = 'direct' THEN 1 ELSE 0 END) AS total_clicks,
+        SUM(CASE WHEN event_type = 'open' AND source = 'proxy' THEN 1 ELSE 0 END) AS proxy_opens,
+        SUM(CASE WHEN source = 'scanner' THEN 1 ELSE 0 END) AS scanner_events,
+        MIN(CASE
+          WHEN (event_type = 'open' AND source != 'scanner') OR (event_type = 'click' AND source = 'direct')
+          THEN occurred_at END
+        ) AS first_opened_at,
+        MAX(CASE
+          WHEN (event_type = 'open' AND source != 'scanner') OR (event_type = 'click' AND source = 'direct')
+          THEN occurred_at END
+        ) AS last_opened_at,
+        MIN(CASE WHEN event_type = 'click' AND source = 'direct' THEN occurred_at END) AS first_clicked_at,
+        MAX(CASE WHEN event_type = 'click' AND source = 'direct' THEN occurred_at END) AS last_clicked_at
+      FROM tracking_events
+      WHERE send_event_id IN (${placeholders})
+      GROUP BY send_event_id
+    `)
+    .all(...ids);
+  return new Map(rows.map((row) => {
+    const totalOpens = Number(row.total_opens || 0);
+    const totalClicks = Number(row.total_clicks || 0);
+    return [row.send_event_id, {
+      eventCount: Number(row.event_count || 0),
+      summary: {
+        totalOpens,
+        totalClicks,
+        uniqueOpen: totalOpens > 0 || totalClicks > 0,
+        uniqueClick: totalClicks > 0,
+        proxyOpens: Number(row.proxy_opens || 0),
+        scannerEvents: Number(row.scanner_events || 0),
+        firstOpenedAt: row.first_opened_at || null,
+        lastOpenedAt: row.last_opened_at || null,
+        firstClickedAt: row.first_clicked_at || null,
+        lastClickedAt: row.last_clicked_at || null
+      }
+    }];
+  }));
+}
+
+function emptyTrackingSummary() {
+  return {
+    totalOpens: 0,
+    totalClicks: 0,
+    uniqueOpen: false,
+    uniqueClick: false,
+    proxyOpens: 0,
+    scannerEvents: 0,
+    firstOpenedAt: null,
+    lastOpenedAt: null,
+    firstClickedAt: null,
+    lastClickedAt: null
+  };
+}
+
+function countTrackingLinksForSendEvent(sendEventId) {
+  return Number(requireDb().prepare('SELECT COUNT(*) AS total FROM tracking_links WHERE send_event_id = ?').get(sendEventId)?.total || 0);
+}
+
+function listTrackingLinksForSendEvent(sendEventId, trackingSecret, limit = 200) {
+  return requireDb()
+    .prepare(`
+      SELECT
+        tl.*,
+        SUM(CASE WHEN te.event_type = 'click' AND te.source = 'direct' THEN 1 ELSE 0 END) AS clicks,
+        MIN(CASE WHEN te.event_type = 'click' AND te.source = 'direct' THEN te.occurred_at END) AS first_clicked_at,
+        MAX(CASE WHEN te.event_type = 'click' AND te.source = 'direct' THEN te.occurred_at END) AS last_clicked_at
+      FROM tracking_links tl
+      LEFT JOIN tracking_events te ON te.tracking_link_id = tl.id
+      WHERE tl.send_event_id = ?
+      GROUP BY tl.id
+      ORDER BY clicks DESC, last_clicked_at DESC, tl.id ASC
+      LIMIT ?
+    `)
+    .all(sendEventId, limit)
+    .map((row) => ({
+      id: row.id,
+      target: decryptTrackingTargetForOwner(row.target_ciphertext, row.target_origin, trackingSecret),
+      targetOrigin: row.target_origin,
+      clicks: Number(row.clicks || 0),
+      firstClickedAt: row.first_clicked_at,
+      lastClickedAt: row.last_clicked_at
+    }));
+}
+
+function publicTrackingEvent(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    sendEventId: row.send_event_id,
+    trackingLinkId: row.tracking_link_id,
+    eventType: row.event_type,
+    source: row.source,
+    occurredAt: row.occurred_at,
+    userAgent: row.user_agent,
+    targetOrigin: row.target_origin || ''
   };
 }
 
@@ -2456,6 +3132,21 @@ function boolString(value) {
   return value === true || String(value).toLowerCase() === 'true' ? 'true' : 'false';
 }
 
+function normalizeTrackingSource(value) {
+  const source = String(value || '').toLowerCase();
+  return ['direct', 'proxy', 'scanner'].includes(source) ? source : 'direct';
+}
+
+function normalizeIsoDate(value) {
+  const date = new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) throw new Error('Invalid tracking event time.');
+  return date.toISOString();
+}
+
+function isQualifyingTrackingEvent(eventType, source) {
+  return eventType === 'click' ? source === 'direct' : source !== 'scanner';
+}
+
 function normalizeProvider(value) {
   const provider = String(value || '').trim().toLowerCase();
   return ['cloudflare', 'aliyun', 'dnspod'].includes(provider) ? provider : '';
@@ -2509,41 +3200,6 @@ function buildDayBuckets(days) {
 
 function percent(part, total) {
   return total ? Math.round((Number(part || 0) / total) * 1000) / 10 : 0;
-}
-
-function classifySendEvent(row) {
-  const status = String(row?.status || '').toLowerCase();
-  const hasQueueId = Boolean(normalizeQueueId(row?.queue_id));
-  const accepted = hasQueueId || ['queued', 'sent', 'deferred', 'bounced'].includes(status);
-  return {
-    status,
-    accepted,
-    delivered: status === 'sent',
-    pending: status === 'queued' || status === 'deferred',
-    deferred: status === 'deferred',
-    bounced: status === 'bounced',
-    terminalFailed: status === 'bounced' || status === 'failed'
-  };
-}
-
-function normalizeFailureReason(row) {
-  const detail = String(row?.detail || '').replace(/\s+/g, ' ').trim();
-  return detail || String(row?.status || 'unknown failure');
-}
-
-function addFailureReason(map, row) {
-  const reason = normalizeFailureReason(row);
-  const status = String(row?.status || 'unknown').toLowerCase();
-  const bucket = map.get(reason) || {
-    reason,
-    total: 0,
-    statuses: {},
-    lastSeenAt: row?.created_at || ''
-  };
-  bucket.total += 1;
-  bucket.statuses[status] = (bucket.statuses[status] || 0) + 1;
-  if (row?.created_at && row.created_at > bucket.lastSeenAt) bucket.lastSeenAt = row.created_at;
-  map.set(reason, bucket);
 }
 
 function safeJson(value, fallback) {
@@ -2664,10 +3320,6 @@ function deliveryAttemptDetail(attempt) {
     attempt.dsn ? `dsn=${attempt.dsn}` : ''
   ].filter(Boolean);
   return `${parts.join(' ')}${attempt.response ? `; ${attempt.response}` : ''}`;
-}
-
-function isDeliveryFailureStatus(status) {
-  return ['deferred', 'bounced', 'failed'].includes(String(status || '').toLowerCase());
 }
 
 function now() {

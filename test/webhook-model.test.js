@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { test } from 'node:test';
 
 import {
+  WEBHOOK_EVENTS,
   TERMINAL_WEBHOOK_EVENTS,
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_LEASE_MS,
@@ -20,8 +21,17 @@ test('maps terminal statuses to email.* types', () => {
   assert.equal(eventTypeForStatus('sent'), 'email.sent');
   assert.equal(eventTypeForStatus('bounced'), 'email.bounced');
   assert.equal(eventTypeForStatus('failed'), 'email.failed');
+  assert.equal(eventTypeForStatus('opened'), 'email.opened');
+  assert.equal(eventTypeForStatus('clicked'), 'email.clicked');
   assert.equal(eventTypeForStatus('queued'), null);
   assert.equal(eventTypeForStatus('deferred'), null);
+});
+
+test('supports opened and clicked subscriptions without making them delivery terminal statuses', () => {
+  assert.deepEqual(WEBHOOK_EVENTS, ['sent', 'bounced', 'failed', 'opened', 'clicked']);
+  assert.equal(isTerminalWebhookStatus('opened'), false);
+  assert.equal(isTerminalWebhookStatus('clicked'), false);
+  assert.deepEqual(normalizeWebhookEvents(['clicked', 'opened', 'sent']), ['sent', 'opened', 'clicked']);
 });
 
 test('isTerminalWebhookStatus matches terminal set', () => {
@@ -117,6 +127,39 @@ test('builds webhook payload for real and test deliveries', () => {
   assert.equal(synthetic.data.message_id, 'mh-test');
   assert.equal(synthetic.data.send_event_id, 0);
   assert.equal(synthetic.type, 'email.failed');
+});
+
+test('builds private engagement webhook payloads without full click destinations', () => {
+  const payload = buildWebhookPayload({
+    deliveryId: 51,
+    eventType: 'email.clicked',
+    createdAt: '2026-07-09T12:00:00.000Z',
+    sendEvent: {
+      id: 8,
+      status: 'sent',
+      domain: 'example.com',
+      sender: 'noreply@example.com',
+      recipients: ['reader@example.net'],
+      subject: 'Tracked'
+    },
+    engagement: {
+      type: 'click',
+      occurredAt: '2026-07-09T12:00:00.000Z',
+      source: 'direct',
+      linkId: 4,
+      targetOrigin: 'https://example.net'
+    }
+  });
+
+  assert.equal(payload.type, 'email.clicked');
+  assert.deepEqual(payload.data.engagement, {
+    type: 'click',
+    occurred_at: '2026-07-09T12:00:00.000Z',
+    source: 'direct',
+    link_id: 4,
+    target_origin: 'https://example.net'
+  });
+  assert.equal(JSON.stringify(payload).includes('token='), false);
 });
 
 test('signs body with Stripe-style t and v1', () => {

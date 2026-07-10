@@ -1,13 +1,27 @@
 import net from 'node:net';
 import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
-import { getDomainByName, logSendEvent, verifySmtpCredential } from './db.js';
+import {
+  createSendEvent,
+  createTrackingLink,
+  finalizeSendEvent,
+  getDomainByName,
+  logSendEvent,
+  verifySmtpCredential
+} from './db.js';
 import {
   domainFromAddress,
   extractAddress,
   sendViaSmtp,
   signMessageForDomain
 } from './mailer.js';
+import {
+  createTrackingToken,
+  encryptTrackingTarget,
+  instrumentRawMime,
+  stripRawMimeHeaders,
+  trackingTargetFingerprint
+} from './tracking.js';
 
 const implicitTlsDetectTimeoutMs = 300;
 
@@ -33,6 +47,37 @@ export function startSubmissionServer(config) {
     servers.push(server);
   }
   return servers;
+}
+
+export function resolveSubmissionTracking(rawMessage, defaultEnabled = false) {
+  const control = extractHeader(String(rawMessage || ''), 'x-mailhub-track').trim().toLowerCase();
+  if (!control) {
+    const enabled = Boolean(defaultEnabled);
+    return { enabled, opens: enabled, clicks: enabled, explicit: false };
+  }
+  if (['off', 'false', 'none', '0'].includes(control)) {
+    return { enabled: false, opens: false, clicks: false, explicit: true };
+  }
+  const values = new Set(control.split(/[\s,]+/).filter(Boolean));
+  const opens = values.has('open') || values.has('opens');
+  const clicks = values.has('click') || values.has('clicks');
+  return { enabled: opens || clicks, opens, clicks, explicit: true };
+}
+
+function createSubmissionClickUrl({ appBaseUrl, secret, userId, eventId, target }) {
+  const normalizedTarget = new URL(target).toString();
+  const token = createTrackingToken();
+  createTrackingLink(userId, eventId, {
+    token,
+    targetCiphertext: encryptTrackingTarget(normalizedTarget, secret),
+    targetFingerprint: trackingTargetFingerprint(normalizedTarget, secret),
+    targetOrigin: new URL(normalizedTarget).origin
+  });
+  return `${trackingUrlBase(appBaseUrl)}/t/c/${token}`;
+}
+
+function trackingUrlBase(value) {
+  return String(value || '').replace(/\/+$/, '');
 }
 
 function loadTlsMaterial(config) {
@@ -355,8 +400,48 @@ class SubmissionSession {
       return this.write(550, 'Sender domain is not configured in MailHub');
     }
 
+    const trackingSettings = this.config.getTrackingSettings?.() || {};
+    const requestedTracking = resolveSubmissionTracking(rawMessage, trackingSettings.enabled);
+    const trackingAvailable = Boolean(trackingSettings.appBaseUrl && trackingSettings.secret);
+    const requestedOpens = requestedTracking.opens && trackingAvailable;
+    const requestedClicks = requestedTracking.clicks && trackingAvailable;
+    const openToken = requestedOpens ? createTrackingToken() : '';
+    const eventId = createSendEvent({
+      userId: this.user.id,
+      domainId: domain.id,
+      sender: sender || this.mailFrom,
+      recipients: this.recipients,
+      subject,
+      trackingToken: openToken,
+      trackingOpens: requestedOpens,
+      trackingClicks: requestedClicks
+    });
+
     try {
-      const signed = signMessageForDomain(rawMessage, domain);
+      let preparedMessage = rawMessage;
+      let trackingOpens = false;
+      let trackingClicks = false;
+      if (requestedOpens || requestedClicks) {
+        const result = await instrumentRawMime(preparedMessage, {
+          openPixelUrl: requestedOpens
+            ? `${trackingUrlBase(trackingSettings.appBaseUrl)}/t/o/${openToken}.gif`
+            : '',
+          createClickUrl: requestedClicks
+            ? (target) => createSubmissionClickUrl({
+                appBaseUrl: trackingSettings.appBaseUrl,
+                secret: trackingSettings.secret,
+                userId: this.user.id,
+                eventId,
+                target
+              })
+            : null
+        });
+        preparedMessage = result.rawMessage;
+        trackingOpens = requestedOpens && result.pixelAdded;
+        trackingClicks = requestedClicks && result.linkCount > 0;
+      }
+      preparedMessage = await stripRawMimeHeaders(preparedMessage, ['x-mailhub-track']);
+      const signed = signMessageForDomain(preparedMessage, domain);
       const smtpResult = await sendViaSmtp({
         host: this.config.relayHost,
         port: this.config.relayPort,
@@ -368,26 +453,18 @@ class SubmissionSession {
         recipients: this.recipients,
         rawMessage: signed
       });
-      logSendEvent({
-        userId: this.user.id,
-        domainId: domain.id,
-        sender: sender || this.mailFrom,
-        recipients: this.recipients,
-        subject,
+      finalizeSendEvent(eventId, this.user.id, {
         status: 'queued',
         detail: `submission ${this.remoteAddress}; ${smtpResult.message}`,
         queueId: smtpResult.queueId,
-        deliveryLog: smtpResult.deliveryLog
+        deliveryLog: smtpResult.deliveryLog,
+        trackingOpens,
+        trackingClicks
       });
       this.resetEnvelope(false);
       return this.write(250, 'Message queued');
     } catch (error) {
-      logSendEvent({
-        userId: this.user.id,
-        domainId: domain.id,
-        sender: sender || this.mailFrom,
-        recipients: this.recipients,
-        subject,
+      finalizeSendEvent(eventId, this.user.id, {
         status: 'failed',
         detail: `submission ${this.remoteAddress}; ${error.message}`,
         deliveryLog: deliveryLogFromError(error)

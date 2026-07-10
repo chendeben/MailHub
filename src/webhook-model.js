@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 export const TERMINAL_WEBHOOK_EVENTS = ['sent', 'bounced', 'failed'];
+export const WEBHOOK_EVENTS = [...TERMINAL_WEBHOOK_EVENTS, 'opened', 'clicked'];
 export const MAX_WEBHOOK_ATTEMPTS = 8;
 export const WEBHOOK_LEASE_MS = 2 * 60 * 1000;
 
@@ -21,6 +22,8 @@ export function eventTypeForStatus(status) {
   if (status === 'sent') return 'email.sent';
   if (status === 'bounced') return 'email.bounced';
   if (status === 'failed') return 'email.failed';
+  if (status === 'opened') return 'email.opened';
+  if (status === 'clicked') return 'email.clicked';
   return null;
 }
 
@@ -42,11 +45,14 @@ export function resolveWebhooksForEvent({ accountWebhooks, domainWebhooks, event
   return matches(accountWebhooks);
 }
 
-export function buildWebhookPayload({ deliveryId, eventType, createdAt, sendEvent, test = false }) {
+export function buildWebhookPayload({ deliveryId, eventType, createdAt, sendEvent, engagement = null, test = false }) {
   const status = sendEvent.status;
+  const externalType = String(eventType || '').startsWith('email.')
+    ? eventType
+    : eventTypeForStatus(status) || eventType;
   return {
     id: `whd_${deliveryId}`,
-    type: eventTypeForStatus(status) || eventType,
+    type: externalType,
     created_at: createdAt,
     data: {
       ...(test ? { test: true } : {}),
@@ -59,7 +65,8 @@ export function buildWebhookPayload({ deliveryId, eventType, createdAt, sendEven
       to: sendEvent.recipients || [],
       subject: sendEvent.subject || '',
       detail: sendEvent.detail || '',
-      delivered_at: sendEvent.deliveredAt || null
+      delivered_at: sendEvent.deliveredAt || null,
+      ...(engagement ? { engagement: publicEngagement(engagement) } : {})
     }
   };
 }
@@ -87,20 +94,20 @@ export function nextBackoffMs(attemptCount) {
  */
 export function normalizeWebhookEvents(input) {
   if (!Array.isArray(input)) {
-    throw new Error('events must be a non-empty array of sent|bounced|failed');
+    throw webhookEventsError();
   }
-  const allowed = new Set(TERMINAL_WEBHOOK_EVENTS);
+  const allowed = new Set(WEBHOOK_EVENTS);
   const seen = new Set();
   for (const item of input) {
     if (!allowed.has(item)) {
-      throw new Error('events must be a non-empty array of sent|bounced|failed');
+      throw webhookEventsError();
     }
     seen.add(item);
   }
   if (seen.size === 0) {
-    throw new Error('events must be a non-empty array of sent|bounced|failed');
+    throw webhookEventsError();
   }
-  return TERMINAL_WEBHOOK_EVENTS.filter((e) => seen.has(e));
+  return WEBHOOK_EVENTS.filter((e) => seen.has(e));
 }
 
 export function parseWebhookEventsJson(json) {
@@ -108,7 +115,21 @@ export function parseWebhookEventsJson(json) {
   try {
     parsed = typeof json === 'string' ? JSON.parse(json) : json;
   } catch {
-    throw new Error('events must be a non-empty array of sent|bounced|failed');
+    throw webhookEventsError();
   }
   return normalizeWebhookEvents(parsed);
+}
+
+function publicEngagement(engagement) {
+  return {
+    type: engagement.type,
+    occurred_at: engagement.occurredAt,
+    source: engagement.source,
+    link_id: engagement.linkId ?? null,
+    target_origin: engagement.targetOrigin || ''
+  };
+}
+
+function webhookEventsError() {
+  return new Error('events must be a non-empty array of sent|bounced|failed|opened|clicked');
 }

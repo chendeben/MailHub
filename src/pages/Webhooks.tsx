@@ -44,7 +44,7 @@ import type {
   WebhookPayload
 } from '../frontend/types';
 
-const ALL_EVENTS: WebhookEvent[] = ['sent', 'bounced', 'failed'];
+const ALL_EVENTS: WebhookEvent[] = ['sent', 'bounced', 'failed', 'opened', 'clicked'];
 const DELIVERY_STATUSES: WebhookDeliveryStatus[] = ['pending', 'processing', 'success', 'dead'];
 
 interface WebhooksProps {
@@ -292,6 +292,8 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
     if (event === 'sent') return t('webhooks.eventSent');
     if (event === 'bounced') return t('webhooks.eventBounced');
     if (event === 'failed') return t('webhooks.eventFailed');
+    if (event === 'opened') return t('webhooks.eventOpened');
+    if (event === 'clicked') return t('webhooks.eventClicked');
     return event;
   }
 

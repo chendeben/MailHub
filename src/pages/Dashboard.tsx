@@ -1,4 +1,4 @@
-import { Area, Bar, Column, Pie } from '@ant-design/plots';
+import { Area, Bar, Column, Line, Pie } from '@ant-design/plots';
 import { Alert, Col, List, Progress, Row, Space, Table, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -11,8 +11,11 @@ import {
   buildDashboardSummary,
   buildDeliveryFunnel,
   buildDomainRanking,
+  buildEngagementSummary,
+  buildEngagementTrend,
   buildHourlyHeatmap,
   buildStatusDistribution,
+  buildTopLinks,
   buildTrendSeries
 } from '../frontend/analytics-model.js';
 import { buildDomainHealth } from '../frontend/domain-model.js';
@@ -44,6 +47,13 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
   const rankingData = buildDomainRanking(analytics);
   const hourlyData = buildHourlyHeatmap(analytics);
   const deliveryFunnel = buildDeliveryFunnel(analytics);
+  const engagement = buildEngagementSummary(analytics);
+  const engagementTrend = buildEngagementTrend(analytics);
+  const engagementTrendData = engagementTrend.flatMap((item) => [
+    { date: item.date, type: t('dashboard.opens'), value: item.opens },
+    { date: item.date, type: t('dashboard.clicks'), value: item.clicks }
+  ]);
+  const topLinks = buildTopLinks(analytics);
   const failureReasons = analytics?.failureReasons || [];
   const lastSentLabel = summary.lastSentAt
     ? new Date(summary.lastSentAt).toLocaleString()
@@ -60,6 +70,22 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
       render: (value) => (
         <StatusPill tone={statusTone(value)}>{statusLabel(value, t)}</StatusPill>
       )
+    }
+  ];
+  const linkColumns: ColumnsType<(typeof topLinks)[number]> = [
+    {
+      title: t('dashboard.link'),
+      dataIndex: 'target',
+      ellipsis: { showTitle: false },
+      render: (value) => <Typography.Text ellipsis={{ tooltip: value }}>{value || '-'}</Typography.Text>
+    },
+    { title: t('dashboard.uniqueClicks'), dataIndex: 'uniqueClicks', width: 110 },
+    { title: t('dashboard.totalClicks'), dataIndex: 'clicks', width: 100 },
+    {
+      title: t('dashboard.lastClicked'),
+      dataIndex: 'lastClickedAt',
+      width: 180,
+      render: (value) => value ? new Date(value).toLocaleString() : '-'
     }
   ];
 
@@ -100,6 +126,75 @@ export default function Dashboard({ analytics, domains, events, config, smtpCred
             tone={summary.dnsIssues > 0 ? 'warning' : 'default'}
             hint={summary.dnsIssues > 0 ? t('dashboard.dnsActionHint') : undefined}
           />
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]}>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label={t('dashboard.openRate')}
+            value={`${engagement.openRate}%`}
+            hint={`${engagement.uniqueOpens} ${t('dashboard.unique')} · ${engagement.totalOpens} ${t('dashboard.total')}`}
+          />
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label={t('dashboard.clickRate')}
+            value={`${engagement.clickRate}%`}
+            hint={`${engagement.uniqueClicks} ${t('dashboard.unique')} · ${engagement.totalClicks} ${t('dashboard.total')}`}
+          />
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label={t('dashboard.clickToOpenRate')}
+            value={`${engagement.clickToOpenRate}%`}
+            hint={`${t('dashboard.trackedDelivered')} ${engagement.trackedDelivered}`}
+          />
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label={t('dashboard.measuredActivity')}
+            value={engagement.totalOpens + engagement.totalClicks}
+            hint={`${t('dashboard.proxyOpens')} ${engagement.proxyOpens} · ${t('dashboard.scannerEvents')} ${engagement.scannerEvents}`}
+          />
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]}>
+        <Col xs={24} xl={15}>
+          <SectionCard title={t('dashboard.engagementTrend')} className="chart-card">
+            {engagementTrendData.some((item) => item.value > 0) ? (
+              <Line
+                data={engagementTrendData}
+                xField="date"
+                yField="value"
+                colorField="type"
+                height={300}
+                axis={{ y: { title: false }, x: { title: false } }}
+                scale={{ color: { range: [brandColors.chartPrimary, brandColors.chartSuccess] } }}
+                tooltip={{ title: 'date' }}
+                legend={{ color: { position: 'top' } }}
+              />
+            ) : (
+              <EmptyState description={t('dashboard.noEngagement')} />
+            )}
+          </SectionCard>
+        </Col>
+        <Col xs={24} xl={9}>
+          <SectionCard title={t('dashboard.topLinks')}>
+            {topLinks.length ? (
+              <Table
+                rowKey="fingerprint"
+                size="small"
+                columns={linkColumns}
+                dataSource={topLinks}
+                pagination={false}
+                scroll={{ x: 640 }}
+              />
+            ) : (
+              <EmptyState description={t('dashboard.noEngagement')} />
+            )}
+          </SectionCard>
         </Col>
       </Row>
 

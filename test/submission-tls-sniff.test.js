@@ -6,7 +6,7 @@ import path from 'node:path';
 import tls from 'node:tls';
 import { test } from 'node:test';
 
-import { startSubmissionServer } from '../src/submission.js';
+import { resolveSubmissionTracking, startSubmissionServer } from '../src/submission.js';
 
 const testCert = `-----BEGIN CERTIFICATE-----
 MIIDCTCCAfGgAwIBAgIUKFK3kjPk5eJZ2nsmLbEjfQZp5lQwDQYJKoZIhvcNAQEL
@@ -83,6 +83,33 @@ test('smtp listeners accept both plain SMTP and implicit TLS clients', async () 
   } finally {
     await closeServer(server);
   }
+});
+
+test('submission tracking honors defaults and explicit control headers', () => {
+  assert.deepEqual(resolveSubmissionTracking('Subject: A\r\n\r\nBody', false), {
+    enabled: false,
+    opens: false,
+    clicks: false,
+    explicit: false
+  });
+  assert.deepEqual(resolveSubmissionTracking('X-MailHub-Track: opens\r\n\r\nBody', false), {
+    enabled: true,
+    opens: true,
+    clicks: false,
+    explicit: true
+  });
+  assert.deepEqual(resolveSubmissionTracking('X-MailHub-Track: clicks, opens\r\n\r\nBody', false), {
+    enabled: true,
+    opens: true,
+    clicks: true,
+    explicit: true
+  });
+  assert.deepEqual(resolveSubmissionTracking('X-MailHub-Track: off\r\n\r\nBody', true), {
+    enabled: false,
+    opens: false,
+    clicks: false,
+    explicit: true
+  });
 });
 
 function waitForListening(server) {

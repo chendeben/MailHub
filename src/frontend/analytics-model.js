@@ -106,6 +106,55 @@ export function buildHourlyHeatmap(analytics = null) {
 }
 
 /**
+ * @param {any} [analytics]
+ */
+export function buildEngagementSummary(analytics = null) {
+  const engagement = analytics?.engagement || {};
+  return {
+    trackedDelivered: Number(engagement.trackedDelivered || 0),
+    totalOpens: Number(engagement.totalOpens || 0),
+    uniqueOpens: Number(engagement.uniqueOpens || 0),
+    proxyOpens: Number(engagement.proxyOpens || 0),
+    totalClicks: Number(engagement.totalClicks || 0),
+    uniqueClicks: Number(engagement.uniqueClicks || 0),
+    scannerEvents: Number(engagement.scannerEvents || 0),
+    openRate: Number(engagement.openRate || 0),
+    clickRate: Number(engagement.clickRate || 0),
+    clickToOpenRate: Number(engagement.clickToOpenRate || 0)
+  };
+}
+
+/**
+ * @param {any} [analytics]
+ * @returns {Array<{date: string; opens: number; uniqueOpens: number; clicks: number; uniqueClicks: number; scannerEvents: number}>}
+ */
+export function buildEngagementTrend(analytics = null) {
+  return (analytics?.engagementByDay || []).map((item) => ({
+    date: item.day || item.date,
+    opens: Number(item.opens || 0),
+    uniqueOpens: Number(item.uniqueOpens || 0),
+    clicks: Number(item.clicks || 0),
+    uniqueClicks: Number(item.uniqueClicks || 0),
+    scannerEvents: Number(item.scannerEvents || 0)
+  }));
+}
+
+/**
+ * @param {any} [analytics]
+ * @returns {Array<{fingerprint: string; target: string; targetOrigin: string; clicks: number; uniqueClicks: number; lastClickedAt: string}>}
+ */
+export function buildTopLinks(analytics = null) {
+  return (analytics?.topLinks || []).map((item) => ({
+    fingerprint: item.fingerprint || '',
+    target: item.target || item.targetOrigin || '',
+    targetOrigin: item.targetOrigin || '',
+    clicks: Number(item.clicks || 0),
+    uniqueClicks: Number(item.uniqueClicks || 0),
+    lastClickedAt: item.lastClickedAt || ''
+  }));
+}
+
+/**
  * @param {any} [event]
  * @returns {Array<{
  *   stage: string;
@@ -163,6 +212,21 @@ export function buildEventTimeline(event = null) {
       queueId: event.queueId
     });
   }
+  const trackingEvents = Array.isArray(event.tracking?.events) ? event.tracking.events : [];
+  for (const trackingEvent of trackingEvents) {
+    const stage = trackingEvent.eventType === 'click' ? 'clicked' : 'opened';
+    timeline.push({
+      stage,
+      at: trackingEvent.occurredAt || '',
+      tone: trackingEvent.source === 'scanner'
+        ? 'neutral'
+        : stage === 'clicked' ? 'success' : 'info',
+      status: trackingEvent.source,
+      source: trackingEvent.source,
+      targetOrigin: trackingEvent.targetOrigin || '',
+      trackingLinkId: trackingEvent.trackingLinkId ?? null
+    });
+  }
   const webhookDeliveries = Array.isArray(event.webhookDeliveries) ? event.webhookDeliveries : [];
   for (const delivery of webhookDeliveries) {
     timeline.push({
@@ -174,7 +238,26 @@ export function buildEventTimeline(event = null) {
       responseStatus: delivery.responseStatus
     });
   }
-  return timeline;
+  const stageOrder = {
+    submitted: 0,
+    accepted: 1,
+    delivered: 2,
+    pending: 2,
+    failed: 2,
+    opened: 3,
+    clicked: 4,
+    webhook: 5
+  };
+  return timeline
+    .map((item, index) => ({ item, index, time: Date.parse(item.at) }))
+    .sort((left, right) => {
+      const leftTime = Number.isNaN(left.time) ? Number.POSITIVE_INFINITY : left.time;
+      const rightTime = Number.isNaN(right.time) ? Number.POSITIVE_INFINITY : right.time;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      const stageDifference = (stageOrder[left.item.stage] ?? 99) - (stageOrder[right.item.stage] ?? 99);
+      return stageDifference || left.index - right.index;
+    })
+    .map(({ item }) => item);
 }
 
 function deliveryAttemptStage(status) {

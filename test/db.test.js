@@ -11,6 +11,8 @@ import {
   consumeAccountToken,
   createApiToken,
   createAccountToken,
+  createSendEvent,
+  createTrackingLink,
   createDomain,
   createUser,
   createUserWithAccountToken,
@@ -39,6 +41,8 @@ import {
   approveUser,
   markUserEmailVerified,
   previewUserMerge,
+  pruneTrackingEvents,
+  recordTrackingEvent,
   saveDnsCredential,
   saveSmtpRelay,
   saveSmtpCredential,
@@ -50,9 +54,18 @@ import {
   updateUser,
   updateUserStatus,
   executeUserMerge,
+  finalizeSendEvent,
+  findSendEventByTrackingToken,
+  findTrackingLinkByToken,
   verifyApiToken,
   verifySmtpCredential
 } from '../src/db.js';
+import {
+  createTrackingToken,
+  encryptTrackingTarget,
+  hashTrackingToken,
+  trackingTargetFingerprint
+} from '../src/tracking.js';
 
 test('migrates legacy data to the seeded admin user', () => {
   const dataDir = tempDataDir();
@@ -123,6 +136,377 @@ test('migrates legacy data to the seeded admin user', () => {
   assert.equal(listDomains(admin.id).length, 1);
   assert.equal(listSendEvents(admin.id).length, 1);
   assert.equal(getSmtpCredential(admin.id).username, 'legacy-smtp');
+});
+
+test('migrates legacy send events with engagement tracking disabled', () => {
+  const dataDir = tempDataDir();
+  const database = initDatabase(dataDir, 'test-secret');
+  const columns = database.prepare('PRAGMA table_info(send_events)').all().map((column) => column.name);
+  assert.equal(columns.includes('tracking_token_hash'), true);
+  assert.equal(columns.includes('tracking_opens'), true);
+  assert.equal(columns.includes('tracking_clicks'), true);
+  const tables = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tracking_links', 'tracking_events') ORDER BY name")
+    .all()
+    .map((row) => row.name);
+  assert.deepEqual(tables, ['tracking_events', 'tracking_links']);
+});
+
+test('creates and finalizes one tracked send event with a unique open token', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'tracked', email: 'tracked@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('tracked.example'));
+  const token = createTrackingToken();
+  const id = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@tracked.example',
+    recipients: ['reader@example.net'],
+    subject: 'Tracked',
+    trackingToken: token,
+    trackingOpens: true,
+    trackingClicks: true
+  });
+
+  const submitting = getSendEvent(user.id, id);
+  assert.equal(submitting.status, 'submitting');
+  assert.equal(submitting.tracking.enabled, true);
+  assert.equal(submitting.tracking.opens, true);
+  assert.equal(submitting.tracking.clicks, true);
+  assert.equal(findSendEventByTrackingToken(token).id, id);
+
+  const finalized = finalizeSendEvent(id, user.id, {
+    status: 'queued',
+    detail: 'queued as TRACK123',
+    queueId: 'TRACK123',
+    deliveryLog: [{ phase: 'queue', ok: true }]
+  });
+  assert.equal(finalized.status, 'queued');
+  assert.equal(finalized.queueId, 'TRACK123');
+
+  assert.throws(() => createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@tracked.example',
+    recipients: ['second@example.net'],
+    subject: 'Duplicate token',
+    trackingToken: token,
+    trackingOpens: true
+  }), /unique/i);
+});
+
+test('stores encrypted opaque tracking links and isolates creation by owner', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const alice = createUser({ username: 'track-alice', email: 'track-alice@example.com', password: 'password123' });
+  const bob = createUser({ username: 'track-bob', email: 'track-bob@example.com', password: 'password123' });
+  const domain = createDomain(alice.id, domainFixture('links.example'));
+  const eventId = createSendEvent({
+    userId: alice.id,
+    domainId: domain.id,
+    sender: 'sender@links.example',
+    recipients: ['reader@example.net'],
+    subject: 'Links',
+    trackingClicks: true
+  });
+  const token = createTrackingToken();
+  const target = 'https://example.net/reset?token=private';
+  const linkId = createTrackingLink(alice.id, eventId, {
+    token,
+    targetCiphertext: encryptTrackingTarget(target, 'tracking-secret'),
+    targetFingerprint: hashTrackingToken(`destination:${target}`),
+    targetOrigin: 'https://example.net'
+  });
+
+  const link = findTrackingLinkByToken(token);
+  assert.equal(link.id, linkId);
+  assert.equal(link.sendEventId, eventId);
+  assert.equal(link.userId, alice.id);
+  assert.equal(link.targetCiphertext.includes('private'), false);
+  assert.equal(link.targetOrigin, 'https://example.net');
+  const detail = getSendEvent(alice.id, eventId, { trackingSecret: 'tracking-secret' });
+  assert.equal(detail.tracking.links.length, 1);
+  assert.equal(detail.tracking.links[0].target, target);
+  assert.throws(() => createTrackingLink(bob.id, eventId, {
+    token: createTrackingToken(),
+    targetCiphertext: encryptTrackingTarget('https://example.net/other', 'tracking-secret'),
+    targetFingerprint: 'other',
+    targetOrigin: 'https://example.net'
+  }), /not found/i);
+});
+
+test('records deduplicated engagement events and summarizes message detail', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'events', email: 'events@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('events.example'));
+  const eventId = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@events.example',
+    recipients: ['reader@example.net'],
+    subject: 'Engagement',
+    trackingOpens: true,
+    trackingClicks: true
+  });
+  const trackingLinkId = createTrackingLink(user.id, eventId, {
+    token: createTrackingToken(),
+    targetCiphertext: encryptTrackingTarget('https://example.net/click', 'tracking-secret'),
+    targetFingerprint: trackingTargetFingerprint('https://example.net/click', 'tracking-secret'),
+    targetOrigin: 'https://example.net'
+  });
+
+  const scanner = recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'scanner',
+    occurredAt: '2026-07-09T12:00:00.000Z',
+    userAgent: 'Scanner',
+    ipHash: 'scanner-ip',
+    replayKey: 'scanner-open'
+  });
+  assert.equal(scanner.recorded, true);
+  assert.equal(scanner.firstQualifying, false);
+
+  const direct = recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'direct',
+    occurredAt: '2026-07-09T12:01:00.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'direct-ip',
+    replayKey: 'direct-open'
+  });
+  assert.equal(direct.recorded, true);
+  assert.equal(direct.firstQualifying, true);
+
+  recordTrackingEvent({
+    sendEventId: eventId,
+    trackingLinkId,
+    eventType: 'click',
+    source: 'direct',
+    occurredAt: '2026-07-09T11:59:00.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'click-ip',
+    replayKey: 'direct-click'
+  });
+
+  const duplicate = recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'direct',
+    occurredAt: '2026-07-09T12:01:30.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'direct-ip',
+    replayKey: 'direct-open'
+  });
+  assert.equal(duplicate.recorded, false);
+  assert.equal(duplicate.duplicate, true);
+
+  const detail = getSendEvent(user.id, eventId);
+  assert.equal(detail.tracking.summary.totalOpens, 1);
+  assert.equal(detail.tracking.summary.totalClicks, 1);
+  assert.equal(detail.tracking.summary.uniqueOpen, true);
+  assert.equal(detail.tracking.summary.scannerEvents, 1);
+  assert.equal(detail.tracking.summary.firstOpenedAt, '2026-07-09T11:59:00.000Z');
+  assert.equal(detail.tracking.summary.lastOpenedAt, '2026-07-09T12:01:00.000Z');
+  assert.equal(detail.tracking.events.length, 3);
+  assert.equal(detail.tracking.eventCount, 3);
+  assert.equal(detail.tracking.eventsTruncated, false);
+  assert.equal(detail.tracking.events.some((event) => Object.hasOwn(event, 'ipHash')), false);
+  const listed = listSendEvents(user.id)[0];
+  assert.equal(listed.tracking.summary.totalOpens, 1);
+  assert.equal(listed.tracking.summary.uniqueOpen, true);
+});
+
+test('bounds tracking detail events while preserving the complete SQL summary', () => {
+  const database = initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'bounded-events', email: 'bounded-events@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('bounded-events.example'));
+  const eventId = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@bounded-events.example',
+    recipients: ['reader@example.net'],
+    subject: 'Bounded events',
+    trackingOpens: true
+  });
+  const start = Date.parse('2026-07-09T00:00:00.000Z');
+  for (let index = 0; index < 505; index += 1) {
+    recordTrackingEvent({
+      sendEventId: eventId,
+      eventType: 'open',
+      source: 'direct',
+      occurredAt: new Date(start + index * 1000).toISOString(),
+      userAgent: 'Mozilla/5.0',
+      ipHash: `bounded-${index}`,
+      replayKey: `bounded-${index}`
+    });
+  }
+  for (let index = 0; index < 205; index += 1) {
+    const target = `https://example.net/link/${index}`;
+    createTrackingLink(user.id, eventId, {
+      token: createTrackingToken(),
+      targetCiphertext: encryptTrackingTarget(target, 'tracking-secret'),
+      targetFingerprint: trackingTargetFingerprint(target, 'tracking-secret'),
+      targetOrigin: 'https://example.net'
+    });
+  }
+
+  const detail = getSendEvent(user.id, eventId, { trackingSecret: 'tracking-secret' });
+  assert.equal(detail.tracking.summary.totalOpens, 505);
+  assert.equal(detail.tracking.eventCount, 505);
+  assert.equal(detail.tracking.events.length, 500);
+  assert.equal(detail.tracking.eventsTruncated, true);
+  assert.equal(detail.tracking.linkCount, 205);
+  assert.equal(detail.tracking.links.length, 200);
+  assert.equal(detail.tracking.linksTruncated, true);
+  assert.equal(detail.tracking.events[0].occurredAt, '2026-07-09T00:00:05.000Z');
+  assert.equal(detail.tracking.events.at(-1).occurredAt, '2026-07-09T00:08:24.000Z');
+
+  const listed = listSendEvents(user.id)[0];
+  assert.equal(listed.tracking.summary.totalOpens, 505);
+  assert.equal(Object.hasOwn(listed.tracking, 'events'), false);
+  const eventIndexes = database.prepare("PRAGMA index_list('tracking_events')").all().map((row) => row.name);
+  const sendEventIndexes = database.prepare("PRAGMA index_list('send_events')").all().map((row) => row.name);
+  assert.equal(eventIndexes.includes('idx_tracking_events_link_time'), true);
+  assert.equal(sendEventIndexes.includes('idx_events_user_created'), true);
+});
+
+test('enqueues first qualifying engagement webhook and ignores scanner-first events', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'engagement-hook', email: 'engagement-hook@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('engagement-hook.example'));
+  createWebhook(user.id, {
+    name: 'Engagement events',
+    url: 'https://hooks.example.com/engagement',
+    events: ['opened', 'clicked']
+  });
+  const eventId = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@engagement-hook.example',
+    recipients: ['reader@example.net'],
+    subject: 'Webhook engagement',
+    status: 'sent',
+    trackingOpens: true,
+    trackingClicks: true
+  });
+
+  recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'scanner',
+    occurredAt: '2026-07-09T12:00:00.000Z',
+    userAgent: 'Scanner',
+    ipHash: 'scanner-ip',
+    replayKey: 'hook-scanner'
+  });
+  assert.equal(getSendEvent(user.id, eventId).webhookDeliveries.length, 0);
+
+  recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'direct',
+    occurredAt: '2026-07-09T12:01:00.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'direct-ip',
+    replayKey: 'hook-direct-1'
+  });
+  recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'direct',
+    occurredAt: '2026-07-09T12:02:00.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'direct-ip-2',
+    replayKey: 'hook-direct-2'
+  });
+  const deliveries = getSendEvent(user.id, eventId).webhookDeliveries;
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].eventType, 'opened');
+});
+
+test('caps tracking writes per message and UTC day', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'cap-user', email: 'cap-user@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('cap.example'));
+  const eventId = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@cap.example',
+    recipients: ['reader@example.net'],
+    subject: 'Cap',
+    trackingOpens: true
+  });
+  for (let index = 0; index < 2; index += 1) {
+    const result = recordTrackingEvent({
+      sendEventId: eventId,
+      eventType: 'open',
+      source: 'direct',
+      occurredAt: `2026-07-09T12:0${index}:00.000Z`,
+      userAgent: 'Mozilla/5.0',
+      ipHash: `ip-${index}`,
+      replayKey: `cap-${index}`,
+      maxPerDay: 2
+    });
+    assert.equal(result.recorded, true);
+  }
+  const capped = recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'direct',
+    occurredAt: '2026-07-09T12:03:00.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'ip-3',
+    replayKey: 'cap-3',
+    maxPerDay: 2
+  });
+  assert.equal(capped.recorded, false);
+  assert.equal(capped.capped, true);
+
+  const nextDay = recordTrackingEvent({
+    sendEventId: eventId,
+    eventType: 'open',
+    source: 'direct',
+    occurredAt: '2026-07-10T00:00:00.000Z',
+    userAgent: 'Mozilla/5.0',
+    ipHash: 'ip-4',
+    replayKey: 'cap-4',
+    maxPerDay: 2
+  });
+  assert.equal(nextDay.recorded, true);
+});
+
+test('prunes raw tracking events before the retention cutoff', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'retention', email: 'retention@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('retention.example'));
+  const eventId = createSendEvent({
+    userId: user.id,
+    domainId: domain.id,
+    sender: 'sender@retention.example',
+    recipients: ['reader@example.net'],
+    subject: 'Retention',
+    trackingOpens: true
+  });
+  for (const [occurredAt, replayKey] of [
+    ['2026-01-01T00:00:00.000Z', 'old-event'],
+    ['2026-07-09T00:00:00.000Z', 'new-event']
+  ]) {
+    recordTrackingEvent({
+      sendEventId: eventId,
+      eventType: 'open',
+      source: 'direct',
+      occurredAt,
+      userAgent: 'Mozilla/5.0',
+      ipHash: replayKey,
+      replayKey
+    });
+  }
+
+  assert.equal(pruneTrackingEvents({ days: 30, now: '2026-07-10T00:00:00.000Z' }), 1);
+  const detail = getSendEvent(user.id, eventId);
+  assert.equal(detail.tracking.events.length, 1);
+  assert.equal(detail.tracking.events[0].occurredAt, '2026-07-09T00:00:00.000Z');
 });
 
 test('isolates domains, smtp credentials, and api tokens by user', () => {
@@ -350,7 +734,7 @@ test('send analytics includes delivery funnel and top failure reasons', () => {
     recipients: ['bad2@example.com'],
     subject: 'Failure',
     status: 'failed',
-    detail: 'Mailbox unavailable'
+    detail: 'Mailbox\t  unavailable'
   });
 
   const analytics = getSendAnalytics(alice.id, { days: 7 });
@@ -372,6 +756,89 @@ test('send analytics includes delivery funnel and top failure reasons', () => {
   ]);
   assert.equal(analytics.failureReasons[0].reason, 'Mailbox unavailable');
   assert.equal(analytics.failureReasons[0].total, 2);
+});
+
+test('send analytics reports delivered engagement rates trends and grouped links', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'analytics-track', email: 'analytics-track@example.com', password: 'password123' });
+  const domain = createDomain(user.id, domainFixture('analytics-track.example'));
+  const now = new Date().toISOString();
+  const target = 'https://example.net/reset?token=private';
+  const fingerprint = trackingTargetFingerprint(target, 'tracking-secret');
+  const events = [];
+  for (let index = 0; index < 3; index += 1) {
+    events.push(createSendEvent({
+      userId: user.id,
+      domainId: domain.id,
+      sender: 'sender@analytics-track.example',
+      recipients: [`reader-${index}@example.net`],
+      subject: `Tracked ${index}`,
+      status: 'sent',
+      trackingOpens: true,
+      trackingClicks: true
+    }));
+  }
+  const links = events.slice(0, 2).map((eventId, index) => {
+    const token = createTrackingToken();
+    const id = createTrackingLink(user.id, eventId, {
+      token,
+      targetCiphertext: encryptTrackingTarget(target, 'tracking-secret'),
+      targetFingerprint: fingerprint,
+      targetOrigin: 'https://example.net'
+    });
+    return { id, token, index };
+  });
+  const engagement = [
+    { sendEventId: events[0], eventType: 'open', source: 'direct', key: 'open-direct' },
+    { sendEventId: events[0], eventType: 'open', source: 'proxy', key: 'open-proxy' },
+    { sendEventId: events[0], trackingLinkId: links[0].id, eventType: 'click', source: 'direct', key: 'click-one' },
+    { sendEventId: events[1], trackingLinkId: links[1].id, eventType: 'click', source: 'scanner', key: 'click-scanner' },
+    { sendEventId: events[1], trackingLinkId: links[1].id, eventType: 'click', source: 'direct', key: 'click-two' }
+  ];
+  for (const item of engagement) {
+    recordTrackingEvent({
+      ...item,
+      occurredAt: now,
+      userAgent: item.source === 'scanner' ? 'Scanner' : 'Mozilla/5.0',
+      ipHash: item.key,
+      replayKey: item.key
+    });
+  }
+
+  const analytics = getSendAnalytics(user.id, { days: 7, trackingSecret: 'tracking-secret' });
+  assert.equal(analytics.engagement.trackedDelivered, 3);
+  assert.equal(analytics.engagement.totalOpens, 2);
+  assert.equal(analytics.engagement.uniqueOpens, 2);
+  assert.equal(analytics.engagement.proxyOpens, 1);
+  assert.equal(analytics.engagement.totalClicks, 2);
+  assert.equal(analytics.engagement.uniqueClicks, 2);
+  assert.equal(analytics.engagement.scannerEvents, 1);
+  assert.equal(analytics.engagement.openRate, 66.7);
+  assert.equal(analytics.engagement.clickRate, 66.7);
+  assert.equal(analytics.engagement.clickToOpenRate, 100);
+  assert.equal(analytics.engagementByDay.reduce((sum, day) => sum + day.clicks, 0), 2);
+  assert.equal(analytics.topLinks.length, 1);
+  assert.equal(analytics.topLinks[0].clicks, 2);
+  assert.equal(analytics.topLinks[0].uniqueClicks, 2);
+  assert.equal(analytics.topLinks[0].target, target);
+});
+
+test('send analytics does not truncate windows above 5000 messages', () => {
+  const database = initDatabase(tempDataDir(), 'test-secret');
+  const user = createUser({ username: 'large-analytics', email: 'large-analytics@example.com', password: 'password123' });
+  const createdAt = new Date().toISOString();
+  const insert = database.prepare(`
+    INSERT INTO send_events (
+      user_id, domain_id, sender, recipients, subject, status, detail, created_at
+    ) VALUES (?, NULL, ?, '[]', ?, 'queued', '', ?)
+  `);
+  database.exec('BEGIN');
+  for (let index = 0; index < 5001; index += 1) {
+    insert.run(user.id, 'sender@example.com', `Message ${index}`, createdAt);
+  }
+  database.exec('COMMIT');
+
+  assert.equal(getSendAnalytics(user.id, { days: 1 }).summary.total, 5001);
 });
 
 test('stores account tokens as hashes and enforces token lifecycle', () => {

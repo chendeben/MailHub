@@ -44,6 +44,7 @@ export interface RuntimeConfig {
   dmarcPolicy: string;
   dmarcRua: string;
   sendRequiresVerified: boolean;
+  engagementTrackingEnabled: boolean;
   systemChecks?: SystemChecks;
   submission?: {
     enabled: boolean;
@@ -290,6 +291,56 @@ export interface SendEventTimelineEntry {
   response?: string;
   webhookId?: number;
   responseStatus?: number | null;
+  source?: string;
+  targetOrigin?: string;
+  trackingLinkId?: number | null;
+}
+
+export interface TrackingEvent {
+  id: number;
+  sendEventId: number;
+  trackingLinkId?: number | null;
+  eventType: 'open' | 'click';
+  source: 'direct' | 'proxy' | 'scanner';
+  occurredAt: string;
+  userAgent?: string;
+  targetOrigin?: string;
+}
+
+export interface TrackingLink {
+  id: number;
+  target: string;
+  targetOrigin: string;
+  clicks: number;
+  firstClickedAt?: string | null;
+  lastClickedAt?: string | null;
+}
+
+export interface TrackingSummary {
+  totalOpens: number;
+  totalClicks: number;
+  uniqueOpen: boolean;
+  uniqueClick: boolean;
+  proxyOpens: number;
+  scannerEvents: number;
+  firstOpenedAt?: string | null;
+  lastOpenedAt?: string | null;
+  firstClickedAt?: string | null;
+  lastClickedAt?: string | null;
+}
+
+export interface SendTracking {
+  enabled: boolean;
+  opens: boolean;
+  clicks: boolean;
+  messageLevel: boolean;
+  summary?: TrackingSummary;
+  events?: TrackingEvent[];
+  eventCount?: number;
+  eventsTruncated?: boolean;
+  links?: TrackingLink[];
+  linkCount?: number;
+  linksTruncated?: boolean;
 }
 
 export interface SendEvent {
@@ -307,6 +358,7 @@ export interface SendEvent {
   deliveryLog?: DeliveryLogEntry[];
   deliveryAttempts?: DeliveryAttempt[];
   webhookDeliveries?: WebhookDelivery[];
+  tracking?: SendTracking;
   deliveredAt?: string;
   createdAt: string;
 }
@@ -338,6 +390,34 @@ export interface Analytics {
     stage: string;
     total: number;
     rate: number;
+  }>;
+  engagement: {
+    trackedDelivered: number;
+    totalOpens: number;
+    uniqueOpens: number;
+    proxyOpens: number;
+    totalClicks: number;
+    uniqueClicks: number;
+    scannerEvents: number;
+    openRate: number;
+    clickRate: number;
+    clickToOpenRate: number;
+  };
+  engagementByDay: Array<{
+    day: string;
+    opens: number;
+    uniqueOpens: number;
+    clicks: number;
+    uniqueClicks: number;
+    scannerEvents: number;
+  }>;
+  topLinks: Array<{
+    fingerprint: string;
+    target: string;
+    targetOrigin: string;
+    clicks: number;
+    uniqueClicks: number;
+    lastClickedAt: string;
   }>;
   byDay: Array<{
     day: string;
@@ -420,7 +500,7 @@ export interface DomainPatchPayload {
   dmarcRua?: string;
 }
 
-export type WebhookEvent = 'sent' | 'bounced' | 'failed';
+export type WebhookEvent = 'sent' | 'bounced' | 'failed' | 'opened' | 'clicked';
 export type WebhookDeliveryStatus = 'pending' | 'processing' | 'success' | 'dead';
 
 export interface Webhook {

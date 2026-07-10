@@ -9,7 +9,7 @@ import { SectionCard } from '../components/common/SectionCard';
 import { StatusPill } from '../components/common/StatusPill';
 import { buildEventTimeline } from '../frontend/analytics-model.js';
 import { useI18n } from '../frontend/i18n/react';
-import type { DeliveryAttempt, DeliveryLogEntry, Domain, SendEvent, SendEventTimelineEntry, WebhookDelivery } from '../frontend/types';
+import type { DeliveryAttempt, DeliveryLogEntry, Domain, SendEvent, SendEventTimelineEntry, TrackingLink, WebhookDelivery } from '../frontend/types';
 
 const { RangePicker } = DatePicker;
 
@@ -51,6 +51,16 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
       dataIndex: 'status',
       render: (value) => <StatusTag status={value} />,
       width: 120
+    },
+    {
+      title: t('logs.opens'),
+      width: 90,
+      render: (_, event) => event.tracking?.summary?.totalOpens ?? 0
+    },
+    {
+      title: t('logs.clicks'),
+      width: 90,
+      render: (_, event) => event.tracking?.summary?.totalClicks ?? 0
     },
     { title: 'Message ID', dataIndex: 'id', render: (value) => <span>mh-{value}</span>, width: 140 },
     { title: t('logs.errorReason'), dataIndex: 'detail', ellipsis: true },
@@ -114,7 +124,7 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
             </Typography.Text>
           }
         >
-          <Table rowKey="id" columns={columns} dataSource={filtered} scroll={{ x: 1300 }} />
+          <Table rowKey="id" columns={columns} dataSource={filtered} scroll={{ x: 1480 }} />
         </SectionCard>
       </Space>
 
@@ -163,7 +173,7 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
       <Drawer
         title={event ? `${t('logs.detailTitle')} · mh-${event.id}` : t('logs.detailTitle')}
         open={Boolean(event)}
-        width={760}
+        width="min(760px, 100vw)"
         onClose={onClose}
         extra={event ? (
           <Button icon={<CopyOutlined />} onClick={() => onCopy(formatDeliveryLog(event))}>
@@ -195,7 +205,49 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
                   <Typography.Text code className="inline-code-value">{event.detail || '-'}</Typography.Text>
                 </Descriptions.Item>
               </Descriptions>
+              {event.tracking?.enabled ? (
+                <SectionCard title={t('logs.engagement')} className="delivery-log-card">
+                  <Descriptions bordered size="small" column={2}>
+                    <Descriptions.Item label={t('logs.trackingScope')} span={2}>
+                      <StatusPill tone={event.tracking.messageLevel ? 'warning' : 'info'}>
+                        {event.tracking.messageLevel ? t('logs.messageLevel') : t('logs.recipientLevel')}
+                      </StatusPill>
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.opens')}>
+                      {event.tracking.summary?.totalOpens || 0}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.clicks')}>
+                      {event.tracking.summary?.totalClicks || 0}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.firstOpened')}>
+                      {formatOptionalTime(event.tracking.summary?.firstOpenedAt)}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.lastOpened')}>
+                      {formatOptionalTime(event.tracking.summary?.lastOpenedAt)}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.firstClicked')}>
+                      {formatOptionalTime(event.tracking.summary?.firstClickedAt)}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.lastClicked')}>
+                      {formatOptionalTime(event.tracking.summary?.lastClickedAt)}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.proxyOpens')}>
+                      {event.tracking.summary?.proxyOpens || 0}
+                    </Descriptions.Item>
+                    <Descriptions.Item label={t('logs.scannerEvents')}>
+                      {event.tracking.summary?.scannerEvents || 0}
+                    </Descriptions.Item>
+                  </Descriptions>
+                  {event.tracking.linksTruncated ? (
+                    <Alert type="warning" showIcon message={t('logs.trackingLinksTruncated')} />
+                  ) : null}
+                  {event.tracking.links?.length ? <TrackingLinksTable links={event.tracking.links} /> : null}
+                </SectionCard>
+              ) : null}
               <SectionCard title={t('logs.trackingTimeline')} className="delivery-log-card">
+                {event.tracking?.eventsTruncated ? (
+                  <Alert type="warning" showIcon message={t('logs.trackingTimelineTruncated')} />
+                ) : null}
                 {trackingTimeline.length ? (
                   <Timeline
                     items={trackingTimeline.map((item, index) => ({
@@ -260,9 +312,29 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
         {item.recipient ? <LogLine label="To" value={item.recipient} /> : null}
         {item.relay ? <LogLine label="MX" value={item.relay} /> : null}
         {item.response ? <LogLine label="S" value={item.response} /> : null}
+        {item.targetOrigin ? <LogLine label="URL" value={item.targetOrigin} /> : null}
         {item.webhookId ? <LogLine label="WH" value={`#${item.webhookId}${item.responseStatus ? ` · HTTP ${item.responseStatus}` : ''}`} /> : null}
       </div>
     );
+  }
+
+  function TrackingLinksTable({ links }: { links: TrackingLink[] }) {
+    const columns: ColumnsType<TrackingLink> = [
+      {
+        title: t('dashboard.link'),
+        dataIndex: 'target',
+        ellipsis: { showTitle: false },
+        render: (value) => <Typography.Text ellipsis={{ tooltip: value }}>{value}</Typography.Text>
+      },
+      { title: t('logs.clicks'), dataIndex: 'clicks', width: 80 },
+      {
+        title: t('logs.lastClicked'),
+        dataIndex: 'lastClickedAt',
+        width: 180,
+        render: formatOptionalTime
+      }
+    ];
+    return <Table rowKey="id" size="small" columns={columns} dataSource={links} pagination={false} scroll={{ x: 620 }} />;
   }
 
   function WebhookDeliveriesTable({ deliveries }: { deliveries: WebhookDelivery[] }) {
@@ -366,6 +438,14 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
         lines.push('');
       }
     }
+    if (event.tracking?.enabled) {
+      lines.push(t('logs.engagement'));
+      lines.push(`${t('logs.opens')}: ${event.tracking.summary?.totalOpens || 0}`);
+      lines.push(`${t('logs.clicks')}: ${event.tracking.summary?.totalClicks || 0}`);
+      lines.push(`${t('logs.proxyOpens')}: ${event.tracking.summary?.proxyOpens || 0}`);
+      lines.push(`${t('logs.scannerEvents')}: ${event.tracking.summary?.scannerEvents || 0}`);
+      lines.push('');
+    }
     const entries = event.deliveryLog?.length ? event.deliveryLog : [{
       at: event.createdAt,
       phase: 'legacy',
@@ -414,6 +494,8 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
       delivered: t('logs.stageDelivered'),
       pending: t('logs.stagePending'),
       failed: t('logs.stageFailed'),
+      opened: t('logs.stageOpened'),
+      clicked: t('logs.stageClicked'),
       webhook: t('logs.stageWebhook')
     }[stage] || stage;
   }
@@ -453,5 +535,9 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
     if (status === 'deferred') return 'gold';
     if (status === 'bounced' || status === 'failed') return 'red';
     return 'blue';
+  }
+
+  function formatOptionalTime(value?: string | null) {
+    return value ? new Date(value).toLocaleString() : '-';
   }
 }

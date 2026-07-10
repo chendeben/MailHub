@@ -108,6 +108,9 @@ export default function Settings({ me, settings, users, loading, onSave }: Setti
           <Form.Item name="sendRequiresVerified" label="SEND_REQUIRES_VERIFIED" valuePropName="checked">
             <Switch />
           </Form.Item>
+          <Form.Item name="engagementTrackingEnabled" label={t('settings.engagementTracking')} valuePropName="checked">
+            <Switch />
+          </Form.Item>
           <Button type="primary" htmlType="submit" loading={loading}>
             {t('settings.save')}
           </Button>
