@@ -113,8 +113,7 @@ test('IMAP exposes MIME body structures and individual parts for Roundcube', asy
     await client.command('A2 SELECT INBOX', /A2 OK/);
 
     const structure = await client.command('A3 UID FETCH 1 (UID BODYSTRUCTURE)', /A3 OK/);
-    assert.match(structure, /BODYSTRUCTURE \(\("TEXT" "PLAIN" \("CHARSET" "UTF-8"\)/);
-    assert.match(structure, /"HTML" \("CHARSET" "UTF-8"\).*"ALTERNATIVE" \("BOUNDARY" "mailhub-boundary"\)\)/);
+    assert.match(structure, /BODYSTRUCTURE \(\("TEXT" "PLAIN" \("CHARSET" "UTF-8"\).*\) \("TEXT" "HTML" \("CHARSET" "UTF-8"\).*\) "ALTERNATIVE" \("BOUNDARY" "mailhub-boundary"\)\)/);
 
     const textPart = await client.command('A4 UID FETCH 1 (BODY.PEEK[1])', /A4 OK/);
     assert.match(textPart, /BODY\[1\] \{\d+\}\r\nPlain message body\./);

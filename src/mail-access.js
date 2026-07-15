@@ -812,7 +812,7 @@ function imapBodyStructure(message) {
 
 function imapMimeNodeStructure(node) {
   if (node.children.length) {
-    return `(${node.children.map(imapMimeNodeStructure).join(' ')}) ${imapNString(node.contentType.subtype.toUpperCase())} ${imapBodyParameters(node.contentType.parameters)}`;
+    return `(${node.children.map(imapMimeNodeStructure).join(' ')} ${imapNString(node.contentType.subtype.toUpperCase())} ${imapBodyParameters(node.contentType.parameters)})`;
   }
 
   const values = [
