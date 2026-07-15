@@ -64,6 +64,75 @@ test('IMAP clients can log in and fetch mailbox messages', async () => {
   }
 });
 
+test('IMAP exposes MIME body structures and individual parts for Roundcube', async () => {
+  initDatabase(mkdtempSync(path.join(tmpdir(), 'mailhub-imap-mime-test-')), 'mail-access-secret');
+  const { mailbox } = createMailboxFixture('mime.example', 'mime-user');
+  createInboundMessage(mailbox, {
+    sender: 'alice@example.net',
+    recipients: ['admin@mime.example'],
+    subject: 'MIME message',
+    messageId: '<mime-message@example.net>',
+    rawMessage: [
+      'From: Alice <alice@example.net>',
+      'To: admin@mime.example',
+      'Subject: MIME message',
+      'MIME-Version: 1.0',
+      'Content-Type: multipart/alternative; boundary="mailhub-boundary"',
+      '',
+      '--mailhub-boundary',
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: quoted-printable',
+      '',
+      'Plain message body.',
+      '--mailhub-boundary',
+      'Content-Type: text/html; charset=UTF-8',
+      '',
+      '<p>HTML message body.</p>',
+      '--mailhub-boundary--',
+      ''
+    ].join('\r\n'),
+    textBody: 'Plain message body.',
+    htmlBody: '<p>HTML message body.</p>'
+  });
+
+  const [server] = startMailboxAccessServers({
+    hostname: 'mail.mime.example',
+    imapEnabled: true,
+    imapListeners: [{ port: 0, protocol: 'imap' }],
+    pop3Enabled: false,
+    pop3Listeners: [],
+    allowInsecureAuth: true
+  });
+  await waitForListening(server);
+
+  let client;
+  try {
+    client = await connectClient(server.address().port);
+    await client.readUntil(/\* OK .* IMAP ready\r\n/);
+    assert.match(await client.command('A1 LOGIN "admin@mime.example" "mailbox-pass-123"', /A1 OK/), /LOGIN completed/);
+    await client.command('A2 SELECT INBOX', /A2 OK/);
+
+    const structure = await client.command('A3 UID FETCH 1 (UID BODYSTRUCTURE)', /A3 OK/);
+    assert.match(structure, /BODYSTRUCTURE \(\("TEXT" "PLAIN" \("CHARSET" "UTF-8"\)/);
+    assert.match(structure, /"HTML" \("CHARSET" "UTF-8"\).*"ALTERNATIVE" \("BOUNDARY" "mailhub-boundary"\)\)/);
+
+    const textPart = await client.command('A4 UID FETCH 1 (BODY.PEEK[1])', /A4 OK/);
+    assert.match(textPart, /BODY\[1\] \{\d+\}\r\nPlain message body\./);
+    assert.doesNotMatch(textPart, /Content-Type: text\/plain/);
+
+    const htmlPart = await client.command('A5 UID FETCH 1 (BODY.PEEK[2])', /A5 OK/);
+    assert.match(htmlPart, /BODY\[2\] \{\d+\}\r\n<p>HTML message body\.<\/p>/);
+
+    const mimeHeaders = await client.command('A6 UID FETCH 1 (BODY.PEEK[1.MIME])', /A6 OK/);
+    assert.match(mimeHeaders, /BODY\[1\.MIME\] \{\d+\}\r\nContent-Type: text\/plain; charset=UTF-8/);
+    await client.command('A7 LOGOUT', /A7 OK/);
+    client.close();
+  } finally {
+    client?.close();
+    await closeServer(server);
+  }
+});
+
 test('IMAP exposes standard folders expected by mainstream clients', async () => {
   initDatabase(mkdtempSync(path.join(tmpdir(), 'mailhub-imap-folders-test-')), 'mail-access-secret');
   createMailboxFixture('folders.example', 'folders-user');

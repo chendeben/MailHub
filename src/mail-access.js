@@ -332,8 +332,9 @@ class ImapSession {
     if (byUid || /\bUID\b/.test(upper)) attrs.push(`UID ${entry.message.id}`);
     if (!upper || /\bFLAGS\b/.test(upper)) attrs.push(`FLAGS (${imapFlags(entry.message, this.deletedUids).join(' ')})`);
     if (/\bINTERNALDATE\b/.test(upper)) attrs.push(`INTERNALDATE "${imapDate(entry.message.receivedAt)}"`);
-    if (/RFC822\.SIZE|BODY|RFC822/i.test(items)) attrs.push(`RFC822.SIZE ${messageBytes(entry.message)}`);
+    if (/RFC822\.SIZE|RFC822|BODY(?:\.PEEK)?\[/i.test(items)) attrs.push(`RFC822.SIZE ${messageBytes(entry.message)}`);
     if (/\bENVELOPE\b/.test(upper)) attrs.push(`ENVELOPE ${imapEnvelope(entry.message)}`);
+    if (/\bBODYSTRUCTURE\b/.test(upper)) attrs.push(`BODYSTRUCTURE ${imapBodyStructure(entry.message)}`);
 
     const literal = resolveFetchLiteral(items, entry.message);
     if (!literal) {
@@ -795,7 +796,123 @@ function bodySection(raw, section) {
   if (clean === 'HEADER') return headerBlock(raw);
   if (clean === 'TEXT') return bodyBlock(raw);
   if (clean.startsWith('HEADER.FIELDS')) return selectedHeaders(raw, clean);
+  const match = clean.match(/^(\d+(?:\.\d+)*)(?:\.(MIME|HEADER|TEXT))?$/);
+  if (match) {
+    const node = resolveMimeSection(parseMimeNode(raw), match[1]);
+    if (!node) return '';
+    if (match[2] === 'MIME' || match[2] === 'HEADER') return headerBlock(node.raw);
+    return node.body;
+  }
   return raw;
+}
+
+function imapBodyStructure(message) {
+  return imapMimeNodeStructure(parseMimeNode(normalizeRawMessage(message)));
+}
+
+function imapMimeNodeStructure(node) {
+  if (node.children.length) {
+    return `(${node.children.map(imapMimeNodeStructure).join(' ')}) ${imapNString(node.contentType.subtype.toUpperCase())} ${imapBodyParameters(node.contentType.parameters)}`;
+  }
+
+  const values = [
+    imapNString(node.contentType.primary.toUpperCase()),
+    imapNString(node.contentType.subtype.toUpperCase()),
+    imapBodyParameters(node.contentType.parameters),
+    imapNString(node.headers['content-id'] || ''),
+    imapNString(node.headers['content-description'] || ''),
+    imapNString(node.encoding.toUpperCase()),
+    String(Buffer.byteLength(node.body, 'utf8'))
+  ];
+  if (node.contentType.primary === 'text') values.push(String(imapLineCount(node.body)));
+  return `(${values.join(' ')})`;
+}
+
+function imapBodyParameters(parameters) {
+  const entries = Object.entries(parameters);
+  if (!entries.length) return 'NIL';
+  return `(${entries.map(([name, value]) => `${imapNString(name.toUpperCase())} ${imapNString(value)}`).join(' ')})`;
+}
+
+function imapLineCount(value) {
+  const body = String(value || '').replace(/\r\n$/, '');
+  return body ? body.split('\r\n').length : 0;
+}
+
+function parseMimeNode(rawMessage) {
+  const raw = String(rawMessage || '').replace(/\r?\n/g, '\r\n');
+  const headers = parseMessageHeaders(raw);
+  const contentType = parseMimeContentType(headers['content-type']);
+  const body = bodyBlock(raw);
+  const boundary = contentType.primary === 'multipart' ? contentType.parameters.boundary : '';
+  return {
+    raw,
+    headers,
+    body,
+    contentType,
+    encoding: normalizeTransferEncoding(headers['content-transfer-encoding']),
+    children: boundary ? splitMultipartParts(body, boundary).map(parseMimeNode) : []
+  };
+}
+
+function parseMimeContentType(value) {
+  const source = String(value || 'text/plain');
+  const mediaType = source.split(';', 1)[0].trim().toLowerCase();
+  const [primary = 'text', subtype = 'plain'] = mediaType.split('/');
+  return {
+    primary: normalizeMimeToken(primary, 'text'),
+    subtype: normalizeMimeToken(subtype, 'plain'),
+    parameters: parseMimeParameters(source)
+  };
+}
+
+function parseMimeParameters(value) {
+  const parameters = {};
+  const expression = /;\s*([^=;\s]+)\s*=\s*(?:"((?:\\.|[^"])*)"|([^;]*))/g;
+  for (const match of String(value || '').matchAll(expression)) {
+    const name = String(match[1] || '').trim().toLowerCase();
+    const parameterValue = String(match[2] ?? match[3] ?? '').trim().replace(/\\(.)/g, '$1');
+    if (name) parameters[name] = parameterValue;
+  }
+  return parameters;
+}
+
+function normalizeMimeToken(value, fallback) {
+  const token = String(value || '').trim().replace(/[^a-z0-9!#$&^_.+-]/gi, '');
+  return token || fallback;
+}
+
+function normalizeTransferEncoding(value) {
+  const encoding = String(value || '7bit').trim().toLowerCase();
+  return normalizeMimeToken(encoding, '7bit');
+}
+
+function splitMultipartParts(body, boundary) {
+  const marker = `--${boundary}`;
+  const parts = [];
+  let current = null;
+  for (const line of String(body || '').split('\r\n')) {
+    if (line === marker || line === `${marker}--`) {
+      if (current !== null) parts.push(current.join('\r\n'));
+      if (line === `${marker}--`) break;
+      current = [];
+      continue;
+    }
+    if (current) current.push(line);
+  }
+  return parts.filter((part) => part.trim());
+}
+
+function resolveMimeSection(root, section) {
+  const indexes = String(section || '').split('.').map(Number);
+  if (!indexes.every((index) => Number.isInteger(index) && index > 0)) return null;
+  if (!root.children.length) return indexes.length === 1 && indexes[0] === 1 ? root : null;
+  let node = root;
+  for (const index of indexes) {
+    node = node.children[index - 1];
+    if (!node) return null;
+  }
+  return node;
 }
 
 function selectedHeaders(raw, section) {
