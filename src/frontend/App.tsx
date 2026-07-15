@@ -677,7 +677,7 @@ function MailHubConsole() {
       return <SendingLogs events={data.events} domains={data.domains} onCopy={copy} onLoadEvent={loadSendEvent} />;
     }
     if (activeView === 'webhooks') {
-      return <Webhooks domains={data.domains} onCopy={copy} />;
+      return <Webhooks domains={data.domains} mailboxes={data.inboundMailboxes} onCopy={copy} />;
     }
     if (activeView === 'admin') {
       return <AdminPage me={data.me} />;

@@ -639,6 +639,7 @@ async function handleApi(req, res, url, user) {
 
   if (method === 'GET' && pathname === '/api/webhooks') {
     let domainId;
+    let mailboxId;
     if (url.searchParams.has('domainId')) {
       const raw = url.searchParams.get('domainId');
       if (raw === '' || raw === 'null') {
@@ -650,7 +651,21 @@ async function handleApi(req, res, url, user) {
         }
       }
     }
-    return sendJson(res, 200, { webhooks: listWebhooks(user.id, { domainId }) });
+    if (url.searchParams.has('mailboxId')) {
+      const raw = url.searchParams.get('mailboxId');
+      mailboxId = Number(raw);
+      if (!Number.isInteger(mailboxId) || mailboxId <= 0) {
+        return sendJson(res, 400, { error: 'mailboxId 无效。' });
+      }
+    }
+    if (domainId !== undefined && mailboxId !== undefined) {
+      return sendJson(res, 400, { error: 'Webhook 不能同时按域名和收信邮箱筛选。' });
+    }
+    try {
+      return sendJson(res, 200, { webhooks: listWebhooks(user.id, { domainId, mailboxId }) });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message || 'Webhook 查询失败。' });
+    }
   }
   if (method === 'POST' && pathname === '/api/webhooks') {
     const body = await readJson(req);
@@ -661,6 +676,7 @@ async function handleApi(req, res, url, user) {
         url: body.url,
         events: body.events,
         domainId: body.domainId === undefined ? null : body.domainId,
+        mailboxId: body.mailboxId === undefined ? null : body.mailboxId,
         enabled: body.enabled
       });
       return sendJson(res, 201, { webhook });
@@ -683,6 +699,7 @@ async function handleApi(req, res, url, user) {
         if (body.url !== undefined) patch.url = body.url;
         if (body.events !== undefined) patch.events = body.events;
         if (body.domainId !== undefined) patch.domainId = body.domainId;
+        if (body.mailboxId !== undefined) patch.mailboxId = body.mailboxId;
         if (body.enabled !== undefined) patch.enabled = body.enabled;
         const webhook = updateWebhook(user.id, id, patch);
         if (!webhook) return sendJson(res, 404, { error: 'Webhook 不存在。' });

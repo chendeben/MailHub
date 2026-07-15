@@ -613,13 +613,14 @@ export interface DomainPatchPayload {
   catchAllAddress?: string;
 }
 
-export type WebhookEvent = 'sent' | 'bounced' | 'failed' | 'opened' | 'clicked';
+export type WebhookEvent = 'sent' | 'bounced' | 'failed' | 'opened' | 'clicked' | 'received';
 export type WebhookDeliveryStatus = 'pending' | 'processing' | 'success' | 'dead';
 
 export interface Webhook {
   id: number;
   userId: number;
   domainId: number | null;
+  mailboxId: number | null;
   name: string;
   url: string;
   secretPrefix: string;
@@ -636,6 +637,7 @@ export interface WebhookPayload {
   url: string;
   events: WebhookEvent[];
   domainId?: number | string | null;
+  mailboxId?: number | string | null;
   enabled?: boolean;
 }
 
@@ -644,6 +646,7 @@ export interface WebhookPatchPayload {
   url?: string;
   events?: WebhookEvent[];
   domainId?: number | string | null;
+  mailboxId?: number | string | null;
   enabled?: boolean;
 }
 
@@ -652,6 +655,7 @@ export interface WebhookDelivery {
   webhookId: number;
   userId: number;
   sendEventId: number;
+  inboundMessageId?: number | null;
   eventType: WebhookEvent | string;
   payloadJson?: string;
   status: WebhookDeliveryStatus | string;

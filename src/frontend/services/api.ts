@@ -247,10 +247,11 @@ export const api = {
   resetPassword: (token: string, password: string) =>
     request<{ message: string }>('/api/auth/reset-password', { method: 'POST', data: { token, password } }),
   logout: () => request<{ ok: boolean }>('/api/logout', { method: 'POST' }),
-  webhooks: (domainId?: number | null) => {
+  webhooks: (domainId?: number | null, mailboxId?: number) => {
     const params = new URLSearchParams();
     if (domainId === null) params.set('domainId', 'null');
     else if (domainId !== undefined) params.set('domainId', String(domainId));
+    if (mailboxId !== undefined) params.set('mailboxId', String(mailboxId));
     const query = params.toString();
     return request<{ webhooks: Webhook[] }>(`/api/webhooks${query ? `?${query}` : ''}`);
   },

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 
 import {
@@ -9,10 +10,13 @@ import {
   completeWebhookDeliveryFailure,
   completeWebhookDeliverySuccess,
   createDomain,
+  createInboundMailbox,
+  createInboundMessage,
   createUser,
   createWebhook,
   deleteWebhook,
   enqueueWebhookDeliveries,
+  enqueueInboundWebhookDeliveries,
   enqueueWebhookTestDelivery,
   getWebhook,
   initDatabase,
@@ -55,6 +59,67 @@ test('isolates webhooks by user and supports domain scope filter', () => {
   assert.equal(listWebhooks(alice.id, { domainId: aliceDomain.id }).length, 1);
   assert.equal(listWebhooks(alice.id, { domainId: aliceDomain.id })[0].name, 'Alice domain');
   assert.equal(listWebhooks(bob.id, { domainId: aliceDomain.id }).length, 0);
+});
+
+test('migrates legacy webhook deliveries without losing send-event records', () => {
+  const dataDir = tempDataDir();
+  const database = new DatabaseSync(path.join(dataDir, 'mailhub.sqlite'));
+  database.exec(`
+    CREATE TABLE users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE webhooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      domain_id INTEGER,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      secret_ciphertext TEXT NOT NULL,
+      secret_prefix TEXT NOT NULL,
+      events_json TEXT NOT NULL,
+      enabled TEXT NOT NULL DEFAULT 'true',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE webhook_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      webhook_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      send_event_id INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_attempt_at TEXT,
+      response_status INTEGER,
+      response_body_preview TEXT NOT NULL DEFAULT '',
+      error TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE,
+      UNIQUE(webhook_id, send_event_id, event_type)
+    );
+    INSERT INTO users (id, username, email, password_hash, role, status, created_at, updated_at)
+    VALUES (1, 'legacy', 'legacy@example.com', 'hash', 'user', 'active', '2026-07-14T00:00:00.000Z', '2026-07-14T00:00:00.000Z');
+    INSERT INTO webhooks (id, user_id, name, url, secret_ciphertext, secret_prefix, events_json, enabled, created_at, updated_at)
+    VALUES (1, 1, 'Legacy', 'https://hooks.example.com/legacy', 'secret', 'whsec_12', '["sent"]', 'true', '2026-07-14T00:00:00.000Z', '2026-07-14T00:00:00.000Z');
+    INSERT INTO webhook_deliveries (id, webhook_id, user_id, send_event_id, event_type, payload_json, status, attempt_count, next_attempt_at, response_body_preview, error, created_at)
+    VALUES (1, 1, 1, 42, 'sent', '{}', 'success', 1, '2026-07-14T00:00:00.000Z', '', '', '2026-07-14T00:00:00.000Z');
+  `);
+  database.close();
+
+  initDatabase(dataDir, 'test-secret');
+  const [delivery] = listWebhookDeliveries(1);
+  assert.equal(delivery.sendEventId, 42);
+  assert.equal(delivery.inboundMessageId, null);
+  assert.equal(listWebhooks(1)[0].mailboxId, null);
 });
 
 test('create returns secret once; list and get omit secret', () => {
@@ -135,6 +200,102 @@ test('enqueueWebhookDeliveries is idempotent per webhook+event+send_event', () =
   assert.equal(payload.data.message_id, 'mh-42');
   assert.equal(payload.data.domain, 'alice.example');
   assert.equal(payload.data.queue_id, 'QUEUE42');
+});
+
+test('mailbox webhooks only enqueue idempotent receipt callbacks for their stored mail', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const alice = createUser({ username: 'inbound-alice', email: 'inbound-alice@example.com', password: 'password123' });
+  const bob = createUser({ username: 'inbound-bob', email: 'inbound-bob@example.com', password: 'password123' });
+  const domain = createDomain(alice.id, domainFixture('inbound-hook.example'));
+  const mailbox = createInboundMailbox(alice.id, { address: 'support@inbound-hook.example' });
+  const otherMailbox = createInboundMailbox(alice.id, { address: 'sales@inbound-hook.example' });
+  const webhook = createWebhook(alice.id, {
+    name: 'Support receipt',
+    url: 'https://hooks.example.com/inbound',
+    events: ['received'],
+    mailboxId: mailbox.id
+  });
+  const sendWebhook = createWebhook(alice.id, {
+    name: 'Sending only',
+    url: 'https://hooks.example.com/send',
+    events: ['sent']
+  });
+
+  assert.equal(webhook.domainId, null);
+  assert.equal(webhook.mailboxId, mailbox.id);
+  assert.equal(listWebhooks(alice.id, { mailboxId: mailbox.id }).length, 1);
+  assert.equal(listWebhooks(alice.id, { domainId: null }).length, 1);
+  assert.throws(() => createWebhook(alice.id, {
+    name: 'Invalid account receipt',
+    url: 'https://hooks.example.com/invalid-account',
+    events: ['received']
+  }), /received/);
+  assert.throws(() => createWebhook(alice.id, {
+    name: 'Invalid mailbox send',
+    url: 'https://hooks.example.com/invalid-mailbox',
+    events: ['sent'],
+    mailboxId: mailbox.id
+  }), /邮箱 Webhook/);
+  assert.throws(() => createWebhook(bob.id, {
+    name: 'Other user mailbox',
+    url: 'https://hooks.example.com/other-user',
+    events: ['received'],
+    mailboxId: mailbox.id
+  }), /收信邮箱/);
+
+  const inboundMessage = createInboundMessage(mailbox, {
+    sender: 'sender@example.net',
+    recipients: ['support@inbound-hook.example'],
+    subject: 'Receipt callback',
+    messageId: '<inbound-message@example.net>',
+    textBody: 'Plain text',
+    htmlBody: '<p>HTML</p>'
+  });
+  const unrelatedMessage = createInboundMessage(otherMailbox, {
+    sender: 'sender@example.net',
+    recipients: ['sales@inbound-hook.example'],
+    subject: 'Other mailbox'
+  });
+
+  assert.equal(enqueueInboundWebhookDeliveries(inboundMessage).length, 1);
+  assert.equal(enqueueInboundWebhookDeliveries(inboundMessage).length, 0);
+  assert.equal(enqueueInboundWebhookDeliveries(unrelatedMessage).length, 0);
+  enqueueWebhookDeliveries({
+    id: 99,
+    userId: alice.id,
+    domainId: domain.id,
+    status: 'sent',
+    sender: 'noreply@inbound-hook.example',
+    recipients: ['reader@example.net'],
+    subject: 'Sending path'
+  });
+
+  const deliveries = listWebhookDeliveries(alice.id);
+  const received = deliveries.find((delivery) => delivery.eventType === 'received');
+  assert.ok(received);
+  assert.equal(received.webhookId, webhook.id);
+  assert.equal(received.sendEventId, 0);
+  assert.equal(received.inboundMessageId, inboundMessage.id);
+  const payload = JSON.parse(received.payloadJson);
+  assert.equal(payload.type, 'email.received');
+  assert.equal(payload.data.mailbox, 'support@inbound-hook.example');
+  assert.equal(payload.data.rfc_message_id, '<inbound-message@example.net>');
+  assert.equal(payload.data.text, 'Plain text');
+  assert.equal(payload.data.html, '<p>HTML</p>');
+  assert.equal('raw_message' in payload.data, false);
+  assert.equal(deliveries.find((delivery) => delivery.eventType === 'sent')?.webhookId, sendWebhook.id);
+
+  const testDelivery = enqueueWebhookTestDelivery(alice.id, webhook.id);
+  assert.equal(testDelivery.inboundMessageId, 0);
+  assert.equal(JSON.parse(testDelivery.payloadJson).type, 'email.received');
+
+  updateWebhook(alice.id, webhook.id, { enabled: false });
+  const disabledMessage = createInboundMessage(mailbox, {
+    sender: 'sender@example.net',
+    recipients: ['support@inbound-hook.example'],
+    subject: 'Disabled callback'
+  });
+  assert.equal(enqueueInboundWebhookDeliveries(disabledMessage).length, 0);
 });
 
 test('domain override skips account webhooks for that event', () => {

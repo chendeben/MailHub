@@ -34,6 +34,81 @@ test('webhook API requires authentication', async () => {
   }
 });
 
+test('mailbox webhook API confines email.received to its owned mailbox', async () => {
+  const { child, baseUrl, dataDir, sessionSecret } = await startTestServer();
+
+  try {
+    seedUsers(dataDir, sessionSecret, [
+      { username: 'mailbox-alice', email: 'mailbox-alice@example.com', password: 'password123', status: 'active' },
+      { username: 'mailbox-bob', email: 'mailbox-bob@example.com', password: 'password123', status: 'active' }
+    ]);
+    const aliceCookie = await login(baseUrl, 'mailbox-alice', 'password123');
+    const bobCookie = await login(baseUrl, 'mailbox-bob', 'password123');
+    await createSendingDomain(baseUrl, aliceCookie, { domain: 'mailbox-hooks.example' });
+
+    const createMailbox = await fetch(`${baseUrl}/api/inbound-mailboxes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: aliceCookie },
+      body: JSON.stringify({ address: 'support@mailbox-hooks.example', password: 'mailbox-pass-123' })
+    });
+    assert.equal(createMailbox.status, 201);
+    const mailbox = (await createMailbox.json()).mailbox;
+
+    const createWebhook = await fetch(`${baseUrl}/api/webhooks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: aliceCookie },
+      body: JSON.stringify({
+        name: 'Support arrival',
+        url: 'http://127.0.0.1:9/receipt',
+        events: ['received'],
+        mailboxId: mailbox.id
+      })
+    });
+    assert.equal(createWebhook.status, 201);
+    const webhook = (await createWebhook.json()).webhook;
+    assert.equal(webhook.mailboxId, mailbox.id);
+    assert.equal(webhook.domainId, null);
+    assert.deepEqual(webhook.events, ['received']);
+
+    const filtered = await fetch(`${baseUrl}/api/webhooks?mailboxId=${mailbox.id}`, {
+      headers: { Cookie: aliceCookie }
+    });
+    assert.equal(filtered.status, 200);
+    assert.equal((await filtered.json()).webhooks[0].id, webhook.id);
+
+    const bobLookup = await fetch(`${baseUrl}/api/webhooks?mailboxId=${mailbox.id}`, {
+      headers: { Cookie: bobCookie }
+    });
+    assert.equal(bobLookup.status, 400);
+
+    const accountReceipt = await fetch(`${baseUrl}/api/webhooks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: aliceCookie },
+      body: JSON.stringify({
+        name: 'Invalid account arrival',
+        url: 'http://127.0.0.1:9/invalid-account',
+        events: ['received']
+      })
+    });
+    assert.equal(accountReceipt.status, 400);
+
+    const mailboxSend = await fetch(`${baseUrl}/api/webhooks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: aliceCookie },
+      body: JSON.stringify({
+        name: 'Invalid mailbox send',
+        url: 'http://127.0.0.1:9/invalid-mailbox',
+        events: ['sent'],
+        mailboxId: mailbox.id
+      })
+    });
+    assert.equal(mailboxSend.status, 400);
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+  }
+});
+
 test('webhook API isolates users and returns secret only on create/rotate', async () => {
   const { child, baseUrl, dataDir, sessionSecret } = await startTestServer();
 

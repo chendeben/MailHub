@@ -37,6 +37,7 @@ import { useI18n } from '../frontend/i18n/react';
 import { api } from '../frontend/services/api';
 import type {
   Domain,
+  InboundMailbox,
   Webhook,
   WebhookDelivery,
   WebhookDeliveryStatus,
@@ -44,13 +45,17 @@ import type {
   WebhookPayload
 } from '../frontend/types';
 
-const ALL_EVENTS: WebhookEvent[] = ['sent', 'bounced', 'failed', 'opened', 'clicked'];
+const DELIVERY_EVENTS: WebhookEvent[] = ['sent', 'bounced', 'failed', 'opened', 'clicked'];
+const ALL_EVENTS: WebhookEvent[] = [...DELIVERY_EVENTS, 'received'];
 const DELIVERY_STATUSES: WebhookDeliveryStatus[] = ['pending', 'processing', 'success', 'dead'];
 
 interface WebhooksProps {
   /** When set, list/create are scoped to this domain (no global page chrome). */
   domainId?: number;
+  /** When set, only receipt callbacks for this mailbox are shown. */
+  mailboxId?: number;
   domains?: Domain[];
+  mailboxes?: InboundMailbox[];
   onCopy?: (value: string) => void;
 }
 
@@ -67,7 +72,7 @@ interface SecretReveal {
   mode: 'created' | 'rotated';
 }
 
-export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksProps) {
+export default function Webhooks({ domainId, mailboxId, domains = [], mailboxes = [], onCopy }: WebhooksProps) {
   const { message } = AntApp.useApp();
   const { t } = useI18n();
   const [webhooks, setWebhooks] = useState<Webhook[]>([]);
@@ -82,17 +87,20 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
   const [filterStatus, setFilterStatus] = useState<WebhookDeliveryStatus | 'all'>('all');
   const [filterEvent, setFilterEvent] = useState<WebhookEvent | 'all'>('all');
 
-  const scoped = domainId != null;
+  const mailboxScoped = mailboxId != null;
+  const scoped = domainId != null || mailboxScoped;
+  const selectableEvents: WebhookEvent[] = mailboxScoped ? ['received'] : DELIVERY_EVENTS;
   const domainMap = useMemo(() => new Map(domains.map((d) => [d.id, d.domain])), [domains]);
+  const mailboxMap = useMemo(() => new Map(mailboxes.map((m) => [m.id, m.address])), [mailboxes]);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
       const [webhooksResult, deliveriesResult] = await Promise.all([
-        api.webhooks(scoped ? domainId : undefined),
+        api.webhooks(mailboxScoped ? undefined : (domainId != null ? domainId : undefined), mailboxId),
         api.webhookDeliveries({ limit: 100 })
       ]);
-      const nextWebhooks = webhooksResult.webhooks || [];
+      const nextWebhooks = (webhooksResult.webhooks || []).filter((webhook) => scoped || webhook.mailboxId == null);
       setWebhooks(nextWebhooks);
       const webhookIds = new Set(nextWebhooks.map((w) => w.id));
       const nextDeliveries = (deliveriesResult.deliveries || []).filter((d) =>
@@ -104,7 +112,7 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
     } finally {
       setLoading(false);
     }
-  }, [domainId, message, scoped, t]);
+  }, [domainId, mailboxId, mailboxScoped, message, scoped, t]);
 
   useEffect(() => {
     void loadData();
@@ -148,8 +156,8 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
     form.setFieldsValue({
       name: '',
       url: '',
-      events: [...ALL_EVENTS],
-      domainId: scoped ? domainId : undefined,
+      events: [...selectableEvents],
+      domainId: mailboxScoped ? undefined : (domainId != null ? domainId : undefined),
       enabled: true
     });
     setDrawerOpen(true);
@@ -160,7 +168,7 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
     form.setFieldsValue({
       name: webhook.name,
       url: webhook.url,
-      events: webhook.events?.length ? [...webhook.events] : [...ALL_EVENTS],
+      events: webhook.events?.length ? [...webhook.events] : [...selectableEvents],
       domainId: webhook.domainId ?? undefined,
       enabled: webhook.enabled
     });
@@ -181,7 +189,8 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
         name: values.name.trim(),
         url: values.url.trim(),
         events: values.events,
-        domainId: scoped ? domainId : (values.domainId ?? null),
+        domainId: mailboxScoped ? null : (domainId != null ? domainId : (values.domainId ?? null)),
+        mailboxId: mailboxScoped ? mailboxId : null,
         enabled: values.enabled
       };
       if (editing) {
@@ -283,6 +292,10 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
   }
 
   function scopeLabel(webhook: Webhook) {
+    if (webhook.mailboxId != null) {
+      const address = mailboxMap.get(webhook.mailboxId);
+      return address ? `${t('webhooks.scopeMailbox')} · ${address}` : t('webhooks.scopeMailbox');
+    }
     if (webhook.domainId == null) return t('webhooks.scopeAccount');
     const name = domainMap.get(webhook.domainId);
     return name ? `${t('webhooks.scopeDomain')} · ${name}` : t('webhooks.scopeDomain');
@@ -294,6 +307,7 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
     if (event === 'failed') return t('webhooks.eventFailed');
     if (event === 'opened') return t('webhooks.eventOpened');
     if (event === 'clicked') return t('webhooks.eventClicked');
+    if (event === 'received') return t('webhooks.eventReceived');
     return event;
   }
 
@@ -496,7 +510,7 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
         />
       ) : (
         <Space direction="vertical" size={12} className="full-width">
-          <Alert type="info" showIcon message={t('webhooks.domainOverrideHelp')} />
+          <Alert type="info" showIcon message={mailboxScoped ? t('webhooks.mailboxReceiptHelp') : t('webhooks.domainOverrideHelp')} />
           <Space>
             <Button icon={<ReloadOutlined />} onClick={() => void loadData()} loading={loading}>
               {t('common.refresh')}
@@ -613,7 +627,7 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
           </div>
         }
       >
-        <Form form={form} layout="vertical" initialValues={{ enabled: true, events: ALL_EVENTS }}>
+        <Form form={form} layout="vertical" initialValues={{ enabled: true, events: DELIVERY_EVENTS }}>
           <Form.Item
             name="name"
             label={t('webhooks.name')}
@@ -635,10 +649,11 @@ export default function Webhooks({ domainId, domains = [], onCopy }: WebhooksPro
             rules={[{ required: true, type: 'array', min: 1, message: t('webhooks.eventsRequired') }]}
           >
             <Checkbox.Group
-              options={ALL_EVENTS.map((event) => ({
+              options={selectableEvents.map((event) => ({
                 value: event,
                 label: eventLabel(event)
               }))}
+              disabled={mailboxScoped}
             />
           </Form.Item>
           {!scoped ? (

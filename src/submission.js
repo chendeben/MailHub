@@ -5,6 +5,7 @@ import {
   createSendEvent,
   createInboundMessage,
   createTrackingLink,
+  enqueueInboundWebhookDeliveries,
   finalizeSendEvent,
   getDomainByName,
   logSendEvent,
@@ -552,11 +553,17 @@ class SubmissionSession {
         const forwardTo = route.forwardTo || [];
         const shouldStore = route.mailbox && (route.keepForwarded || !forwardTo.length);
         if (shouldStore) {
-          createInboundMessage(route.mailbox, {
+          const inboundMessage = createInboundMessage(route.mailbox, {
             ...parsedMessage,
             recipients: [route.recipient],
             sender: parsedMessage.sender || this.mailFrom
           });
+          try {
+            enqueueInboundWebhookDeliveries(inboundMessage);
+          } catch (error) {
+            // The message is already durable; webhook retries must not turn receipt into an SMTP failure.
+            console.error(`Inbound webhook enqueue failed for ${route.recipient}: ${error.message}`);
+          }
           storedCount += 1;
         }
         if (forwardTo.length) {

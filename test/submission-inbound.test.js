@@ -9,8 +9,10 @@ import {
   createDomain,
   createInboundMailbox,
   createUser,
+  createWebhook,
   initDatabase,
   listInboundMessages,
+  listWebhookDeliveries,
   updateDomain
 } from '../src/db.js';
 import { sendViaSmtp } from '../src/mailer.js';
@@ -76,6 +78,71 @@ test('SMTP accepts unauthenticated inbound mail for local mailboxes', async () =
     assert.deepEqual(message.recipients, ['support@inbound.example']);
     assert.equal(message.subject, 'Hello inbound SMTP');
     assert.equal(message.preview, 'Hello through SMTP.');
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('SMTP queues a mailbox receipt webhook only after the inbound message is stored', async () => {
+  initDatabase(mkdtempSync(path.join(tmpdir(), 'mailhub-submission-inbound-webhook-')), 'inbound-secret');
+  const user = createUser({ username: 'inbound-webhook', email: 'inbound-webhook@example.com', password: 'password123' });
+  createDomain(user.id, {
+    domain: 'receipt-hook.example',
+    selector: 'mh',
+    verificationToken: 'verify',
+    dkimPublic: 'public',
+    dkimPrivate: 'private',
+    senderHost: 'mail.receipt-hook.example',
+    sendingIp: '192.0.2.12',
+    spfExtra: '',
+    dmarcPolicy: 'none',
+    dmarcRua: ''
+  });
+  const mailbox = createInboundMailbox(user.id, { address: 'support@receipt-hook.example' });
+  createWebhook(user.id, {
+    name: 'Support received',
+    url: 'https://hooks.example.com/receipt',
+    events: ['received'],
+    mailboxId: mailbox.id
+  });
+  const [server] = startSubmissionServer({
+    enabled: true,
+    listeners: [{ port: 0, protocol: 'smtp' }],
+    hostname: 'mx.receipt-hook.example',
+    allowInsecureAuth: true,
+    inboundEnabled: true
+  });
+  await waitForListening(server);
+
+  try {
+    await sendViaSmtp({
+      host: '127.0.0.1',
+      port: server.address().port,
+      secure: false,
+      username: '',
+      password: '',
+      helo: 'sender.example.net',
+      mailFrom: 'sender@example.net',
+      recipients: ['support@receipt-hook.example'],
+      rawMessage: [
+        'Message-ID: <smtp-receipt-hook@example.net>',
+        'From: sender@example.net',
+        'To: support@receipt-hook.example',
+        'Subject: Stored before callback',
+        '',
+        'Inbound body'
+      ].join('\r\n')
+    });
+
+    const [message] = listInboundMessages(user.id);
+    assert.ok(message);
+    const [delivery] = listWebhookDeliveries(user.id, { eventType: 'received' });
+    assert.ok(delivery);
+    assert.equal(delivery.inboundMessageId, message.id);
+    const payload = JSON.parse(delivery.payloadJson);
+    assert.equal(payload.type, 'email.received');
+    assert.equal(payload.data.message_id, '<smtp-receipt-hook@example.net>');
+    assert.equal(payload.data.text, 'Inbound body');
   } finally {
     await closeServer(server);
   }

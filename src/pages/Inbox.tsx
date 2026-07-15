@@ -5,7 +5,8 @@ import {
   PlusOutlined,
   ReloadOutlined,
   SearchOutlined,
-  SettingOutlined
+  SettingOutlined,
+  ThunderboltOutlined
 } from '@ant-design/icons';
 import {
   Alert,
@@ -35,6 +36,7 @@ import { SectionCard } from '../components/common/SectionCard';
 import { StatusPill } from '../components/common/StatusPill';
 import { useI18n } from '../frontend/i18n/react';
 import type { Domain, DomainPatchPayload, InboundMailbox, InboundMessage, MailboxClientConfig, RuntimeConfig } from '../frontend/types';
+import Webhooks from './Webhooks';
 
 interface InboxProps {
   config: RuntimeConfig | null;
@@ -92,6 +94,7 @@ export default function Inbox({
   const [mailboxOpen, setMailboxOpen] = useState(false);
   const [mailboxLoading, setMailboxLoading] = useState(false);
   const [clientConfig, setClientConfig] = useState<MailboxClientConfig | null>(null);
+  const [webhookMailbox, setWebhookMailbox] = useState<InboundMailbox | null>(null);
   const [catchAllDomain, setCatchAllDomain] = useState<Domain | null>(null);
   const [catchAllLoading, setCatchAllLoading] = useState(false);
   const [selectedMailboxId, setSelectedMailboxId] = useState<number | null>(null);
@@ -192,11 +195,16 @@ export default function Inbox({
     },
     {
       title: t('common.actions'),
-      width: 120,
+      width: 230,
       render: (_value, mailbox) => (
-        <Button icon={<KeyOutlined />} onClick={() => setClientConfig(buildMailboxClientConfig(mailbox, config))}>
-          {t('inbox.clientConfig')}
-        </Button>
+        <Space size={4} wrap>
+          <Button icon={<KeyOutlined />} onClick={() => setClientConfig(buildMailboxClientConfig(mailbox, config))}>
+            {t('inbox.clientConfig')}
+          </Button>
+          <Button icon={<ThunderboltOutlined />} onClick={() => setWebhookMailbox(mailbox)}>
+            {t('inbox.mailboxWebhooks')}
+          </Button>
+        </Space>
       )
     }
   ];
@@ -487,6 +495,23 @@ export default function Inbox({
           </Space>
         ) : null}
       </Modal>
+
+      <Drawer
+        title={webhookMailbox ? `${t('inbox.mailboxWebhooks')} · ${webhookMailbox.address}` : t('inbox.mailboxWebhooks')}
+        open={Boolean(webhookMailbox)}
+        width="min(1240px, 100vw)"
+        destroyOnHidden
+        onClose={() => setWebhookMailbox(null)}
+      >
+        {webhookMailbox ? (
+          <Webhooks
+            mailboxId={webhookMailbox.id}
+            domains={domains}
+            mailboxes={mailboxes}
+            onCopy={onCopy}
+          />
+        ) : null}
+      </Drawer>
 
       <Drawer
         title={selectedMessage ? `${t('inbox.messageDetail')} · mh-in-${selectedMessage.id}` : t('inbox.messageDetail')}

@@ -263,6 +263,7 @@ export function initDatabase(dataDir, secret = '') {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
       domain_id INTEGER,
+      mailbox_id INTEGER,
       name TEXT NOT NULL,
       url TEXT NOT NULL,
       secret_ciphertext TEXT NOT NULL,
@@ -279,6 +280,7 @@ export function initDatabase(dataDir, secret = '') {
       webhook_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
       send_event_id INTEGER NOT NULL,
+      inbound_message_id INTEGER,
       event_type TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -289,8 +291,7 @@ export function initDatabase(dataDir, secret = '') {
       response_body_preview TEXT NOT NULL DEFAULT '',
       error TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
-      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE,
-      UNIQUE(webhook_id, send_event_id, event_type)
+      FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
     );
 
     CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON api_tokens(user_id);
@@ -339,6 +340,8 @@ export function initDatabase(dataDir, secret = '') {
   ensureColumn('inbound_mailboxes', 'quota_mb', 'INTEGER');
   ensureColumn('inbound_mailboxes', 'expires_at', 'TEXT');
   ensureColumn('inbound_messages', 'folder', "TEXT NOT NULL DEFAULT 'INBOX'");
+  ensureColumn('webhooks', 'mailbox_id', 'INTEGER');
+  migrateWebhookDeliveriesForInbound();
   ensureColumn('api_tokens', 'scopes_json', "TEXT NOT NULL DEFAULT '[\"send\"]'");
   ensureColumn('api_tokens', 'expires_at', 'TEXT');
   ensureColumn('api_tokens', 'revoked_at', 'TEXT');
@@ -358,6 +361,15 @@ export function initDatabase(dataDir, secret = '') {
     CREATE INDEX IF NOT EXISTS idx_api_tokens_user_status ON api_tokens(user_id, revoked_at, expires_at);
     CREATE INDEX IF NOT EXISTS idx_inbound_messages_mailbox_folder_received ON inbound_messages(mailbox_id, folder, received_at);
     CREATE INDEX IF NOT EXISTS idx_inbound_folders_mailbox ON inbound_folders(mailbox_id, deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_webhooks_user_mailbox ON webhooks(user_id, mailbox_id);
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status_next ON webhook_deliveries(status, next_attempt_at);
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_user_created ON webhook_deliveries(user_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_send_event_unique
+      ON webhook_deliveries(webhook_id, send_event_id, event_type)
+      WHERE inbound_message_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_inbound_message_unique
+      ON webhook_deliveries(webhook_id, inbound_message_id, event_type)
+      WHERE inbound_message_id IS NOT NULL;
   `);
   normalizeSendEventQueueIds();
   normalizeDkimPublicKeys();
@@ -1773,20 +1785,27 @@ export function pruneTrackingEvents({ days = 180, now: currentTime } = {}) {
   return Number(requireDb().prepare('DELETE FROM tracking_events WHERE occurred_at < ?').run(cutoff.toISOString()).changes || 0);
 }
 
-export function listWebhooks(userId, { domainId } = {}) {
+export function listWebhooks(userId, { domainId, mailboxId } = {}) {
+  if (domainId !== undefined && mailboxId !== undefined) {
+    throw new Error('Webhook 不能同时绑定域名和收信邮箱。');
+  }
   const params = [userId];
-  let domainClause = '';
-  if (domainId === null) {
-    domainClause = ' AND domain_id IS NULL';
+  let scopeClause = '';
+  if (mailboxId !== undefined) {
+    const resolvedMailboxId = normalizeWebhookMailboxId(userId, mailboxId);
+    scopeClause = ' AND mailbox_id = ?';
+    params.push(resolvedMailboxId);
+  } else if (domainId === null) {
+    scopeClause = ' AND domain_id IS NULL AND mailbox_id IS NULL';
   } else if (domainId !== undefined) {
-    domainClause = ' AND domain_id = ?';
+    scopeClause = ' AND domain_id = ? AND mailbox_id IS NULL';
     params.push(domainId);
   }
   return requireDb()
     .prepare(`
       SELECT *
       FROM webhooks
-      WHERE user_id = ?${domainClause}
+      WHERE user_id = ?${scopeClause}
       ORDER BY created_at DESC, id DESC
     `)
     .all(...params)
@@ -1798,25 +1817,27 @@ export function getWebhook(id, userId) {
   return publicWebhook(row);
 }
 
-export function createWebhook(userId, { name, url, events, domainId = null, enabled = true } = {}) {
+export function createWebhook(userId, { name, url, events, domainId = null, mailboxId = null, enabled = true } = {}) {
   const cleanName = String(name || '').trim();
   const cleanUrl = String(url || '').trim();
   if (!cleanName) throw new Error('Webhook 名称不能为空。');
   if (!cleanUrl) throw new Error('Webhook URL 不能为空。');
   const normalizedEvents = normalizeWebhookEvents(events);
-  const resolvedDomainId = normalizeWebhookDomainId(userId, domainId);
+  const scope = normalizeWebhookScope(userId, { domainId, mailboxId });
+  assertWebhookEventsMatchScope(normalizedEvents, scope);
   const secret = generateWebhookSecret();
   const createdAt = now();
   const result = requireDb()
     .prepare(`
       INSERT INTO webhooks (
-        user_id, domain_id, name, url, secret_ciphertext, secret_prefix,
+        user_id, domain_id, mailbox_id, name, url, secret_ciphertext, secret_prefix,
         events_json, enabled, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       userId,
-      resolvedDomainId,
+      scope.domainId,
+      scope.mailboxId,
       cleanName,
       cleanUrl,
       encryptSecret(secret),
@@ -1842,19 +1863,99 @@ export function updateWebhook(userId, id, patch = {}) {
   const nextEvents = patch.events !== undefined
     ? normalizeWebhookEvents(patch.events)
     : parseWebhookEventsJson(current.events_json);
-  const nextDomainId = patch.domainId !== undefined
-    ? normalizeWebhookDomainId(userId, patch.domainId)
-    : current.domain_id;
+  const scope = normalizeWebhookScope(userId, {
+    domainId: patch.domainId === undefined ? current.domain_id : patch.domainId,
+    mailboxId: patch.mailboxId === undefined ? current.mailbox_id : patch.mailboxId
+  });
+  assertWebhookEventsMatchScope(nextEvents, scope);
   const nextEnabled = patch.enabled !== undefined ? boolString(patch.enabled) : current.enabled;
   const updatedAt = now();
   requireDb()
     .prepare(`
       UPDATE webhooks
-      SET domain_id = ?, name = ?, url = ?, events_json = ?, enabled = ?, updated_at = ?
+      SET domain_id = ?, mailbox_id = ?, name = ?, url = ?, events_json = ?, enabled = ?, updated_at = ?
       WHERE id = ? AND user_id = ?
     `)
-    .run(nextDomainId, nextName, nextUrl, JSON.stringify(nextEvents), nextEnabled, updatedAt, id, userId);
+    .run(
+      scope.domainId,
+      scope.mailboxId,
+      nextName,
+      nextUrl,
+      JSON.stringify(nextEvents),
+      nextEnabled,
+      updatedAt,
+      id,
+      userId
+    );
   return getWebhook(id, userId);
+}
+
+/**
+ * Enqueue a mailbox-scoped callback after an inbound message has been stored.
+ * Inbound webhooks deliberately do not participate in account/domain send-event fallback.
+ */
+export function enqueueInboundWebhookDeliveries(inboundMessage, options = {}) {
+  if (!inboundMessage?.id || !inboundMessage?.userId || !inboundMessage?.mailboxId) return [];
+  const targets = listWebhookRowsForMailbox(inboundMessage.userId, inboundMessage.mailboxId)
+    .filter((webhook) => webhook.enabled && webhook.events.includes('received'));
+  const database = options.database || requireDb();
+  const manageTransactions = options.manageTransactions !== false;
+  const created = [];
+
+  for (const webhook of targets) {
+    if (manageTransactions) database.exec('BEGIN');
+    try {
+      const existing = database
+        .prepare(`
+          SELECT id FROM webhook_deliveries
+          WHERE webhook_id = ? AND inbound_message_id = ? AND event_type = 'received'
+        `)
+        .get(webhook.id, inboundMessage.id);
+      if (existing) {
+        if (manageTransactions) database.exec('COMMIT');
+        continue;
+      }
+
+      const createdAt = now();
+      const insert = database
+        .prepare(`
+          INSERT INTO webhook_deliveries (
+            webhook_id, user_id, send_event_id, inbound_message_id, event_type, payload_json, status,
+            attempt_count, next_attempt_at, last_attempt_at, response_status,
+            response_body_preview, error, created_at
+          ) VALUES (?, ?, 0, ?, 'received', '{}', 'pending', 0, ?, NULL, NULL, '', '', ?)
+        `)
+        .run(webhook.id, inboundMessage.userId, inboundMessage.id, createdAt, createdAt);
+      if (insert.changes !== 1) {
+        if (manageTransactions) database.exec('ROLLBACK');
+        continue;
+      }
+      const deliveryId = insert.lastInsertRowid;
+      const payload = buildWebhookPayload({
+        deliveryId,
+        eventType: 'email.received',
+        createdAt,
+        inboundMessage
+      });
+      database
+        .prepare('UPDATE webhook_deliveries SET payload_json = ? WHERE id = ?')
+        .run(JSON.stringify(payload), deliveryId);
+      if (manageTransactions) database.exec('COMMIT');
+      created.push(publicWebhookDelivery(
+        database.prepare('SELECT * FROM webhook_deliveries WHERE id = ?').get(deliveryId)
+      ));
+    } catch (error) {
+      if (manageTransactions) {
+        try {
+          database.exec('ROLLBACK');
+        } catch {
+          // ignore rollback errors when no transaction is open
+        }
+      }
+      throw error;
+    }
+  }
+  return created;
 }
 
 export function rotateWebhookSecret(userId, id) {
@@ -2196,6 +2297,7 @@ export function enqueueWebhookTestDelivery(userId, webhookId) {
   const events = parseWebhookEventsJson(webhook.events_json);
   const eventType = events[0] || 'sent';
   const externalType = eventTypeForStatus(eventType) || 'email.sent';
+  const mailbox = webhook.mailbox_id == null ? null : getInboundMailbox(webhook.mailbox_id, userId);
   const firstDomain = requireDb()
     .prepare('SELECT domain FROM domains WHERE user_id = ? ORDER BY created_at ASC, id ASC LIMIT 1')
     .get(userId);
@@ -2211,6 +2313,19 @@ export function enqueueWebhookTestDelivery(userId, webhookId) {
     detail: 'test delivery',
     deliveredAt: null
   };
+  const inboundMessage = mailbox ? {
+    id: 0,
+    mailboxId: mailbox.id,
+    mailboxAddress: mailbox.address,
+    domain: mailbox.domain,
+    sender: 'sender@example.com',
+    recipients: [mailbox.address],
+    subject: 'MailHub inbound webhook test',
+    messageId: '<mailhub-inbound-test@example.com>',
+    textBody: 'MailHub inbound webhook test',
+    htmlBody: '<p>MailHub inbound webhook test</p>',
+    receivedAt: null
+  } : null;
 
   const database = requireDb();
   database.exec('BEGIN');
@@ -2218,7 +2333,9 @@ export function enqueueWebhookTestDelivery(userId, webhookId) {
     const existing = database
       .prepare(`
         SELECT * FROM webhook_deliveries
-        WHERE webhook_id = ? AND send_event_id = 0 AND event_type = ?
+        WHERE webhook_id = ?
+          AND event_type = ?
+          AND ${mailbox ? 'inbound_message_id = 0' : 'inbound_message_id IS NULL AND send_event_id = 0'}
       `)
       .get(webhook.id, eventType);
 
@@ -2251,12 +2368,12 @@ export function enqueueWebhookTestDelivery(userId, webhookId) {
     const insert = database
       .prepare(`
         INSERT INTO webhook_deliveries (
-          webhook_id, user_id, send_event_id, event_type, payload_json, status,
+          webhook_id, user_id, send_event_id, inbound_message_id, event_type, payload_json, status,
           attempt_count, next_attempt_at, last_attempt_at, response_status,
           response_body_preview, error, created_at
-        ) VALUES (?, ?, 0, ?, '{}', 'pending', 0, ?, NULL, NULL, '', '', ?)
+        ) VALUES (?, ?, 0, ?, ?, '{}', 'pending', 0, ?, NULL, NULL, '', '', ?)
       `)
-      .run(webhook.id, userId, eventType, createdAt, createdAt);
+      .run(webhook.id, userId, mailbox ? 0 : null, eventType, createdAt, createdAt);
     if (insert.changes !== 1) {
       database.exec('ROLLBACK');
       return null;
@@ -2267,6 +2384,7 @@ export function enqueueWebhookTestDelivery(userId, webhookId) {
       eventType: externalType,
       createdAt,
       sendEvent,
+      inboundMessage,
       test: true
     });
     database
@@ -3289,6 +3407,54 @@ function migrateSmtpCredentialsToMultiplePerUser() {
   `);
 }
 
+function migrateWebhookDeliveriesForInbound() {
+  if (!tableExists('webhook_deliveries') || columnExists('webhook_deliveries', 'inbound_message_id')) return;
+  const database = requireDb();
+  database.exec('BEGIN');
+  try {
+    database.exec(`
+      ALTER TABLE webhook_deliveries RENAME TO webhook_deliveries_legacy;
+      CREATE TABLE webhook_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        webhook_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        send_event_id INTEGER NOT NULL,
+        inbound_message_id INTEGER,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        last_attempt_at TEXT,
+        response_status INTEGER,
+        response_body_preview TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
+      );
+      INSERT INTO webhook_deliveries (
+        id, webhook_id, user_id, send_event_id, inbound_message_id, event_type, payload_json, status,
+        attempt_count, next_attempt_at, last_attempt_at, response_status,
+        response_body_preview, error, created_at
+      )
+      SELECT
+        id, webhook_id, user_id, send_event_id, NULL, event_type, payload_json, status,
+        attempt_count, next_attempt_at, last_attempt_at, response_status,
+        response_body_preview, error, created_at
+      FROM webhook_deliveries_legacy;
+      DROP TABLE webhook_deliveries_legacy;
+    `);
+    database.exec('COMMIT');
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // ignore rollback errors when no transaction is open
+    }
+    throw error;
+  }
+}
+
 function smtpCredentialsHasUserIdUniqueConstraint() {
   const row = requireDb()
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'smtp_credentials'")
@@ -3740,6 +3906,7 @@ function publicWebhook(row) {
     id: row.id,
     userId: row.user_id,
     domainId: row.domain_id ?? null,
+    mailboxId: row.mailbox_id ?? null,
     name: row.name,
     url: row.url,
     secretPrefix: row.secret_prefix,
@@ -3757,6 +3924,7 @@ function publicWebhookDelivery(row) {
     webhookId: row.webhook_id,
     userId: row.user_id,
     sendEventId: row.send_event_id,
+    inboundMessageId: row.inbound_message_id ?? null,
     eventType: row.event_type,
     payloadJson: row.payload_json,
     status: row.status,
@@ -3773,10 +3941,10 @@ function publicWebhookDelivery(row) {
 function listWebhookRowsForResolve(userId, domainId) {
   const rows = domainId == null
     ? requireDb()
-      .prepare('SELECT * FROM webhooks WHERE user_id = ? AND domain_id IS NULL')
+      .prepare('SELECT * FROM webhooks WHERE user_id = ? AND domain_id IS NULL AND mailbox_id IS NULL')
       .all(userId)
     : requireDb()
-      .prepare('SELECT * FROM webhooks WHERE user_id = ? AND domain_id = ?')
+      .prepare('SELECT * FROM webhooks WHERE user_id = ? AND domain_id = ? AND mailbox_id IS NULL')
       .all(userId, domainId);
   return rows.map((row) => ({
     id: row.id,
@@ -3784,6 +3952,50 @@ function listWebhookRowsForResolve(userId, domainId) {
     enabled: row.enabled === 'true' || row.enabled === true || row.enabled === 1,
     events: parseWebhookEventsJson(row.events_json)
   }));
+}
+
+function listWebhookRowsForMailbox(userId, mailboxId) {
+  return requireDb()
+    .prepare('SELECT * FROM webhooks WHERE user_id = ? AND mailbox_id = ?')
+    .all(userId, mailboxId)
+    .map((row) => ({
+      id: row.id,
+      mailboxId: row.mailbox_id,
+      enabled: row.enabled === 'true' || row.enabled === true || row.enabled === 1,
+      events: parseWebhookEventsJson(row.events_json)
+    }));
+}
+
+function normalizeWebhookScope(userId, { domainId, mailboxId }) {
+  const hasDomain = domainId != null && domainId !== '';
+  const hasMailbox = mailboxId != null && mailboxId !== '';
+  if (hasDomain && hasMailbox) throw new Error('Webhook 不能同时绑定域名和收信邮箱。');
+  return {
+    domainId: hasDomain ? normalizeWebhookDomainId(userId, domainId) : null,
+    mailboxId: hasMailbox ? normalizeWebhookMailboxId(userId, mailboxId) : null
+  };
+}
+
+function normalizeWebhookMailboxId(userId, mailboxId) {
+  const id = Number(mailboxId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error('收信邮箱不存在。');
+  const mailbox = requireDb()
+    .prepare('SELECT id FROM inbound_mailboxes WHERE id = ? AND user_id = ? AND deleted_at IS NULL')
+    .get(id, userId);
+  if (!mailbox) throw new Error('收信邮箱不存在。');
+  return id;
+}
+
+function assertWebhookEventsMatchScope(events, scope) {
+  if (scope.mailboxId != null) {
+    if (events.length !== 1 || events[0] !== 'received') {
+      throw new Error('邮箱 Webhook 仅支持 received 事件。');
+    }
+    return;
+  }
+  if (events.includes('received')) {
+    throw new Error('received 事件只能绑定到收信邮箱。');
+  }
 }
 
 function normalizeWebhookDomainId(userId, domainId) {

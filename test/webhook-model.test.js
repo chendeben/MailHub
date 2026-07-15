@@ -23,15 +23,49 @@ test('maps terminal statuses to email.* types', () => {
   assert.equal(eventTypeForStatus('failed'), 'email.failed');
   assert.equal(eventTypeForStatus('opened'), 'email.opened');
   assert.equal(eventTypeForStatus('clicked'), 'email.clicked');
+  assert.equal(eventTypeForStatus('received'), 'email.received');
   assert.equal(eventTypeForStatus('queued'), null);
   assert.equal(eventTypeForStatus('deferred'), null);
 });
 
-test('supports opened and clicked subscriptions without making them delivery terminal statuses', () => {
-  assert.deepEqual(WEBHOOK_EVENTS, ['sent', 'bounced', 'failed', 'opened', 'clicked']);
+test('supports engagement and receipt subscriptions without making them delivery terminal statuses', () => {
+  assert.deepEqual(WEBHOOK_EVENTS, ['sent', 'bounced', 'failed', 'opened', 'clicked', 'received']);
   assert.equal(isTerminalWebhookStatus('opened'), false);
   assert.equal(isTerminalWebhookStatus('clicked'), false);
+  assert.equal(isTerminalWebhookStatus('received'), false);
   assert.deepEqual(normalizeWebhookEvents(['clicked', 'opened', 'sent']), ['sent', 'opened', 'clicked']);
+});
+
+test('builds an inbound receipt payload without raw MIME content', () => {
+  const payload = buildWebhookPayload({
+    deliveryId: 9,
+    eventType: 'email.received',
+    createdAt: '2026-07-14T12:00:00.000Z',
+    inboundMessage: {
+      id: 55,
+      mailboxId: 4,
+      mailboxAddress: 'support@example.com',
+      domain: 'example.com',
+      sender: 'sender@example.net',
+      recipients: ['support@example.com'],
+      subject: 'Inbound test',
+      messageId: '<rfc-123@example.net>',
+      textBody: 'Plain body',
+      htmlBody: '<p>HTML body</p>',
+      rawMessage: 'secret raw MIME',
+      receivedAt: '2026-07-14T11:59:58.000Z'
+    }
+  });
+
+  assert.equal(payload.type, 'email.received');
+  assert.equal(payload.data.inbound_message_id, 55);
+  assert.equal(payload.data.mailbox, 'support@example.com');
+  assert.equal(payload.data.message_id, '<rfc-123@example.net>');
+  assert.equal(payload.data.rfc_message_id, '<rfc-123@example.net>');
+  assert.equal(payload.data.text, 'Plain body');
+  assert.equal(payload.data.html, '<p>HTML body</p>');
+  assert.equal('raw_message' in payload.data, false);
+  assert.equal(JSON.stringify(payload).includes('secret raw MIME'), false);
 });
 
 test('isTerminalWebhookStatus matches terminal set', () => {

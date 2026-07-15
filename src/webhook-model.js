@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
 export const TERMINAL_WEBHOOK_EVENTS = ['sent', 'bounced', 'failed'];
-export const WEBHOOK_EVENTS = [...TERMINAL_WEBHOOK_EVENTS, 'opened', 'clicked'];
+export const WEBHOOK_EVENTS = [...TERMINAL_WEBHOOK_EVENTS, 'opened', 'clicked', 'received'];
 export const MAX_WEBHOOK_ATTEMPTS = 8;
 export const WEBHOOK_LEASE_MS = 2 * 60 * 1000;
 
@@ -24,6 +24,7 @@ export function eventTypeForStatus(status) {
   if (status === 'failed') return 'email.failed';
   if (status === 'opened') return 'email.opened';
   if (status === 'clicked') return 'email.clicked';
+  if (status === 'received') return 'email.received';
   return null;
 }
 
@@ -45,7 +46,39 @@ export function resolveWebhooksForEvent({ accountWebhooks, domainWebhooks, event
   return matches(accountWebhooks);
 }
 
-export function buildWebhookPayload({ deliveryId, eventType, createdAt, sendEvent, engagement = null, test = false }) {
+export function buildWebhookPayload({
+  deliveryId,
+  eventType,
+  createdAt,
+  sendEvent,
+  inboundMessage = null,
+  engagement = null,
+  test = false
+}) {
+  if (inboundMessage) {
+    const rfcMessageId = String(inboundMessage.messageId || '').trim();
+    return {
+      id: `whd_${deliveryId}`,
+      type: String(eventType || '').startsWith('email.') ? eventType : eventTypeForStatus('received'),
+      created_at: createdAt,
+      data: {
+        ...(test ? { test: true } : {}),
+        message_id: rfcMessageId || (test ? 'mh-test' : `mh-in-${inboundMessage.id}`),
+        rfc_message_id: rfcMessageId || null,
+        inbound_message_id: inboundMessage.id,
+        mailbox_id: inboundMessage.mailboxId,
+        mailbox: inboundMessage.mailboxAddress || '',
+        domain: inboundMessage.domain || '',
+        from: inboundMessage.sender || '',
+        to: inboundMessage.recipients || [],
+        subject: inboundMessage.subject || '',
+        text: inboundMessage.textBody || '',
+        html: inboundMessage.htmlBody || '',
+        received_at: inboundMessage.receivedAt || null
+      }
+    };
+  }
+
   const status = sendEvent.status;
   const externalType = String(eventType || '').startsWith('email.')
     ? eventType
@@ -131,5 +164,5 @@ function publicEngagement(engagement) {
 }
 
 function webhookEventsError() {
-  return new Error('events must be a non-empty array of sent|bounced|failed|opened|clicked');
+  return new Error('events must be a non-empty array of sent|bounced|failed|opened|clicked|received');
 }
