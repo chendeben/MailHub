@@ -4,6 +4,7 @@ import {
   CloudServerOutlined,
   DashboardOutlined,
   GlobalOutlined,
+  InboxOutlined,
   KeyOutlined,
   MailOutlined,
   ReloadOutlined,
@@ -39,6 +40,7 @@ const navGroups: Array<{
     labelKey: 'nav.group.delivery',
     items: [
       { key: 'smtp', labelKey: 'nav.smtp', icon: <MailOutlined /> },
+      { key: 'inbox', labelKey: 'nav.inbox', icon: <InboxOutlined /> },
       { key: 'tokens', labelKey: 'nav.tokens', icon: <KeyOutlined /> },
       { key: 'logs', labelKey: 'nav.logs', icon: <SendOutlined /> },
       { key: 'webhooks', labelKey: 'nav.webhooks', icon: <ApiOutlined /> }

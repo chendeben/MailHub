@@ -249,6 +249,12 @@ body {
   margin-bottom: 16px;
 }
 
+.token-form-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .token-secret-alert {
   border: 1px solid #fecaca;
   background: #fef2f2;
@@ -257,6 +263,10 @@ body {
 .token-secret-alert .ant-alert-message {
   color: #991b1b;
   font-weight: 600;
+}
+
+.api-doc-subheading {
+  margin: 4px 0 0 !important;
 }
 
 .api-doc-list {
@@ -509,6 +519,51 @@ body {
 
 .delivery-log-card .ant-table-wrapper {
   margin-top: 16px;
+}
+
+.inbox-toolbar {
+  margin-bottom: 16px;
+}
+
+.inbox-help .ant-collapse-content-box {
+  padding: 12px 16px;
+}
+
+.inbox-help-intro {
+  margin-bottom: 0;
+}
+
+.inbox-help-list {
+  color: var(--mh-text);
+  line-height: 1.7;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.inbox-help-list li + li {
+  margin-top: 4px;
+}
+
+.inbox-form-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.inbox-message-body {
+  background: #f8fafc;
+  border: 1px solid var(--mh-border);
+  border-radius: 10px;
+  color: #1e293b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0;
+  max-height: 52vh;
+  overflow: auto;
+  padding: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .delivery-log-entry {
@@ -843,6 +898,14 @@ body {
   .toolbar-search,
   .toolbar-select {
     width: 100%;
+  }
+
+  .inbox-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .token-form-grid {
+    grid-template-columns: 1fr;
   }
 
   .delivery-funnel-row {

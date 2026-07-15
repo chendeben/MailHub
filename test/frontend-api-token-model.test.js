@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   buildApiUsageExamples,
+  buildMailboxApiUsageExamples,
   canCopyFullApiToken,
   formatApiTokenPrefix,
   getCopyableApiToken,
@@ -41,4 +42,17 @@ test('builds API usage examples with endpoint, bearer token, and message body', 
   assert.match(examples.nodeFetch, /from: 'noreply@example.com'/);
   assert.match(examples.requestBody, /"to": "user@example.com"/);
   assert.match(examples.successResponse, /"queued": true/);
+});
+
+test('builds persistent and temporary mailbox API examples', () => {
+  const examples = buildMailboxApiUsageExamples({
+    endpoint: 'https://mailhub.example.com/api/mailboxes',
+    token: 'mh_mailbox_token',
+    domain: 'example.com'
+  });
+
+  assert.match(examples.permanentCurl, /"mode": "permanent"/);
+  assert.match(examples.temporaryCurl, /Authorization: Bearer mh_mailbox_token/);
+  assert.match(examples.temporary, /"expiresInMinutes": 60/);
+  assert.match(examples.successResponse, /"temporary": true/);
 });

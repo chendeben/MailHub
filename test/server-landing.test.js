@@ -18,6 +18,12 @@ test('anonymous root serves landing page with no-store cache header', async () =
     const html = await response.text();
     assert.match(html, /MailHub/i);
     assert.match(html, /data-i18n|hero|Get started|开始使用|landing/i);
+    assert.match(html, /api\/mailboxes|mailboxes|邮箱/i);
+    assert.match(html, /mailboxes:write|长期邮箱|permanent/i);
+    assert.match(html, /expiresInMinutes|临时邮箱|temporary/i);
+    assert.match(html, /Receiving mail|收信|IMAP|POP3/i);
+    assert.match(html, /POST \/api\/send|发送 API|Send API/i);
+    assert.match(html, /domainsDoc|域名配置|Domain configuration/i);
     assert.doesNotMatch(html, /id="root"/);
   } finally {
     child.kill('SIGTERM');
@@ -82,6 +88,8 @@ function spawnServer(port) {
       DATA_DIR: mkdtempSync(path.join(tmpdir(), 'mailhub-landing-test-')),
       ADMIN_PASSWORD: 'password123',
       SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false',
       WEBHOOK_WORKER_ENABLED: '0'
     },
     stdio: ['ignore', 'pipe', 'pipe']

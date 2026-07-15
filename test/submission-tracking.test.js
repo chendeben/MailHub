@@ -98,7 +98,96 @@ test('SMTP submission instruments HTML before DKIM and relays one tracked messag
   }
 });
 
+test('SMTP submission adds deliverability headers before DKIM and honors bounce envelope opt-in', async () => {
+  initDatabase(mkdtempSync(path.join(tmpdir(), 'mailhub-submission-headers-')), 'session-secret');
+  const user = createUser({ username: 'submission-headers-user', email: 'submission-headers-user@example.com', password: 'password123' });
+  saveSmtpCredential(user.id, { username: 'smtp-headers-user', password: 'smtp-password' });
+  const keys = createDkimKeyPair();
+  createDomain(user.id, {
+    domain: 'submission-headers.example',
+    selector: 'mh202607',
+    verificationToken: 'verify',
+    dkimPublic: keys.publicKey,
+    dkimPrivate: keys.privateKey,
+    senderHost: 'mail.submission-headers.example',
+    sendingIp: '192.0.2.10',
+    spfExtra: '',
+    dmarcPolicy: 'none',
+    dmarcRua: ''
+  });
+  const relay = await startFakeSmtpServer();
+  const [submission] = startSubmissionServer({
+    enabled: true,
+    listeners: [{ port: 0, protocol: 'smtp' }],
+    hostname: 'submission-headers.example',
+    allowInsecureAuth: true,
+    relayHost: '127.0.0.1',
+    relayPort: relay.port,
+    relaySecure: false,
+    relayUsername: '',
+    relayPassword: '',
+    relayHelo: 'mail.submission-headers.example',
+    getTrackingSettings: () => ({
+      enabled: false,
+      appBaseUrl: 'https://mail.example.com',
+      secret: 'tracking-secret'
+    }),
+    getDeliverabilitySettings: () => ({
+      listUnsubscribeMailto: 'unsubscribe@submission-headers.example',
+      listUnsubscribeUrl: 'https://submission-headers.example/unsubscribe/{eventId}/{recipient}',
+      listUnsubscribePostEnabled: true,
+      feedbackIdEnabled: true,
+      reportAbuseTo: 'abuse@submission-headers.example',
+      csaComplaintsTo: 'csa@submission-headers.example',
+      bounceAddress: 'bounce@submission-headers.example',
+      bounceEnvelopeEnabled: true,
+      secret: 'deliverability-secret'
+    })
+  });
+  await waitForListening(submission);
+
+  try {
+    const rawMessage = [
+      'From: noreply@submission-headers.example',
+      'To: reader@example.net',
+      'Subject: Submission headers',
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=UTF-8',
+      '',
+      'Hello',
+      ''
+    ].join('\r\n');
+    const response = await sendViaSmtp({
+      host: '127.0.0.1',
+      port: submission.address().port,
+      secure: false,
+      username: 'smtp-headers-user',
+      password: 'smtp-password',
+      helo: 'client.example',
+      mailFrom: 'noreply@submission-headers.example',
+      recipients: ['reader@example.net'],
+      rawMessage
+    });
+    assert.match(response.message, /Message queued/i);
+    await waitFor(() => relay.messages.length === 1);
+
+    const relayed = relay.messages[0];
+    assert.match(relayed, /^DKIM-Signature:[\s\S]*h=from:to:subject:date:message-id:mime-version:content-type:list-unsubscribe:list-unsubscribe-post:feedback-id:x-report-abuse-to:x-csa-complaints:x-sender/im);
+    assert.match(relayed, /^List-Unsubscribe: <mailto:unsubscribe@submission-headers\.example>,\n <https:\/\/submission-headers\.example\/unsubscribe\/\d+\/reader%40example\.net>$/m);
+    assert.match(relayed, /^List-Unsubscribe-Post: List-Unsubscribe=One-Click$/m);
+    assert.match(relayed, /^Feedback-Id: mh\.[a-f0-9]{12}\.[a-f0-9]{12}\.[a-f0-9]{12}:MailHub$/m);
+    assert.match(relayed, /^X-Report-Abuse-To: abuse@submission-headers\.example$/m);
+    assert.match(relayed, /^X-CSA-Complaints: csa@submission-headers\.example$/m);
+    assert.match(relayed, /^X-Sender: noreply@submission-headers\.example$/m);
+    assert.ok(relay.commands.some((command) => command === 'MAIL FROM:<bounce@submission-headers.example>'));
+  } finally {
+    await closeServer(submission);
+    await relay.close();
+  }
+});
+
 function startFakeSmtpServer() {
+  const commands = [];
   const messages = [];
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
@@ -123,6 +212,7 @@ function startFakeSmtpServer() {
           }
           continue;
         }
+        commands.push(line);
         if (line.startsWith('EHLO')) socket.write('250 relay.test\r\n');
         else if (line.startsWith('MAIL FROM') || line.startsWith('RCPT TO')) socket.write('250 ok\r\n');
         else if (line === 'DATA') {
@@ -139,6 +229,7 @@ function startFakeSmtpServer() {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => resolve({
       port: server.address().port,
+      commands,
       messages,
       close: () => closeServer(server)
     }));

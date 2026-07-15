@@ -9,6 +9,7 @@ import Dashboard from '../pages/Dashboard';
 import DnsApi from '../pages/DnsApi';
 import DomainDetail from '../pages/Domains/DomainDetail';
 import DomainsPage from '../pages/Domains';
+import Inbox from '../pages/Inbox';
 import PlaceholderPage from '../pages/PlaceholderPage';
 import SendingLogs from '../pages/SendingLogs';
 import Settings from '../pages/Settings';
@@ -27,6 +28,9 @@ import type {
   Domain,
   DomainMode,
   DomainPatchPayload,
+  InboundMailbox,
+  InboundMessage,
+  MailboxClientConfig,
   RuntimeConfig,
   SmtpCredential,
   SmtpRelay,
@@ -44,6 +48,8 @@ const emptyData: AppData = {
   smtpCredential: null,
   smtpCredentials: [],
   smtpRelays: [],
+  inboundMailboxes: [],
+  inboundMessages: [],
   dnsCredentials: [],
   apiTokens: [],
   settings: null,
@@ -55,6 +61,7 @@ const viewTitleKeys: Record<ViewKey, string> = {
   domains: 'nav.domains',
   'dns-api': 'nav.dnsApi',
   smtp: 'nav.smtp',
+  inbox: 'nav.inbox',
   tokens: 'nav.tokens',
   logs: 'nav.logs',
   webhooks: 'nav.webhooks',
@@ -98,10 +105,24 @@ function MailHubConsole() {
     setLoading(true);
     try {
       const me = await api.me();
-      const [config, domains, events, analytics, smtpCredential, smtpCredentials, smtpRelays, dnsCredentials, apiTokens] = await Promise.all([
+      const [
+        config,
+        domains,
+        events,
+        inboundMailboxes,
+        inboundMessages,
+        analytics,
+        smtpCredential,
+        smtpCredentials,
+        smtpRelays,
+        dnsCredentials,
+        apiTokens
+      ] = await Promise.all([
         api.config(),
         api.domains(),
         api.events(),
+        api.inboundMailboxes(),
+        api.inboundMessages(),
         api.analytics(7),
         api.smtpCredential(),
         api.smtpCredentials(),
@@ -121,6 +142,8 @@ function MailHubConsole() {
         config,
         domains: domains.domains || [],
         events: events.events || [],
+        inboundMailboxes: inboundMailboxes.mailboxes || [],
+        inboundMessages: inboundMessages.messages || [],
         analytics: analytics.analytics || null,
         smtpCredential: smtpCredential.credential || null,
         smtpCredentials: smtpCredentials.credentials || [],
@@ -237,6 +260,7 @@ function MailHubConsole() {
       from: `noreply@${domain.domain}`,
       subject: `MailHub test for ${domain.domain}`,
       text: `This is a MailHub test message from ${domain.domain}.`,
+      html: `<p>This is a MailHub test message from ${domain.domain}.</p><p><a href="${window.location.origin}/login">Open MailHub</a></p>`,
       smtpRelayId: domain.smtpRelayId || undefined
     });
   }
@@ -375,17 +399,81 @@ function MailHubConsole() {
     }));
   }
 
-  async function createApiToken(name: string) {
-    const result = await runAction(async () => api.createApiToken(name), t('tokens.createdSuccess'));
+  async function createInboundMailbox(values: {
+    address: string;
+    displayName?: string;
+    password: string;
+    aliases?: string;
+    forwardTo?: string;
+    keepForwarded?: boolean;
+    quotaMb?: number | string | null;
+  }): Promise<{ mailbox: InboundMailbox; clientConfig?: MailboxClientConfig } | null> {
+    const result = await runAction(async () => api.createInboundMailbox(values), t('actions.inboundMailboxCreated'));
+    if (!result?.mailbox) return null;
+    setData((current) => ({
+      ...current,
+      inboundMailboxes: [result.mailbox, ...current.inboundMailboxes]
+    }));
+    return result;
+  }
+
+  async function loadInboundMessages(mailboxId?: number | null) {
+    const result = await runAction(async () => api.inboundMessages(mailboxId));
+    if (!result?.messages) return [];
+    setData((current) => ({ ...current, inboundMessages: result.messages }));
+    return result.messages;
+  }
+
+  async function loadInboundMessage(id: number): Promise<InboundMessage | null> {
+    const result = await api.inboundMessage(id);
+    let inboundMessage = result.message;
+    if (inboundMessage && !inboundMessage.read) {
+      const readResult = await api.markInboundMessageRead(id, true);
+      inboundMessage = readResult.message || { ...inboundMessage, read: true };
+    }
+    if (inboundMessage) {
+      setData((current) => {
+        const previous = current.inboundMessages.find((item) => item.id === inboundMessage.id);
+        const shouldDecrementUnread = Boolean(previous && !previous.read && inboundMessage.read);
+        return {
+          ...current,
+          inboundMessages: current.inboundMessages.map((item) => (
+            item.id === inboundMessage.id ? { ...item, ...inboundMessage } : item
+          )),
+          inboundMailboxes: current.inboundMailboxes.map((mailbox) => (
+            mailbox.id === inboundMessage.mailboxId && shouldDecrementUnread
+              ? { ...mailbox, unreadCount: Math.max(0, mailbox.unreadCount - 1) }
+              : mailbox
+          ))
+        };
+      });
+    }
+    return inboundMessage;
+  }
+
+  async function createApiToken(values: { name: string; scopes: string[]; expiresAt?: string | null }) {
+    const result = await runAction(async () => api.createApiToken(values), t('tokens.createdSuccess'));
     if (!result?.token) return null;
     setData((current) => ({ ...current, apiTokens: [result.token, ...current.apiTokens] }));
     return result.token;
   }
 
-  async function deleteApiToken(token: ApiToken) {
-    const result = await runAction(async () => api.deleteApiToken(token.id), t('tokens.deletedSuccess'));
-    if (!result?.deleted) return;
-    setData((current) => ({ ...current, apiTokens: current.apiTokens.filter((item) => item.id !== token.id) }));
+  async function updateApiToken(token: ApiToken, values: { name: string; scopes: string[]; expiresAt?: string | null }) {
+    const result = await runAction(async () => api.updateApiToken(token.id, values), t('tokens.updatedSuccess'));
+    if (!result?.token) return;
+    setData((current) => ({
+      ...current,
+      apiTokens: current.apiTokens.map((item) => item.id === result.token.id ? result.token : item)
+    }));
+  }
+
+  async function revokeApiToken(token: ApiToken) {
+    const result = await runAction(async () => api.deleteApiToken(token.id), t('tokens.revokedSuccess'));
+    if (!result?.token) return;
+    setData((current) => ({
+      ...current,
+      apiTokens: current.apiTokens.map((item) => item.id === result.token?.id ? result.token : item)
+    }));
   }
 
   async function saveSettings(values: Partial<RuntimeConfig>) {
@@ -455,6 +543,9 @@ function MailHubConsole() {
             <Input />
           </Form.Item>
           <Form.Item name="text" label="Text">
+            <Input.TextArea rows={5} />
+          </Form.Item>
+          <Form.Item name="html" label="HTML">
             <Input.TextArea rows={5} />
           </Form.Item>
           <Form.Item name="smtpRelayId" label={t('smtpRelay.domainDefault')}>
@@ -552,6 +643,23 @@ function MailHubConsole() {
         />
       );
     }
+    if (activeView === 'inbox') {
+      return (
+        <Inbox
+          config={data.config}
+          domains={data.domains}
+          mailboxes={data.inboundMailboxes}
+          messages={data.inboundMessages}
+          loading={actionLoading}
+          onCreateMailbox={createInboundMailbox}
+          onPatchDomain={patchDomain}
+          onLoadMessages={loadInboundMessages}
+          onLoadMessage={loadInboundMessage}
+          onCopy={copy}
+          onAddDomain={() => setAddOpen(true)}
+        />
+      );
+    }
     if (activeView === 'tokens') {
       return (
         <ApiTokens
@@ -559,7 +667,8 @@ function MailHubConsole() {
           config={data.config}
           loading={actionLoading}
           onCreate={createApiToken}
-          onDelete={deleteApiToken}
+          onUpdate={updateApiToken}
+          onRevoke={revokeApiToken}
           onCopy={copy}
         />
       );

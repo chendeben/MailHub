@@ -39,7 +39,7 @@ export function buildDkimRecord(publicKey) {
 export function signDkim(rawMessage, options) {
   const headers = parseHeaders(rawMessage);
   const body = rawMessage.slice(rawMessage.indexOf('\r\n\r\n') + 4);
-  const signedHeaderNames = [
+  const baseSignedHeaderNames = [
     'from',
     'to',
     'subject',
@@ -48,21 +48,43 @@ export function signDkim(rawMessage, options) {
     'mime-version',
     'content-type'
   ];
+  const optionalSignedHeaderNames = [
+    'list-unsubscribe',
+    'list-unsubscribe-post',
+    'feedback-id',
+    'x-report-abuse-to',
+    'x-csa-complaints',
+    'x-sender',
+    'sender',
+    'reply-to'
+  ];
+  const presentHeaderNames = new Set(headers.map((header) => header.name.toLowerCase()));
+  const signedHeaderNames = [
+    ...baseSignedHeaderNames,
+    ...optionalSignedHeaderNames.filter((name) => presentHeaderNames.has(name))
+  ];
   const bodyHash = crypto
     .createHash('sha256')
     .update(canonicalizeBody(body))
     .digest('base64');
 
+  const now = Math.floor(Date.now() / 1000);
   const signatureFields = [
     'v=1',
     'a=rsa-sha256',
     'c=relaxed/relaxed',
+    'q=dns/txt',
     `d=${options.domain}`,
+    `i=${options.identity || `@${options.domain}`}`,
     `s=${options.selector}`,
+    `t=${now}`,
     `h=${signedHeaderNames.join(':')}`,
     `bh=${bodyHash}`,
     'b='
   ];
+  if (Number.isInteger(options.expiresInSeconds) && options.expiresInSeconds > 0) {
+    signatureFields.splice(signatureFields.length - 2, 0, `x=${now + options.expiresInSeconds}`);
+  }
   const dkimValueWithoutSignature = signatureFields.join('; ');
   const signingInput = [
     ...signedHeaderNames.map((name) => canonicalizeHeader(findHeader(headers, name))),

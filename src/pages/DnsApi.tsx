@@ -98,7 +98,7 @@ export default function DnsApi({ credentials, loading, onSave, onTest, onDelete 
               name="zoneName"
               label={t('dnsApi.zone')}
               rules={[{ required: true, message: t('dnsApi.zoneRequired') }]}
-              extra={provider === 'cloudflare' ? t('dnsApi.cloudflareZoneExtra') : undefined}
+              extra={t('dnsApi.zoneExtra')}
             >
               <Input placeholder="example.com" />
             </Form.Item>

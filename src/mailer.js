@@ -25,7 +25,7 @@ export function domainFromAddress(value) {
   return address.split('@')[1] || '';
 }
 
-export function buildMessage({ from, to, subject, text, html, baseUrl }) {
+export function buildMessage({ from, to, subject, text, html, baseUrl, headers: extraHeaders = [] }) {
   const recipients = Array.isArray(to) ? to : parseAddressList(to);
   if (!recipients.length) throw new Error('At least one recipient is required.');
   const messageIdHost = domainFromAddress(from) || 'localhost';
@@ -37,6 +37,7 @@ export function buildMessage({ from, to, subject, text, html, baseUrl }) {
     ['Date', new Date().toUTCString()],
     ['Message-ID', messageId],
     ['MIME-Version', '1.0'],
+    ...normalizeExtraHeaders(extraHeaders),
     ['X-MailHub', baseUrl || 'mailhub']
   ];
 
@@ -76,8 +77,78 @@ export function signMessageForDomain(rawMessage, domain) {
   return signDkim(rawMessage, {
     domain: domain.domain,
     selector: domain.selector,
-    privateKey: domain.dkimPrivate
+    privateKey: domain.dkimPrivate,
+    identity: `@${domain.domain}`
   });
+}
+
+export function buildDeliverabilityHeaders({
+  from = '',
+  listUnsubscribeMailto = '',
+  listUnsubscribeUrl = '',
+  listUnsubscribePostEnabled = false,
+  feedbackId = '',
+  reportAbuseTo = '',
+  csaComplaintsTo = '',
+  context = {}
+} = {}) {
+  const headers = [];
+  const unsubscribeLinks = [];
+  const mailto = normalizeMailtoListUnsubscribe(listUnsubscribeMailto);
+  const url = normalizeHttpListUnsubscribe(renderDeliverabilityTemplate(listUnsubscribeUrl, context));
+  if (mailto) unsubscribeLinks.push(`<${mailto}>`);
+  if (url) unsubscribeLinks.push(`<${url}>`);
+  if (unsubscribeLinks.length) {
+    headers.push(['List-Unsubscribe', unsubscribeLinks.join(', ')]);
+    if (listUnsubscribePostEnabled && isHttpsUrl(url)) {
+      headers.push(['List-Unsubscribe-Post', 'List-Unsubscribe=One-Click']);
+    }
+  }
+
+  const normalizedFeedbackId = normalizeFeedbackId(feedbackId);
+  if (normalizedFeedbackId) headers.push(['Feedback-Id', normalizedFeedbackId]);
+
+  const abuse = sanitizeHeader(reportAbuseTo);
+  if (abuse) headers.push(['X-Report-Abuse-To', abuse]);
+
+  const complaints = sanitizeHeader(csaComplaintsTo);
+  if (complaints) headers.push(['X-CSA-Complaints', complaints]);
+
+  const sender = extractAddress(from);
+  if (sender) headers.push(['X-Sender', sender]);
+
+  return headers;
+}
+
+export function addHeadersToRawMessage(rawMessage, headers = []) {
+  const extraHeaders = normalizeExtraHeaders(headers);
+  if (!extraHeaders.length) return rawMessage;
+  const normalized = normalizeMimeMessage(rawMessage);
+  const separator = normalized.indexOf('\r\n\r\n');
+  if (separator === -1) return `${formatHeaders(extraHeaders)}\r\n\r\n${normalized}`;
+
+  const headerBlock = normalized.slice(0, separator);
+  const body = normalized.slice(separator + 4);
+  const existingNames = new Set(parseHeaderNames(headerBlock));
+  const missingHeaders = extraHeaders.filter(([name]) => !existingNames.has(name.toLowerCase()));
+  if (!missingHeaders.length) return normalized;
+  return `${headerBlock}\r\n${formatHeaders(missingHeaders)}\r\n\r\n${body}`;
+}
+
+export function createFeedbackId({ userId, domainId, eventId, secret, product = 'MailHub' } = {}) {
+  const key = String(secret || 'mailhub-feedback');
+  const safeProduct = normalizeFeedbackId(product) || 'MailHub';
+  return [
+    'mh',
+    feedbackPart('user', userId, key),
+    feedbackPart('domain', domainId, key),
+    `${feedbackPart('event', eventId, key)}:${safeProduct}`
+  ].join('.');
+}
+
+export function resolveEnvelopeSender(settings = {}, fallback = '') {
+  if (!settings.bounceEnvelopeEnabled) return fallback;
+  return extractAddress(settings.bounceAddress) || fallback;
 }
 
 export async function sendViaSmtp({ host, port, secure, username, password, helo, mailFrom, recipients, rawMessage }) {
@@ -198,8 +269,109 @@ function encodeHeader(value) {
 function formatHeaders(headers) {
   return headers
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
-    .map(([name, value]) => `${name}: ${value}`)
+    .map(([name, value]) => formatHeader(name, value))
     .join('\r\n');
+}
+
+function formatHeader(name, value) {
+  const line = `${name}: ${value}`;
+  if (line.length <= 78) return line;
+  return foldStructuredHeader(name, value);
+}
+
+function foldStructuredHeader(name, value) {
+  const prefix = `${name}: `;
+  const lines = [];
+  let current = prefix;
+  for (const token of splitHeaderTokens(value)) {
+    if (current.length > prefix.length && current.length + token.length > 78) {
+      lines.push(current.trimEnd());
+      current = ` ${token.trimStart()}`;
+      continue;
+    }
+    current += token;
+  }
+  lines.push(current.trimEnd());
+  return lines.join('\r\n');
+}
+
+function splitHeaderTokens(value) {
+  return String(value).split(/((?:,\s+)|\s+)/).filter(Boolean);
+}
+
+function normalizeExtraHeaders(headers) {
+  return (headers || [])
+    .filter((header) => Array.isArray(header) && isHeaderName(header[0]))
+    .map(([name, value]) => [String(name), sanitizeHeader(value)])
+    .filter(([, value]) => value);
+}
+
+function isHeaderName(value) {
+  return /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/.test(String(value || ''));
+}
+
+function normalizeMailtoListUnsubscribe(value) {
+  const clean = sanitizeHeader(value);
+  if (!clean) return '';
+  if (/^mailto:/i.test(clean)) return clean;
+  const address = extractAddress(clean);
+  return address ? `mailto:${address}` : '';
+}
+
+function normalizeHttpListUnsubscribe(value) {
+  const clean = sanitizeHeader(value);
+  if (!clean) return '';
+  try {
+    const url = new URL(clean);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
+function isHttpsUrl(value) {
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function normalizeMimeMessage(value) {
+  return String(value || '').replace(/\r?\n/g, '\r\n');
+}
+
+function parseHeaderNames(headerBlock) {
+  const names = [];
+  for (const line of String(headerBlock || '').split('\r\n')) {
+    if (/^[\t ]/.test(line)) continue;
+    const index = line.indexOf(':');
+    if (index === -1) continue;
+    names.push(line.slice(0, index).toLowerCase());
+  }
+  return names;
+}
+
+function renderDeliverabilityTemplate(value, context = {}) {
+  return String(value || '').replace(/\{(eventId|recipient|sender|domain|userId)\}/g, (_match, key) => {
+    const replacement = context[key] ?? '';
+    return encodeURIComponent(String(replacement));
+  });
+}
+
+function normalizeFeedbackId(value) {
+  const clean = sanitizeHeader(value);
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clean)) return '';
+  return clean;
+}
+
+function feedbackPart(name, value, secret) {
+  return crypto
+    .createHmac('sha256', secret)
+    .update(`${name}:${String(value ?? '')}`)
+    .digest('hex')
+    .slice(0, 12);
 }
 
 function normalizeBody(value) {

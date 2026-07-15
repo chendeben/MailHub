@@ -19,12 +19,15 @@ import {
 let db;
 let secretKey = '';
 export const USER_STATUSES = new Set(['pending_email', 'pending_review', 'active', 'disabled']);
+export const STANDARD_INBOUND_FOLDERS = ['INBOX', 'Sent', 'Drafts', 'Trash', 'Junk', 'Archive'];
+export const API_TOKEN_SCOPES = new Set(['send', 'mailboxes:read', 'mailboxes:write']);
 const auditSecretKeyPattern = /password|secret|token|key|credential|dkim[_-]?private|authorization/i;
 const auditDescriptorKeyPattern = /^(field|name|path|key|header)$/i;
 const auditDescriptorValuePattern = /password|secret|token|key|credential|dkim[_-]?private|authorization/i;
 const auditDescriptorWrapperKeyPattern = /^(change|context|descriptor|meta)$/i;
 const auditValueLikeKeyPattern = /^(value|from|to|old|new|old_?value|new_?value|before|after)$/i;
 const maxAccountTokenTtlMinutes = 7 * 24 * 60;
+const defaultApiTokenScopes = ['send'];
 
 export function initDatabase(dataDir, secret = '') {
   secretKey = String(secret || process.env.SESSION_SECRET || process.env.API_TOKEN || process.env.ADMIN_PASSWORD || '');
@@ -61,6 +64,7 @@ export function initDatabase(dataDir, secret = '') {
       spf_extra TEXT NOT NULL DEFAULT '',
       dmarc_policy TEXT NOT NULL DEFAULT 'none',
       dmarc_rua TEXT NOT NULL DEFAULT '',
+      catch_all_address TEXT NOT NULL DEFAULT '',
       status_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -150,12 +154,76 @@ export function initDatabase(dataDir, secret = '') {
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS inbound_mailboxes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      domain_id INTEGER NOT NULL,
+      address TEXT NOT NULL UNIQUE,
+      local_part TEXT NOT NULL,
+      display_name TEXT NOT NULL DEFAULT '',
+      password_hash TEXT NOT NULL DEFAULT '',
+      password_secret TEXT NOT NULL DEFAULT '',
+      aliases_json TEXT NOT NULL DEFAULT '[]',
+      forward_to_json TEXT NOT NULL DEFAULT '[]',
+      keep_forwarded TEXT NOT NULL DEFAULT 'true',
+      quota_mb INTEGER,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      deleted_at TEXT,
+      expires_at TEXT,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS inbound_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mailbox_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      domain_id INTEGER NOT NULL,
+      folder TEXT NOT NULL DEFAULT 'INBOX',
+      sender TEXT NOT NULL DEFAULT '',
+      recipients_json TEXT NOT NULL DEFAULT '[]',
+      subject TEXT NOT NULL DEFAULT '',
+      message_id TEXT NOT NULL DEFAULT '',
+      raw_message TEXT NOT NULL DEFAULT '',
+      text_body TEXT NOT NULL DEFAULT '',
+      html_body TEXT NOT NULL DEFAULT '',
+      preview TEXT NOT NULL DEFAULT '',
+      read_state TEXT NOT NULL DEFAULT 'false',
+      received_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      deleted_at TEXT,
+      FOREIGN KEY(mailbox_id) REFERENCES inbound_mailboxes(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS inbound_folders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mailbox_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      subscribed TEXT NOT NULL DEFAULT 'true',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      deleted_at TEXT,
+      UNIQUE(mailbox_id, name),
+      FOREIGN KEY(mailbox_id) REFERENCES inbound_mailboxes(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS api_tokens (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
       name TEXT NOT NULL,
       token_hash TEXT NOT NULL UNIQUE,
       token_prefix TEXT NOT NULL,
+      scopes_json TEXT NOT NULL DEFAULT '["send"]',
+      expires_at TEXT,
+      revoked_at TEXT,
+      revoked_reason TEXT NOT NULL DEFAULT '',
       last_used_at TEXT,
       created_at TEXT NOT NULL,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -242,10 +310,16 @@ export function initDatabase(dataDir, secret = '') {
     CREATE INDEX IF NOT EXISTS idx_tracking_events_event_time ON tracking_events(send_event_id, occurred_at);
     CREATE INDEX IF NOT EXISTS idx_tracking_events_link_time ON tracking_events(tracking_link_id, occurred_at);
     CREATE INDEX IF NOT EXISTS idx_tracking_events_type_time ON tracking_events(event_type, occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_inbound_mailboxes_user_id ON inbound_mailboxes(user_id);
+    CREATE INDEX IF NOT EXISTS idx_inbound_mailboxes_domain_id ON inbound_mailboxes(domain_id);
+    CREATE INDEX IF NOT EXISTS idx_inbound_messages_user_received ON inbound_messages(user_id, received_at);
+    CREATE INDEX IF NOT EXISTS idx_inbound_messages_mailbox_received ON inbound_messages(mailbox_id, received_at);
+    CREATE INDEX IF NOT EXISTS idx_inbound_folders_mailbox ON inbound_folders(mailbox_id, deleted_at);
   `);
   ensureColumn('domains', 'user_id', 'INTEGER');
   ensureColumn('domains', 'dns_credential_id', 'INTEGER');
   ensureColumn('domains', 'smtp_relay_id', 'INTEGER');
+  ensureColumn('domains', 'catch_all_address', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('send_events', 'user_id', 'INTEGER');
   ensureColumn('send_events', 'smtp_relay_id', 'INTEGER');
   ensureColumn('send_events', 'queue_id', "TEXT NOT NULL DEFAULT ''");
@@ -257,6 +331,18 @@ export function initDatabase(dataDir, secret = '') {
   ensureColumn('send_events', 'tracking_clicks', "TEXT NOT NULL DEFAULT 'false'");
   migrateSmtpCredentialsToMultiplePerUser();
   ensureColumn('smtp_credentials', 'password_secret', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('inbound_mailboxes', 'password_hash', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('inbound_mailboxes', 'password_secret', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('inbound_mailboxes', 'aliases_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('inbound_mailboxes', 'forward_to_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('inbound_mailboxes', 'keep_forwarded', "TEXT NOT NULL DEFAULT 'true'");
+  ensureColumn('inbound_mailboxes', 'quota_mb', 'INTEGER');
+  ensureColumn('inbound_mailboxes', 'expires_at', 'TEXT');
+  ensureColumn('inbound_messages', 'folder', "TEXT NOT NULL DEFAULT 'INBOX'");
+  ensureColumn('api_tokens', 'scopes_json', "TEXT NOT NULL DEFAULT '[\"send\"]'");
+  ensureColumn('api_tokens', 'expires_at', 'TEXT');
+  ensureColumn('api_tokens', 'revoked_at', 'TEXT');
+  ensureColumn('api_tokens', 'revoked_reason', "TEXT NOT NULL DEFAULT ''");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_domains_user_id ON domains(user_id);
     CREATE INDEX IF NOT EXISTS idx_domains_smtp_relay_id ON domains(smtp_relay_id);
@@ -269,6 +355,9 @@ export function initDatabase(dataDir, secret = '') {
       WHERE tracking_token_hash IS NOT NULL AND tracking_token_hash != '';
     CREATE INDEX IF NOT EXISTS idx_smtp_credentials_user_id ON smtp_credentials(user_id);
     CREATE INDEX IF NOT EXISTS idx_smtp_relays_user_id ON smtp_relays(user_id);
+    CREATE INDEX IF NOT EXISTS idx_api_tokens_user_status ON api_tokens(user_id, revoked_at, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_inbound_messages_mailbox_folder_received ON inbound_messages(mailbox_id, folder, received_at);
+    CREATE INDEX IF NOT EXISTS idx_inbound_folders_mailbox ON inbound_folders(mailbox_id, deleted_at);
   `);
   normalizeSendEventQueueIds();
   normalizeDkimPublicKeys();
@@ -375,6 +464,8 @@ export function listUsersWithResourceCounts() {
         (SELECT COUNT(*) FROM domains WHERE domains.user_id = users.id) AS domains_count,
         (SELECT COUNT(*) FROM dns_credentials WHERE dns_credentials.user_id = users.id) AS dns_credentials_count,
         (SELECT COUNT(*) FROM api_tokens WHERE api_tokens.user_id = users.id) AS api_tokens_count,
+        (SELECT COUNT(*) FROM inbound_mailboxes WHERE inbound_mailboxes.user_id = users.id AND inbound_mailboxes.deleted_at IS NULL) AS inbound_mailboxes_count,
+        (SELECT COUNT(*) FROM inbound_messages WHERE inbound_messages.user_id = users.id AND inbound_messages.deleted_at IS NULL) AS inbound_messages_count,
         (SELECT COUNT(*) FROM send_events WHERE send_events.user_id = users.id) AS send_events_count,
         (SELECT COUNT(*) FROM smtp_credentials WHERE smtp_credentials.user_id = users.id) AS smtp_credentials_count
       FROM users
@@ -387,6 +478,8 @@ export function listUsersWithResourceCounts() {
         domains: Number(row.domains_count || 0),
         dnsCredentials: Number(row.dns_credentials_count || 0),
         apiTokens: Number(row.api_tokens_count || 0),
+        inboundMailboxes: Number(row.inbound_mailboxes_count || 0),
+        inboundMessages: Number(row.inbound_messages_count || 0),
         sendEvents: Number(row.send_events_count || 0),
         smtpCredential: Number(row.smtp_credentials_count || 0)
       }
@@ -411,9 +504,32 @@ export function getAdminResourceInventory() {
     .prepare('SELECT * FROM api_tokens ORDER BY user_id, created_at DESC')
     .all()
     .map(publicApiToken);
+  const inboundMailboxes = requireDb()
+    .prepare(`
+      SELECT
+        m.*,
+        d.domain,
+        COUNT(msg.id) AS message_count,
+        COALESCE(SUM(CASE WHEN msg.read_state = 'false' THEN 1 ELSE 0 END), 0) AS unread_count,
+        MAX(msg.received_at) AS last_message_at
+      FROM inbound_mailboxes m
+      JOIN domains d ON d.id = m.domain_id
+      LEFT JOIN inbound_messages msg ON msg.mailbox_id = m.id AND msg.deleted_at IS NULL
+      WHERE m.deleted_at IS NULL
+      GROUP BY m.id
+      ORDER BY m.user_id, COALESCE(last_message_at, m.created_at) DESC, m.id DESC
+    `)
+    .all()
+    .map(publicInboundMailbox);
   const sendEventCounts = new Map(
     requireDb()
       .prepare('SELECT user_id, COUNT(*) AS count FROM send_events GROUP BY user_id')
+      .all()
+      .map((row) => [row.user_id, Number(row.count || 0)])
+  );
+  const inboundMessageCounts = new Map(
+    requireDb()
+      .prepare('SELECT user_id, COUNT(*) AS count FROM inbound_messages WHERE deleted_at IS NULL GROUP BY user_id')
       .all()
       .map((row) => [row.user_id, Number(row.count || 0)])
   );
@@ -426,6 +542,8 @@ export function getAdminResourceInventory() {
       dnsCredentials: dnsCredentials.filter((credential) => credential.userId === user.id),
       smtpCredential: smtpCredentials.find((credential) => credential.userId === user.id) || null,
       apiTokens: apiTokens.filter((token) => token.userId === user.id),
+      inboundMailboxes: inboundMailboxes.filter((mailbox) => mailbox.userId === user.id),
+      inboundMessageCount: inboundMessageCounts.get(user.id) || 0,
       sendEventCount: sendEventCounts.get(user.id) || 0
     })),
     warnings: domains.flatMap((domain) => {
@@ -453,6 +571,7 @@ export function transferDomain({ actorUserId, domainId, targetUserId, dnsCredent
     requireDb()
       .prepare('UPDATE domains SET user_id = ?, dns_credential_id = ?, updated_at = ? WHERE id = ?')
       .run(target.id, nextDnsCredentialId, now(), domain.id);
+    const inboundCounts = moveInboundDomainResources(domain.id, target.id);
     if (mode === 'with_dns_credential' && domain.dns_credential_id) {
       const credential = requireDnsCredentialRow(domain.dns_credential_id);
       if (credential.user_id !== domain.user_id) throw new Error('DNS 凭据归属不一致。');
@@ -472,7 +591,9 @@ export function transferDomain({ actorUserId, domainId, targetUserId, dnsCredent
         fromUserId: domain.user_id,
         toUserId: target.id,
         dnsCredentialMode: mode,
-        dnsCredentialId: domain.dns_credential_id || null
+        dnsCredentialId: domain.dns_credential_id || null,
+        inboundMailboxes: inboundCounts.mailboxes,
+        inboundMessages: inboundCounts.messages
       }
     });
     return updated;
@@ -548,6 +669,8 @@ export function previewUserMerge({ sourceUserId, targetUserId }) {
     domains: countRows('domains', source.id),
     dnsCredentials: countRows('dns_credentials', source.id),
     apiTokens: countRows('api_tokens', source.id),
+    inboundMailboxes: countRows('inbound_mailboxes', source.id, 'deleted_at IS NULL'),
+    inboundMessages: countRows('inbound_messages', source.id, 'deleted_at IS NULL'),
     sendEvents: countRows('send_events', source.id),
     smtpCredential: sourceSmtpCredentials.length
   };
@@ -563,6 +686,8 @@ export function previewUserMerge({ sourceUserId, targetUserId }) {
     domains: counts.domains,
     dnsCredentials: counts.dnsCredentials,
     apiTokens: counts.apiTokens,
+    inboundMailboxes: defaultOptions.transferDomains ? counts.inboundMailboxes : 0,
+    inboundMessages: defaultOptions.transferDomains ? counts.inboundMessages : 0,
     sendEvents: counts.sendEvents,
     smtpCredential: defaultOptions.transferSmtpCredential ? counts.smtpCredential : 0
   };
@@ -592,10 +717,15 @@ export function executeUserMerge({ actorUserId, sourceUserId, targetUserId, opti
     if (confirmation !== preview.confirmationText) throw new Error('确认文本不匹配。');
     const sourceId = preview.sourceUser.id;
     const targetId = preview.targetUser.id;
+    const inboundCounts = options.transferDomains === false
+      ? { mailboxes: 0, messages: 0 }
+      : moveInboundResourcesForUserDomains(sourceId, targetId);
     const counts = {
       domains: options.transferDomains === false ? 0 : moveRows('domains', sourceId, targetId),
       dnsCredentials: options.transferDnsCredentials === false ? 0 : moveRows('dns_credentials', sourceId, targetId),
       apiTokens: options.transferApiTokens === false ? 0 : moveRows('api_tokens', sourceId, targetId),
+      inboundMailboxes: inboundCounts.mailboxes,
+      inboundMessages: inboundCounts.messages,
       sendEvents: options.transferSendEvents === false ? 0 : moveRows('send_events', sourceId, targetId),
       smtpCredential: 0
     };
@@ -748,6 +878,396 @@ export function createDomain(userId, domain) {
   return getDomain(result.lastInsertRowid, { userId });
 }
 
+export function createInboundMailbox(userId, mailbox = {}) {
+  const address = normalizeInboundAddress(mailbox.address);
+  if (!address) throw new Error('收信邮箱格式不正确。');
+  const [localPart, domainName] = address.split('@');
+  const domain = getDomainByName(domainName, { userId });
+  if (!domain) throw new Error('收信域名不存在。');
+  const password = String(mailbox.password || '');
+  const passwordHash = password ? hashPassword(password) : '';
+  const passwordSecret = password ? encryptSecret(password) : '';
+  const aliases = normalizeMailboxAliases(mailbox.aliases, domain.domain, localPart);
+  const forwardTo = normalizeRecipientList(mailbox.forwardTo);
+  const keepForwarded = boolString(mailbox.keepForwarded ?? true);
+  const quotaMb = normalizeQuotaMb(mailbox.quotaMb);
+  const expiresAt = normalizeInboundMailboxExpiresAt(mailbox.expiresAt);
+  const createdAt = now();
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO inbound_mailboxes (
+        user_id, domain_id, address, local_part, display_name, password_hash, password_secret,
+        aliases_json, forward_to_json, keep_forwarded, quota_mb, status, expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+    `)
+    .run(
+      userId,
+      domain.id,
+      address,
+      localPart,
+      String(mailbox.displayName || '').trim(),
+      passwordHash,
+      passwordSecret,
+      JSON.stringify(aliases),
+      JSON.stringify(forwardTo),
+      keepForwarded,
+      quotaMb,
+      expiresAt,
+      createdAt,
+      createdAt
+    );
+  return getInboundMailbox(result.lastInsertRowid, userId);
+}
+
+export function updateInboundMailbox(userId, id, patch = {}) {
+  const current = getInboundMailbox(id, userId, { includeSecret: true });
+  if (!current) return null;
+  const password = Object.hasOwn(patch, 'password') ? String(patch.password || '') : null;
+  const next = {
+    displayName: patch.displayName === undefined ? current.displayName : String(patch.displayName || '').trim(),
+    passwordHash: password ? hashPassword(password) : current.passwordHash,
+    passwordSecret: password ? encryptSecret(password) : current.passwordSecret,
+    aliases: Object.hasOwn(patch, 'aliases')
+      ? normalizeMailboxAliases(patch.aliases, current.domain, current.localPart)
+      : current.aliases,
+    forwardTo: Object.hasOwn(patch, 'forwardTo') ? normalizeRecipientList(patch.forwardTo) : current.forwardTo,
+    keepForwarded: Object.hasOwn(patch, 'keepForwarded') ? Boolean(patch.keepForwarded) : current.keepForwarded,
+    quotaMb: Object.hasOwn(patch, 'quotaMb') ? normalizeQuotaMb(patch.quotaMb) : current.quotaMb,
+    expiresAt: Object.hasOwn(patch, 'expiresAt') ? normalizeInboundMailboxExpiresAt(patch.expiresAt) : current.expiresAt,
+    status: patch.status === undefined ? current.status : normalizeInboundMailboxStatus(patch.status),
+    updatedAt: now()
+  };
+  if (!next.passwordHash) next.passwordSecret = '';
+  requireDb()
+    .prepare(`
+      UPDATE inbound_mailboxes
+      SET display_name = ?, password_hash = ?, password_secret = ?, aliases_json = ?, forward_to_json = ?,
+          keep_forwarded = ?, quota_mb = ?, expires_at = ?, status = ?, updated_at = ?
+      WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+    `)
+    .run(
+      next.displayName,
+      next.passwordHash || '',
+      next.passwordSecret || '',
+      JSON.stringify(next.aliases),
+      JSON.stringify(next.forwardTo),
+      boolString(next.keepForwarded),
+      next.quotaMb,
+      next.expiresAt,
+      next.status,
+      next.updatedAt,
+      Number(id),
+      userId
+    );
+  return getInboundMailbox(id, userId);
+}
+
+export function listInboundMailboxes(userId) {
+  return requireDb()
+    .prepare(`
+      SELECT
+        m.*,
+        d.domain,
+        COUNT(msg.id) AS message_count,
+        COALESCE(SUM(CASE WHEN msg.read_state = 'false' THEN 1 ELSE 0 END), 0) AS unread_count,
+        MAX(msg.received_at) AS last_message_at
+      FROM inbound_mailboxes m
+      JOIN domains d ON d.id = m.domain_id
+      LEFT JOIN inbound_messages msg ON msg.mailbox_id = m.id AND msg.deleted_at IS NULL
+      WHERE m.user_id = ? AND m.deleted_at IS NULL
+      GROUP BY m.id
+      ORDER BY COALESCE(last_message_at, m.created_at) DESC, m.id DESC
+    `)
+    .all(userId)
+    .map(publicInboundMailbox);
+}
+
+export function getInboundMailbox(id, userId, { includeHash = false, includeSecret = false } = {}) {
+  const row = requireDb()
+    .prepare(`
+      SELECT
+        m.*,
+        d.domain,
+        COUNT(msg.id) AS message_count,
+        COALESCE(SUM(CASE WHEN msg.read_state = 'false' THEN 1 ELSE 0 END), 0) AS unread_count,
+        MAX(msg.received_at) AS last_message_at
+      FROM inbound_mailboxes m
+      JOIN domains d ON d.id = m.domain_id
+      LEFT JOIN inbound_messages msg ON msg.mailbox_id = m.id AND msg.deleted_at IS NULL
+      WHERE m.id = ? AND m.user_id = ? AND m.deleted_at IS NULL
+      GROUP BY m.id
+    `)
+    .get(Number(id), userId);
+  return publicInboundMailbox(row, { includeHash, includeSecret });
+}
+
+export function getInboundMailboxByAddress(address, { includeHash = false, includeSecret = false } = {}) {
+  const cleanAddress = normalizeInboundAddress(address);
+  if (!cleanAddress) return null;
+  const row = requireDb()
+    .prepare(`
+      SELECT m.*, d.domain, 0 AS message_count, 0 AS unread_count, NULL AS last_message_at
+      FROM inbound_mailboxes m
+      JOIN domains d ON d.id = m.domain_id
+      JOIN users u ON u.id = m.user_id
+      WHERE m.address = ?
+        AND m.status = 'active'
+        AND m.deleted_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at = '' OR m.expires_at > ?)
+        AND u.status = 'active'
+      LIMIT 1
+    `)
+    .get(cleanAddress, now());
+  return publicInboundMailbox(row, { includeHash, includeSecret });
+}
+
+export function verifyInboundMailboxCredential(username, password) {
+  const mailboxAddress = normalizeInboundAddress(username);
+  if (!mailboxAddress) return null;
+  const row = requireDb()
+    .prepare(`
+      SELECT
+        m.*,
+        d.domain,
+        0 AS message_count,
+        0 AS unread_count,
+        NULL AS last_message_at,
+        u.id AS auth_user_id,
+        u.username AS auth_username,
+        u.email,
+        u.role,
+        u.status AS user_status
+      FROM inbound_mailboxes m
+      JOIN domains d ON d.id = m.domain_id
+      JOIN users u ON u.id = m.user_id
+      WHERE m.address = ?
+        AND m.status = 'active'
+        AND m.deleted_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at = '' OR m.expires_at > ?)
+      LIMIT 1
+    `)
+    .get(mailboxAddress, now());
+  if (!row?.password_hash || row.user_status !== 'active' || !verifyPassword(password, row.password_hash)) return null;
+  return {
+    user: {
+      id: row.auth_user_id,
+      username: row.auth_username,
+      email: row.email,
+      role: row.role,
+      status: row.user_status
+    },
+    mailbox: publicInboundMailbox(row)
+  };
+}
+
+export function resolveInboundRecipient(address) {
+  const recipient = normalizeInboundAddress(address);
+  if (!recipient) return null;
+  const exactMailbox = getInboundMailboxByAddress(recipient);
+  if (exactMailbox) return inboundRouteForMailbox(recipient, exactMailbox);
+
+  const aliasMailbox = getInboundMailboxByAliasAddress(recipient);
+  if (aliasMailbox) return inboundRouteForMailbox(recipient, aliasMailbox, { alias: true });
+
+  const [, domainName] = recipient.split('@');
+  const domain = getDomainByName(domainName);
+  const catchAllAddress = normalizeCatchAllAddress(domain?.catchAllAddress);
+  if (!domain || !catchAllAddress) return null;
+  if (catchAllAddress === '/dev/null') {
+    return {
+      recipient,
+      domainId: domain.id,
+      userId: domain.userId,
+      mailbox: null,
+      forwardTo: [],
+      keepForwarded: false,
+      drop: true,
+      catchAll: true,
+      alias: false
+    };
+  }
+
+  const catchAllMailbox = getInboundMailboxByAddress(catchAllAddress);
+  if (catchAllMailbox) return inboundRouteForMailbox(recipient, catchAllMailbox, { catchAll: true });
+
+  const forwardTo = normalizeRecipientList(catchAllAddress);
+  if (!forwardTo.length) return null;
+  return {
+    recipient,
+    domainId: domain.id,
+    userId: domain.userId,
+    mailbox: null,
+    forwardTo,
+    keepForwarded: false,
+    drop: false,
+    catchAll: true,
+    alias: false
+  };
+}
+
+export function createInboundMessage(mailbox, message = {}) {
+  if (!mailbox?.id || !mailbox?.userId || !mailbox?.domainId) throw new Error('收信邮箱不存在。');
+  const receivedAt = message.receivedAt || now();
+  const folder = normalizeInboundFolder(message.folder) || 'INBOX';
+  const textBody = String(message.textBody || '');
+  const htmlBody = String(message.htmlBody || '');
+  const rawMessage = String(message.rawMessage || '');
+  if (!isStandardInboundFolder(folder)) createInboundFolder(mailbox, folder);
+  const result = requireDb()
+    .prepare(`
+      INSERT INTO inbound_messages (
+        mailbox_id, user_id, domain_id, folder, sender, recipients_json, subject, message_id,
+        raw_message, text_body, html_body, preview, read_state, received_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'false', ?, ?, ?)
+    `)
+    .run(
+      mailbox.id,
+      mailbox.userId,
+      mailbox.domainId,
+      folder,
+      normalizeEmail(message.sender) || String(message.sender || '').trim(),
+      JSON.stringify(normalizeRecipientList(message.recipients)),
+      String(message.subject || '').trim() || '(no subject)',
+      String(message.messageId || '').trim(),
+      rawMessage,
+      textBody,
+      htmlBody,
+      inboundPreview(textBody || htmlToText(htmlBody) || rawMessage),
+      receivedAt,
+      receivedAt,
+      receivedAt
+    );
+  return getInboundMessage(mailbox.userId, result.lastInsertRowid);
+}
+
+export function listInboundMessages(userId, { mailboxId = null, folder = 'INBOX' } = {}) {
+  const where = ['msg.user_id = ?', 'msg.deleted_at IS NULL'];
+  const params = [userId];
+  if (mailboxId) {
+    where.push('msg.mailbox_id = ?');
+    params.push(Number(mailboxId));
+  }
+  if (folder !== null) {
+    where.push('msg.folder = ?');
+    params.push(normalizeInboundFolder(folder) || 'INBOX');
+  }
+  return requireDb()
+    .prepare(`
+      SELECT msg.*, m.address AS mailbox_address, d.domain
+      FROM inbound_messages msg
+      JOIN inbound_mailboxes m ON m.id = msg.mailbox_id
+      JOIN domains d ON d.id = msg.domain_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY msg.received_at DESC, msg.id DESC
+    `)
+    .all(...params)
+    .map((row) => publicInboundMessage(row));
+}
+
+export function getInboundMessage(userId, id) {
+  const row = requireDb()
+    .prepare(`
+      SELECT msg.*, m.address AS mailbox_address, d.domain
+      FROM inbound_messages msg
+      JOIN inbound_mailboxes m ON m.id = msg.mailbox_id
+      JOIN domains d ON d.id = msg.domain_id
+      WHERE msg.id = ? AND msg.user_id = ? AND msg.deleted_at IS NULL
+    `)
+    .get(Number(id), userId);
+  return publicInboundMessage(row, { includeBody: true });
+}
+
+export function listInboundFolders(mailbox) {
+  if (!mailbox?.id || !mailbox?.userId) return [...STANDARD_INBOUND_FOLDERS];
+  const custom = requireDb()
+    .prepare(`
+      SELECT name
+      FROM inbound_folders
+      WHERE mailbox_id = ? AND user_id = ? AND deleted_at IS NULL
+      ORDER BY name COLLATE NOCASE
+    `)
+    .all(Number(mailbox.id), mailbox.userId)
+    .map((row) => row.name)
+    .filter((name) => !isStandardInboundFolder(name));
+  return [...STANDARD_INBOUND_FOLDERS, ...custom];
+}
+
+export function createInboundFolder(mailbox, folder) {
+  if (!mailbox?.id || !mailbox?.userId) throw new Error('收信邮箱不存在。');
+  const name = normalizeInboundFolder(folder);
+  if (!name) throw new Error('IMAP 文件夹名称不正确。');
+  if (isStandardInboundFolder(name)) return { name, standard: true };
+  const createdAt = now();
+  requireDb()
+    .prepare(`
+      INSERT OR IGNORE INTO inbound_folders (mailbox_id, user_id, name, subscribed, created_at, updated_at)
+      VALUES (?, ?, ?, 'true', ?, ?)
+    `)
+    .run(Number(mailbox.id), mailbox.userId, name, createdAt, createdAt);
+  return { name, standard: false };
+}
+
+export function inboundFolderExists(mailbox, folder) {
+  if (!mailbox?.id || !mailbox?.userId) return false;
+  const name = normalizeInboundFolder(folder);
+  if (!name) return false;
+  if (isStandardInboundFolder(name)) return true;
+  return Boolean(requireDb()
+    .prepare(`
+      SELECT id
+      FROM inbound_folders
+      WHERE mailbox_id = ? AND user_id = ? AND name = ? AND deleted_at IS NULL
+      LIMIT 1
+    `)
+    .get(Number(mailbox.id), mailbox.userId, name));
+}
+
+export function listInboundMailboxProtocolMessages(mailbox, { folder = 'INBOX' } = {}) {
+  if (!mailbox?.id || !mailbox?.userId) return [];
+  const selectedFolder = normalizeInboundFolder(folder) || 'INBOX';
+  return requireDb()
+    .prepare(`
+      SELECT msg.*, m.address AS mailbox_address, d.domain
+      FROM inbound_messages msg
+      JOIN inbound_mailboxes m ON m.id = msg.mailbox_id
+      JOIN domains d ON d.id = msg.domain_id
+      WHERE msg.mailbox_id = ? AND msg.user_id = ? AND msg.folder = ? AND msg.deleted_at IS NULL
+      ORDER BY msg.id ASC
+    `)
+    .all(Number(mailbox.id), mailbox.userId, selectedFolder)
+    .map((row) => publicInboundMessage(row, { includeBody: true }));
+}
+
+export function markInboundMessageRead(userId, id, read = true) {
+  const updatedAt = now();
+  const result = requireDb()
+    .prepare('UPDATE inbound_messages SET read_state = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL')
+    .run(read ? 'true' : 'false', updatedAt, Number(id), userId);
+  if (!result.changes) return null;
+  return getInboundMessage(userId, id);
+}
+
+export function softDeleteInboundMessages(userId, mailboxId, ids, { folder = null } = {}) {
+  const cleanIds = [...new Set((Array.isArray(ids) ? ids : [ids])
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0))];
+  if (!cleanIds.length) return 0;
+  const folderClause = folder === null ? '' : 'AND folder = ?';
+  const placeholders = cleanIds.map(() => '?').join(', ');
+  const updatedAt = now();
+  const params = folder === null
+    ? [updatedAt, updatedAt, userId, Number(mailboxId), ...cleanIds]
+    : [updatedAt, updatedAt, userId, Number(mailboxId), normalizeInboundFolder(folder) || 'INBOX', ...cleanIds];
+  const result = requireDb()
+    .prepare(`
+      UPDATE inbound_messages
+      SET deleted_at = ?, updated_at = ?
+      WHERE user_id = ? AND mailbox_id = ? AND deleted_at IS NULL ${folderClause} AND id IN (${placeholders})
+    `)
+    .run(...params);
+  return result.changes;
+}
+
 export function updateDomain(id, userId, patch) {
   const current = getDomain(id, { userId, includePrivate: true });
   if (!current) return null;
@@ -760,13 +1280,16 @@ export function updateDomain(id, userId, patch) {
     spfExtra: patch.spfExtra ?? current.spfExtra,
     dmarcPolicy: patch.dmarcPolicy ?? current.dmarcPolicy,
     dmarcRua: patch.dmarcRua ?? current.dmarcRua,
+    catchAllAddress: patch.catchAllAddress === undefined
+      ? current.catchAllAddress
+      : normalizeCatchAllAddress(patch.catchAllAddress),
     updatedAt: now()
   };
   requireDb()
     .prepare(`
       UPDATE domains
       SET selector = ?, dns_credential_id = ?, smtp_relay_id = ?, sender_host = ?, sending_ip = ?, spf_extra = ?,
-          dmarc_policy = ?, dmarc_rua = ?, updated_at = ?
+          dmarc_policy = ?, dmarc_rua = ?, catch_all_address = ?, updated_at = ?
       WHERE id = ? AND user_id = ?
     `)
     .run(
@@ -778,6 +1301,7 @@ export function updateDomain(id, userId, patch) {
       next.spfExtra,
       next.dmarcPolicy,
       next.dmarcRua,
+      next.catchAllAddress,
       next.updatedAt,
       id,
       userId
@@ -2256,6 +2780,7 @@ function clearDefaultSmtpRelay(userId) {
 }
 
 export function verifySmtpCredential(username, password) {
+  const cleanUsername = String(username || '').trim();
   const row = requireDb()
     .prepare(`
       SELECT c.*, u.id AS auth_user_id, u.username AS auth_username, u.email, u.role, u.status
@@ -2263,29 +2788,50 @@ export function verifySmtpCredential(username, password) {
       JOIN users u ON u.id = c.user_id
       WHERE c.username = ?
     `)
-    .get(String(username || '').trim());
-  if (!row || row.status !== 'active' || !verifyPassword(password, row.password_hash)) return null;
-  return {
-    user: {
-      id: row.auth_user_id,
-      username: row.auth_username,
-      email: row.email,
-      role: row.role,
-      status: row.status
-    },
-    credential: publicSmtpCredential(row)
-  };
+    .get(cleanUsername);
+  if (row && row.status === 'active' && verifyPassword(password, row.password_hash)) {
+    return {
+      user: {
+        id: row.auth_user_id,
+        username: row.auth_username,
+        email: row.email,
+        role: row.role,
+        status: row.status
+      },
+      credential: publicSmtpCredential(row)
+    };
+  }
+
+  const mailboxAuth = verifyInboundMailboxCredential(cleanUsername, password);
+  return mailboxAuth ? {
+    user: mailboxAuth.user,
+    mailbox: mailboxAuth.mailbox,
+    credential: {
+      username: mailboxAuth.mailbox.address,
+      type: 'inbound_mailbox'
+    }
+  } : null;
 }
 
-export function createApiToken(userId, name) {
+export function createApiToken(userId, name, { scopes, expiresAt } = {}) {
   const token = `mh_${crypto.randomBytes(32).toString('base64url')}`;
   const createdAt = now();
+  const cleanScopes = normalizeApiTokenScopes(scopes);
+  const cleanExpiresAt = normalizeApiTokenExpiresAt(expiresAt);
   const result = requireDb()
     .prepare(`
-      INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, created_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, scopes_json, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
-    .run(userId, String(name || 'API Token').trim() || 'API Token', tokenHash(token), token.slice(0, 12), createdAt);
+    .run(
+      userId,
+      normalizeApiTokenName(name),
+      tokenHash(token),
+      token.slice(0, 12),
+      JSON.stringify(cleanScopes),
+      cleanExpiresAt,
+      createdAt
+    );
   return {
     ...getApiToken(result.lastInsertRowid, userId),
     token
@@ -2306,12 +2852,46 @@ export function getApiToken(id, userId) {
   return publicApiToken(row);
 }
 
+export function updateApiToken(id, userId, patch = {}) {
+  const current = requireDb()
+    .prepare('SELECT * FROM api_tokens WHERE id = ? AND user_id = ?')
+    .get(Number(id), userId);
+  if (!current) return null;
+  if (current.revoked_at) throw new Error('已撤销的 API Token 不能修改。');
+  const name = Object.hasOwn(patch, 'name') ? normalizeApiTokenName(patch.name) : current.name;
+  const scopes = Object.hasOwn(patch, 'scopes')
+    ? normalizeApiTokenScopes(patch.scopes)
+    : storedApiTokenScopes(current.scopes_json);
+  const expiresAt = Object.hasOwn(patch, 'expiresAt')
+    ? normalizeApiTokenExpiresAt(patch.expiresAt)
+    : current.expires_at || null;
+  requireDb()
+    .prepare('UPDATE api_tokens SET name = ?, scopes_json = ?, expires_at = ? WHERE id = ? AND user_id = ?')
+    .run(name, JSON.stringify(scopes), expiresAt, Number(id), userId);
+  return getApiToken(id, userId);
+}
+
+export function revokeApiToken(id, userId, reason = '') {
+  const result = requireDb()
+    .prepare(`
+      UPDATE api_tokens
+      SET revoked_at = ?, revoked_reason = ?
+      WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+    `)
+    .run(now(), String(reason || '').trim().slice(0, 200), Number(id), userId);
+  return result.changes > 0;
+}
+
 export function deleteApiToken(id, userId) {
   const result = requireDb().prepare('DELETE FROM api_tokens WHERE id = ? AND user_id = ?').run(id, userId);
   return result.changes > 0;
 }
 
 export function verifyApiToken(token) {
+  return authenticateApiToken(token)?.user || null;
+}
+
+export function authenticateApiToken(token) {
   const hash = tokenHash(token);
   const row = requireDb()
     .prepare(`
@@ -2321,14 +2901,17 @@ export function verifyApiToken(token) {
       WHERE t.token_hash = ?
     `)
     .get(hash);
-  if (!row || row.status !== 'active') return null;
+  if (!row || row.status !== 'active' || apiTokenStatus(row) !== 'active') return null;
   requireDb().prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?').run(now(), row.id);
   return {
-    id: row.auth_user_id,
-    username: row.username,
-    email: row.email,
-    role: row.role,
-    status: row.status
+    user: {
+      id: row.auth_user_id,
+      username: row.username,
+      email: row.email,
+      role: row.role,
+      status: row.status
+    },
+    token: publicApiToken(row)
   };
 }
 
@@ -2452,7 +3035,15 @@ export function saveSettings(patch) {
     'dmarcPolicy',
     'dmarcRua',
     'sendRequiresVerified',
-    'engagementTrackingEnabled'
+    'engagementTrackingEnabled',
+    'listUnsubscribeMailto',
+    'listUnsubscribeUrl',
+    'listUnsubscribePostEnabled',
+    'feedbackIdEnabled',
+    'reportAbuseTo',
+    'csaComplaintsTo',
+    'bounceAddress',
+    'bounceEnvelopeEnabled'
   ]);
   const updatedAt = now();
   for (const [key, value] of Object.entries(patch)) {
@@ -2562,13 +3153,16 @@ function mergeResourcesForUser(userId) {
     domains: listDomains(userId),
     dnsCredentials: listDnsCredentials(userId),
     apiTokens: listApiTokens(userId),
+    inboundMailboxes: listInboundMailboxes(userId),
+    inboundMessageCount: countRows('inbound_messages', userId, 'deleted_at IS NULL'),
     sendEventCount: countRows('send_events', userId),
     smtpCredential: getSmtpCredential(userId)
   };
 }
 
-function countRows(table, userId) {
-  return Number(requireDb().prepare(`SELECT COUNT(*) AS count FROM ${mergeResourceTable(table)} WHERE user_id = ?`).get(userId).count || 0);
+function countRows(table, userId, extraWhere = '') {
+  const suffix = extraWhere ? ` AND ${extraWhere}` : '';
+  return Number(requireDb().prepare(`SELECT COUNT(*) AS count FROM ${mergeResourceTable(table)} WHERE user_id = ?${suffix}`).get(userId).count || 0);
 }
 
 function moveRows(table, sourceUserId, targetUserId) {
@@ -2579,10 +3173,67 @@ function moveRows(table, sourceUserId, targetUserId) {
 }
 
 function mergeResourceTable(table) {
-  if (!['domains', 'dns_credentials', 'api_tokens', 'send_events', 'smtp_credentials'].includes(table)) {
+  if (!['domains', 'dns_credentials', 'api_tokens', 'inbound_mailboxes', 'inbound_messages', 'send_events', 'smtp_credentials'].includes(table)) {
     throw new Error('资源类型不正确。');
   }
   return table;
+}
+
+function moveInboundDomainResources(domainId, targetUserId) {
+  const updatedAt = now();
+  const mailboxResult = requireDb()
+    .prepare('UPDATE inbound_mailboxes SET user_id = ?, updated_at = ? WHERE domain_id = ? AND deleted_at IS NULL')
+    .run(targetUserId, updatedAt, domainId);
+  const messageResult = requireDb()
+    .prepare('UPDATE inbound_messages SET user_id = ?, updated_at = ? WHERE domain_id = ? AND deleted_at IS NULL')
+    .run(targetUserId, updatedAt, domainId);
+  requireDb()
+    .prepare(`
+      UPDATE inbound_folders
+      SET user_id = ?, updated_at = ?
+      WHERE deleted_at IS NULL
+        AND mailbox_id IN (SELECT id FROM inbound_mailboxes WHERE domain_id = ?)
+    `)
+    .run(targetUserId, updatedAt, domainId);
+  return {
+    mailboxes: mailboxResult.changes,
+    messages: messageResult.changes
+  };
+}
+
+function moveInboundResourcesForUserDomains(sourceUserId, targetUserId) {
+  const updatedAt = now();
+  const mailboxResult = requireDb()
+    .prepare(`
+      UPDATE inbound_mailboxes
+      SET user_id = ?, updated_at = ?
+      WHERE user_id = ?
+        AND deleted_at IS NULL
+        AND domain_id IN (SELECT id FROM domains WHERE user_id = ?)
+    `)
+    .run(targetUserId, updatedAt, sourceUserId, sourceUserId);
+  const messageResult = requireDb()
+    .prepare(`
+      UPDATE inbound_messages
+      SET user_id = ?, updated_at = ?
+      WHERE user_id = ?
+        AND deleted_at IS NULL
+        AND domain_id IN (SELECT id FROM domains WHERE user_id = ?)
+    `)
+    .run(targetUserId, updatedAt, sourceUserId, sourceUserId);
+  requireDb()
+    .prepare(`
+      UPDATE inbound_folders
+      SET user_id = ?, updated_at = ?
+      WHERE user_id = ?
+        AND deleted_at IS NULL
+        AND mailbox_id IN (SELECT id FROM inbound_mailboxes WHERE domain_id IN (SELECT id FROM domains WHERE user_id = ?))
+    `)
+    .run(targetUserId, updatedAt, sourceUserId, sourceUserId);
+  return {
+    mailboxes: mailboxResult.changes,
+    messages: messageResult.changes
+  };
 }
 
 function requireDomainRow(domainId) {
@@ -2733,6 +3384,7 @@ function publicDomainRow(row) {
     spfExtra: row.spf_extra,
     dmarcPolicy: row.dmarc_policy,
     dmarcRua: row.dmarc_rua,
+    catchAllAddress: row.catch_all_address || '',
     status: safeJson(row.status_json, {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -2742,6 +3394,64 @@ function publicDomainRow(row) {
 function privateDomainRow(row) {
   const publicRow = publicDomainRow(row);
   return publicRow ? { ...publicRow, dkimPrivate: row.dkim_private } : null;
+}
+
+function publicInboundMailbox(row, { includeHash = false, includeSecret = false } = {}) {
+  if (!row) return null;
+  const passwordRecoverable = Boolean(row.password_secret && decryptSecret(row.password_secret));
+  const expiresAt = row.expires_at || null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    domainId: row.domain_id,
+    domain: row.domain || '',
+    address: row.address,
+    localPart: row.local_part,
+    displayName: row.display_name,
+    aliases: safeJson(row.aliases_json, []),
+    forwardTo: safeJson(row.forward_to_json, []),
+    keepForwarded: row.keep_forwarded !== 'false',
+    quotaMb: row.quota_mb === null || row.quota_mb === undefined ? null : Number(row.quota_mb),
+    passwordSet: Boolean(row.password_hash),
+    passwordRecoverable,
+    status: inboundMailboxStatus(row),
+    expiresAt,
+    temporary: Boolean(expiresAt),
+    messageCount: Number(row.message_count || 0),
+    unreadCount: Number(row.unread_count || 0),
+    lastMessageAt: row.last_message_at || null,
+    ...(includeHash ? { passwordHash: row.password_hash } : {}),
+    ...(includeSecret ? { passwordSecret: row.password_secret } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function publicInboundMessage(row, { includeBody = false } = {}) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    mailboxId: row.mailbox_id,
+    userId: row.user_id,
+    domainId: row.domain_id,
+    domain: row.domain || '',
+    folder: row.folder || 'INBOX',
+    mailboxAddress: row.mailbox_address || '',
+    sender: row.sender,
+    recipients: safeJson(row.recipients_json, []),
+    subject: row.subject,
+    messageId: row.message_id,
+    preview: row.preview,
+    read: row.read_state === 'true',
+    receivedAt: row.received_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(includeBody ? {
+      rawMessage: row.raw_message,
+      textBody: row.text_body,
+      htmlBody: row.html_body
+    } : {})
+  };
 }
 
 function publicSmtpCredential(row, { includeHash = false, includePassword = false, includeSecret = false } = {}) {
@@ -2790,6 +3500,11 @@ function publicApiToken(row) {
     userId: row.user_id,
     name: row.name,
     tokenPrefix: row.token_prefix,
+    scopes: storedApiTokenScopes(row.scopes_json),
+    expiresAt: row.expires_at || null,
+    revokedAt: row.revoked_at || null,
+    revokedReason: row.revoked_reason || '',
+    status: apiTokenStatus(row),
     lastUsedAt: row.last_used_at,
     createdAt: row.created_at
   };
@@ -3121,6 +3836,186 @@ function normalizeAccountTokenPurpose(value) {
 function normalizeEmail(value) {
   const email = String(value || '').trim().toLowerCase();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+}
+
+function normalizeInboundAddress(value) {
+  const email = normalizeEmail(value);
+  if (!email) return '';
+  const [localPart, domain] = email.split('@');
+  if (!localPart || !domain) return '';
+  return `${localPart}@${domain}`;
+}
+
+function normalizeInboundFolder(value, fallback = '') {
+  const raw = String(value || fallback || '').trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
+  if (!raw || /[\r\n\u0000]/.test(raw)) return '';
+  if (raw.toUpperCase() === 'INBOX') return 'INBOX';
+  const standard = STANDARD_INBOUND_FOLDERS.find((folder) => folder.toLowerCase() === raw.toLowerCase());
+  if (standard) return standard;
+  return raw
+    .split('/')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join('/');
+}
+
+function isStandardInboundFolder(value) {
+  const clean = normalizeInboundFolder(value);
+  return STANDARD_INBOUND_FOLDERS.some((folder) => folder === clean);
+}
+
+function normalizeCatchAllAddress(value) {
+  const clean = String(value || '').trim().toLowerCase();
+  if (!clean) return '';
+  if (clean === '/dev/null') return clean;
+  return normalizeInboundAddress(clean);
+}
+
+function normalizeInboundMailboxStatus(value) {
+  const clean = String(value || '').trim().toLowerCase();
+  if (['active', 'disabled'].includes(clean)) return clean;
+  throw new Error('收信邮箱状态不正确。');
+}
+
+function normalizeInboundMailboxExpiresAt(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const timestamp = Date.parse(String(value));
+  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) throw new Error('临时邮箱到期时间不正确。');
+  return new Date(timestamp).toISOString();
+}
+
+function inboundMailboxStatus(row) {
+  if (!row) return 'disabled';
+  const expiresAt = String(row.expires_at || '');
+  if (expiresAt && Date.parse(expiresAt) <= Date.now()) return 'expired';
+  return row.status;
+}
+
+function normalizeApiTokenName(value) {
+  const name = String(value || '').trim();
+  if (!name) throw new Error('API Token 名称不能为空。');
+  if (name.length > 100) throw new Error('API Token 名称不能超过 100 个字符。');
+  return name;
+}
+
+function normalizeApiTokenScopes(value) {
+  const candidates = value === undefined ? defaultApiTokenScopes : (Array.isArray(value) ? value : [value]);
+  const scopes = [...new Set(candidates.map((item) => String(item || '').trim()).filter(Boolean))];
+  if (!scopes.length || scopes.some((scope) => !API_TOKEN_SCOPES.has(scope))) {
+    throw new Error('API Token 权限范围不正确。');
+  }
+  return scopes;
+}
+
+function storedApiTokenScopes(value) {
+  try {
+    const parsed = JSON.parse(value || '');
+    const scopes = Array.isArray(parsed) ? parsed.filter((scope) => API_TOKEN_SCOPES.has(scope)) : [];
+    return scopes.length ? scopes : [...defaultApiTokenScopes];
+  } catch {
+    return [...defaultApiTokenScopes];
+  }
+}
+
+function normalizeApiTokenExpiresAt(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const timestamp = Date.parse(String(value));
+  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) throw new Error('API Token 到期时间不正确。');
+  return new Date(timestamp).toISOString();
+}
+
+function apiTokenStatus(row) {
+  if (row?.revoked_at) return 'revoked';
+  const expiresAt = String(row?.expires_at || '');
+  if (expiresAt && Date.parse(expiresAt) <= Date.now()) return 'expired';
+  return 'active';
+}
+
+function normalizeMailboxAliases(values, domain, ownLocalPart) {
+  const list = Array.isArray(values)
+    ? values
+    : String(values || '').split(/[\s,;]+/);
+  const cleanDomain = String(domain || '').toLowerCase();
+  const own = String(ownLocalPart || '').toLowerCase();
+  const aliases = [];
+  for (const value of list) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) continue;
+    const localPart = raw.includes('@')
+      ? (normalizeInboundAddress(raw).endsWith(`@${cleanDomain}`) ? normalizeInboundAddress(raw).split('@')[0] : '')
+      : raw;
+    if (!localPart || localPart === own || !/^[^@\s]+$/.test(localPart)) continue;
+    if (!aliases.includes(localPart)) aliases.push(localPart);
+  }
+  return aliases;
+}
+
+function normalizeQuotaMb(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const quota = Number(value);
+  if (!Number.isFinite(quota) || quota < 0) return null;
+  return Math.floor(quota);
+}
+
+function normalizeRecipientList(values) {
+  const list = Array.isArray(values) ? values : [values];
+  return [...new Set(list.flatMap((value) => String(value || '').split(/[\s,;]+/)).map(normalizeEmail).filter(Boolean))];
+}
+
+function getInboundMailboxByAliasAddress(address) {
+  const cleanAddress = normalizeInboundAddress(address);
+  if (!cleanAddress) return null;
+  const [localPart, domainName] = cleanAddress.split('@');
+  const rows = requireDb()
+    .prepare(`
+      SELECT m.*, d.domain, 0 AS message_count, 0 AS unread_count, NULL AS last_message_at
+      FROM inbound_mailboxes m
+      JOIN domains d ON d.id = m.domain_id
+      JOIN users u ON u.id = m.user_id
+      WHERE d.domain = ?
+        AND m.status = 'active'
+        AND m.deleted_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at = '' OR m.expires_at > ?)
+        AND u.status = 'active'
+    `)
+    .all(domainName, now());
+  const row = rows.find((item) => safeJson(item.aliases_json, []).includes(localPart));
+  return publicInboundMailbox(row);
+}
+
+function inboundRouteForMailbox(recipient, mailbox, meta = {}) {
+  return {
+    recipient,
+    domainId: mailbox.domainId,
+    userId: mailbox.userId,
+    mailbox,
+    forwardTo: normalizeRecipientList(mailbox.forwardTo)
+      .filter((target) => target !== mailbox.address && target !== recipient),
+    keepForwarded: mailbox.keepForwarded,
+    drop: false,
+    catchAll: Boolean(meta.catchAll),
+    alias: Boolean(meta.alias)
+  };
+}
+
+function inboundPreview(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+}
+
+function htmlToText(value) {
+  return String(value || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'");
 }
 
 function normalizePort(value, fallback) {

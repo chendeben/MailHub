@@ -198,6 +198,46 @@ test('aliyun one-click dns falls back to parent zone for subdomain sending domai
   )));
 });
 
+test('aliyun one-click dns can use another managed root zone with the same credentials', async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const params = new URL(String(url)).searchParams;
+    calls.push({
+      action: params.get('Action'),
+      domainName: params.get('DomainName'),
+      rr: params.get('RR')
+    });
+    if (params.get('Action') === 'DescribeDomainRecords') {
+      return json({ DomainRecords: { Record: [] } });
+    }
+    return json({});
+  };
+
+  const result = await applyDnsSetup(
+    { domain: 'phplife.net', senderHost: 'mail.phplife.net', sendingIp: '127.0.0.1' },
+    { ...aliyunCredential(), zoneName: 'ss5.xyz' },
+    {
+      records: [
+        {
+          key: 'verification',
+          host: '_mailhub.phplife.net',
+          type: 'TXT',
+          value: 'mailhub-verification=token',
+          status: 'missing'
+        }
+      ]
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call.action === 'DescribeDomainRecords' && call.domainName === 'phplife.net'));
+  assert.ok(calls.some((call) => (
+    call.action === 'AddDomainRecord'
+    && call.domainName === 'phplife.net'
+    && call.rr === '_mailhub'
+  )));
+});
+
 test('dnspod provider signs and sends create record actions', async () => {
   const actions = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -291,6 +331,43 @@ test('dnspod one-click dns falls back to parent zone for subdomain sending domai
     call.action === 'CreateRecord'
     && call.payload.Domain === 'example.com'
     && call.payload.SubDomain === '_mailhub.notify'
+  )));
+});
+
+test('dnspod one-click dns can use another managed root zone with the same credentials', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    assert.equal(String(url), 'https://dnspod.tencentcloudapi.com');
+    const payload = JSON.parse(options.body);
+    calls.push({ action: options.headers['X-TC-Action'], payload });
+    if (options.headers['X-TC-Action'] === 'DescribeRecordList') {
+      return json({ Response: { RecordList: [] } });
+    }
+    return json({ Response: { RecordId: 123 } });
+  };
+
+  const result = await applyDnsSetup(
+    { domain: 'phplife.net', senderHost: 'mail.phplife.net', sendingIp: '127.0.0.1' },
+    { ...dnspodCredential(), zoneName: 'ss5.xyz' },
+    {
+      records: [
+        {
+          key: 'verification',
+          host: '_mailhub.phplife.net',
+          type: 'TXT',
+          value: 'mailhub-verification=token',
+          status: 'missing'
+        }
+      ]
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call.action === 'DescribeRecordList' && call.payload.Domain === 'phplife.net'));
+  assert.ok(calls.some((call) => (
+    call.action === 'CreateRecord'
+    && call.payload.Domain === 'phplife.net'
+    && call.payload.SubDomain === '_mailhub'
   )));
 });
 

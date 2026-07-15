@@ -16,7 +16,9 @@ test('admin API routes respond once and keep the server alive', async () => {
       PORT: String(port),
       DATA_DIR: mkdtempSync(path.join(tmpdir(), 'mailhub-server-test-')),
       ADMIN_PASSWORD: 'password123',
-      SUBMISSION_ENABLED: 'false'
+      SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -61,7 +63,9 @@ test('built auth assets are served before authentication', async () => {
       PORT: String(port),
       DATA_DIR: mkdtempSync(path.join(tmpdir(), 'mailhub-server-test-')),
       ADMIN_PASSWORD: 'password123',
-      SUBMISSION_ENABLED: 'false'
+      SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -140,6 +144,175 @@ test('users can manage multiple smtp login credentials', async () => {
     });
     assert.equal(deleted.status, 200);
     assert.equal((await deleted.json()).deleted, true);
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+  }
+});
+
+test('users can manage inbound mailboxes and read inbound messages', async () => {
+  const { child, baseUrl, dataDir, sessionSecret } = await startTestServer();
+
+  try {
+    const cookie = await login(baseUrl, 'admin', 'password123');
+    await createSendingDomain(baseUrl, cookie, { domain: 'inbound-api.example' });
+
+    const createMailbox = await fetch(`${baseUrl}/api/inbound-mailboxes`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        address: 'Support@inbound-api.example',
+        displayName: 'Support',
+        password: 'mailbox-pass-123',
+        forwardTo: 'archive@example.net',
+        keepForwarded: true
+      })
+    });
+    assert.equal(createMailbox.status, 201);
+    const createMailboxBody = await createMailbox.json();
+    const mailbox = createMailboxBody.mailbox;
+    assert.equal(mailbox.address, 'support@inbound-api.example');
+    assert.equal(mailbox.displayName, 'Support');
+    assert.equal(mailbox.passwordSet, true);
+    assert.deepEqual(mailbox.forwardTo, ['archive@example.net']);
+    assert.equal(mailbox.unreadCount, 0);
+    assert.equal(createMailboxBody.clientConfig.username, 'support@inbound-api.example');
+    assert.equal(createMailboxBody.clientConfig.password, 'mailbox-pass-123');
+    assert.equal(createMailboxBody.clientConfig.outgoing.authMethod, 'Normal password');
+
+    const mailboxes = await fetch(`${baseUrl}/api/inbound-mailboxes`, { headers: { Cookie: cookie } });
+    assert.equal(mailboxes.status, 200);
+    const mailboxesBody = await mailboxes.json();
+    assert.deepEqual(mailboxesBody.mailboxes.map((entry) => entry.address), ['support@inbound-api.example']);
+
+    const messageId = seedInboundMessage(dataDir, sessionSecret, 'support@inbound-api.example');
+    const messages = await fetch(`${baseUrl}/api/inbound-messages?mailboxId=${mailbox.id}`, { headers: { Cookie: cookie } });
+    assert.equal(messages.status, 200);
+    const messagesBody = await messages.json();
+    assert.equal(messagesBody.messages.length, 1);
+    assert.equal(messagesBody.messages[0].id, messageId);
+    assert.equal(messagesBody.messages[0].subject, 'Inbound API message');
+    assert.equal(messagesBody.messages[0].textBody, undefined);
+
+    const detail = await fetch(`${baseUrl}/api/inbound-messages/${messageId}`, { headers: { Cookie: cookie } });
+    assert.equal(detail.status, 200);
+    const detailBody = await detail.json();
+    assert.equal(detailBody.message.textBody, 'Hello from inbound API.');
+    assert.equal(detailBody.message.rawMessage.includes('Inbound API message'), true);
+
+    const markRead = await fetch(`${baseUrl}/api/inbound-messages/${messageId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({ read: true })
+    });
+    assert.equal(markRead.status, 200);
+    assert.equal((await markRead.json()).message.read, true);
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+  }
+});
+
+test('scoped API tokens create persistent and temporary mailboxes', async () => {
+  const { child, baseUrl } = await startTestServer();
+
+  try {
+    const cookie = await login(baseUrl, 'admin', 'password123');
+    await createSendingDomain(baseUrl, cookie, { domain: 'mailbox-token-api.example' });
+
+    const sendOnlyResponse = await fetch(`${baseUrl}/api/api-tokens`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ name: 'send only', scopes: ['send'] })
+    });
+    assert.equal(sendOnlyResponse.status, 201);
+    const sendOnly = (await sendOnlyResponse.json()).token;
+
+    const denied = await fetch(`${baseUrl}/api/mailboxes`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${sendOnly.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ mode: 'temporary', domain: 'mailbox-token-api.example', expiresInMinutes: 60 })
+    });
+    assert.equal(denied.status, 403);
+
+    const tokenResponse = await fetch(`${baseUrl}/api/api-tokens`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ name: 'mailboxes', scopes: ['mailboxes:read', 'mailboxes:write'] })
+    });
+    assert.equal(tokenResponse.status, 201);
+    const mailboxToken = (await tokenResponse.json()).token;
+
+    const temporary = await fetch(`${baseUrl}/api/mailboxes`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${mailboxToken.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ mode: 'temporary', domain: 'mailbox-token-api.example', expiresInMinutes: 60 })
+    });
+    assert.equal(temporary.status, 201);
+    const temporaryBody = await temporary.json();
+    assert.match(temporaryBody.mailbox.address, /^tmp-[a-f0-9]+@mailbox-token-api\.example$/);
+    assert.equal(temporaryBody.mailbox.temporary, true);
+    assert.ok(temporaryBody.mailbox.expiresAt);
+    assert.equal(temporaryBody.password.length >= 8, true);
+    assert.equal(temporaryBody.clientConfig.incoming.protocol, 'IMAP');
+
+    const permanent = await fetch(`${baseUrl}/api/mailboxes`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${mailboxToken.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        mode: 'permanent',
+        address: 'support@mailbox-token-api.example',
+        password: 'mailbox-pass-123'
+      })
+    });
+    assert.equal(permanent.status, 201);
+    const permanentBody = await permanent.json();
+    assert.equal(permanentBody.mailbox.temporary, false);
+    assert.equal(permanentBody.mailbox.expiresAt, null);
+    assert.equal(permanentBody.clientConfig.outgoing.protocol, 'SMTP');
+
+    const listed = await fetch(`${baseUrl}/api/mailboxes`, {
+      headers: { Authorization: `Bearer ${mailboxToken.token}` }
+    });
+    assert.equal(listed.status, 200);
+    assert.equal((await listed.json()).mailboxes.length, 2);
+
+    const sendDenied = await fetch(`${baseUrl}/api/send`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${mailboxToken.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ from: 'noreply@mailbox-token-api.example', to: 'user@example.com', text: 'blocked' })
+    });
+    assert.equal(sendDenied.status, 403);
+
+    const revoke = await fetch(`${baseUrl}/api/api-tokens/${mailboxToken.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie }
+    });
+    assert.equal(revoke.status, 200);
+    assert.equal((await revoke.json()).token.status, 'revoked');
+
+    const rejectedAfterRevoke = await fetch(`${baseUrl}/api/mailboxes`, {
+      headers: { Authorization: `Bearer ${mailboxToken.token}` }
+    });
+    assert.equal(rejectedAfterRevoke.status, 401);
   } finally {
     child.kill('SIGTERM');
     await waitForExit(child, 1000);
@@ -302,6 +475,19 @@ test('smtp relay selection prefers request relay then domain relay then user def
 
   try {
     const cookie = await login(baseUrl, 'admin', 'password123');
+    const settings = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie
+      },
+      body: JSON.stringify({
+        appBaseUrl: baseUrl,
+        engagementTrackingEnabled: true
+      })
+    });
+    assert.equal(settings.status, 200);
+
     const defaultRelay = await createSmtpRelay(baseUrl, cookie, {
       name: 'Default relay',
       host: '127.0.0.1',
@@ -359,12 +545,20 @@ test('smtp relay selection prefers request relay then domain relay then user def
       body: JSON.stringify({
         to: 'test-send@example.com',
         subject: 'Selected relay test send',
+        text: 'Open the HTML version to verify tracking.',
+        html: '<html><body><p>MailHub tracking test.</p><a href="https://example.net/tracked">Tracked link</a></body></html>',
         smtpRelayId: requestRelay.id
       })
     });
     assert.equal(testSend.status, 202);
-    assert.equal((await testSend.json()).smtpRelayId, requestRelay.id);
+    const testSendBody = await testSend.json();
+    assert.equal(testSendBody.smtpRelayId, requestRelay.id);
+    assert.deepEqual(testSendBody.tracking, { enabled: true, opens: true, clicks: true, messageLevel: false });
     await waitForCondition(() => requestRelayServer.messages.length === 2);
+    const testHtml = decodeHtmlPart(requestRelayServer.messages[1]);
+    assert.match(testHtml, new RegExp(`${escapeRegExp(baseUrl)}/t/o/[A-Za-z0-9_-]+\\.gif`));
+    assert.match(testHtml, new RegExp(`${escapeRegExp(baseUrl)}/t/c/[A-Za-z0-9_-]+`));
+    assert.equal(testHtml.includes('https://example.net/tracked'), false);
 
     const invalidTestSend = await fetch(`${baseUrl}/api/domains/${domain.id}/test-send`, {
       method: 'POST',
@@ -1304,7 +1498,9 @@ async function startTestServer() {
       ADMIN_PASSWORD: 'password123',
       SESSION_SECRET: sessionSecret,
       DNS_AUTO_CHECK_ENABLED: 'false',
-      SUBMISSION_ENABLED: 'false'
+      SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -1364,6 +1560,46 @@ function seedUsers(dataDir, sessionSecret, users) {
     encoding: 'utf8'
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+function seedInboundMessage(dataDir, sessionSecret, address) {
+  const script = `
+    import {
+      createInboundMessage,
+      getInboundMailboxByAddress,
+      initDatabase
+    } from './src/db.js';
+
+    initDatabase(process.env.DATA_DIR, process.env.SESSION_SECRET);
+    const mailbox = getInboundMailboxByAddress(process.env.INBOUND_ADDRESS);
+    const message = createInboundMessage(mailbox, {
+      sender: 'alice@example.net',
+      recipients: [process.env.INBOUND_ADDRESS],
+      subject: 'Inbound API message',
+      messageId: '<inbound-api@example.net>',
+      rawMessage: [
+        'From: Alice <alice@example.net>',
+        'To: Support <' + process.env.INBOUND_ADDRESS + '>',
+        'Subject: Inbound API message',
+        '',
+        'Hello from inbound API.'
+      ].join('\\r\\n'),
+      textBody: 'Hello from inbound API.'
+    });
+    console.log(String(message.id));
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DATA_DIR: dataDir,
+      SESSION_SECRET: sessionSecret,
+      INBOUND_ADDRESS: address
+    },
+    encoding: 'utf8'
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return Number(result.stdout.trim());
 }
 
 function seedTransferResources(dataDir, sessionSecret) {
@@ -1718,6 +1954,16 @@ function assertRelayAuth(relayServer, username, password) {
   const authCommand = relayServer.commands.find((command) => command.startsWith('AUTH PLAIN '));
   assert.ok(authCommand);
   assert.equal(Buffer.from(authCommand.replace('AUTH PLAIN ', ''), 'base64').toString('utf8'), `\0${username}\0${password}`);
+}
+
+function decodeHtmlPart(rawMessage) {
+  const match = rawMessage.match(/Content-Type: text\/html[^]*?\n\n([A-Za-z0-9+/=\n]+?)(?:\n--|$)/i);
+  assert.ok(match, 'expected an HTML MIME part');
+  return Buffer.from(match[1].replace(/\s+/g, ''), 'base64').toString('utf8');
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function startFakeSmtpServer({ responseDelayMs = 0 } = {}) {

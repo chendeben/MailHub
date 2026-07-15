@@ -3,15 +3,22 @@ import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
 import {
   createSendEvent,
+  createInboundMessage,
   createTrackingLink,
   finalizeSendEvent,
   getDomainByName,
   logSendEvent,
+  resolveInboundRecipient,
   verifySmtpCredential
 } from './db.js';
+import { parseInboundMessage } from './inbound-mail.js';
 import {
+  addHeadersToRawMessage,
+  buildDeliverabilityHeaders,
+  createFeedbackId,
   domainFromAddress,
   extractAddress,
+  resolveEnvelopeSender,
   sendViaSmtp,
   signMessageForDomain
 } from './mailer.js';
@@ -24,6 +31,7 @@ import {
 } from './tracking.js';
 
 const implicitTlsDetectTimeoutMs = 300;
+const defaultMaxMessageBytes = 50 * 1024 * 1024;
 
 export function startSubmissionServer(config) {
   if (!config.enabled) return null;
@@ -209,7 +217,12 @@ class SubmissionSession {
     this.user = null;
     this.authenticated = false;
     this.mailFrom = '';
+    this.mailFromAccepted = false;
     this.recipients = [];
+    this.inboundMailboxes = [];
+    this.inboundRoutes = [];
+    this.dataBytes = 0;
+    this.dataTooLarge = false;
     this.remoteAddress = socket.remoteAddress || '';
     this.onDataBound = (chunk) => this.onData(chunk);
     this.queue = Promise.resolve();
@@ -237,7 +250,17 @@ class SubmissionSession {
   async onLine(line) {
     if (this.dataMode) {
       if (line === '.') return await this.finishData();
-      this.dataLines.push(line.startsWith('..') ? line.slice(1) : line);
+      const dataLine = line.startsWith('..') ? line.slice(1) : line;
+      const nextBytes = this.dataBytes + Buffer.byteLength(`${dataLine}\r\n`, 'utf8');
+      if (nextBytes > this.maxMessageBytes()) {
+        this.dataTooLarge = true;
+        this.dataBytes = nextBytes;
+        return;
+      }
+      if (!this.dataTooLarge) {
+        this.dataLines.push(dataLine);
+        this.dataBytes = nextBytes;
+      }
       return;
     }
 
@@ -264,7 +287,7 @@ class SubmissionSession {
 
   ehlo() {
     this.socket.write(`250-${this.config.hostname}\r\n`);
-    this.socket.write('250-SIZE 52428800\r\n');
+    this.socket.write(`250-SIZE ${this.maxMessageBytes()}\r\n`);
     this.socket.write('250-8BITMIME\r\n');
     if (this.config.startTlsAvailable && !this.config.tlsActive) {
       this.socket.write('250-STARTTLS\r\n');
@@ -353,35 +376,53 @@ class SubmissionSession {
   }
 
   mail(argument) {
-    if (!this.authenticated) return this.write(530, 'Authentication required');
-    const address = extractPathAddress(argument);
-    if (!address) return this.write(501, 'Invalid MAIL FROM');
+    if (!this.authenticated && !this.config.inboundEnabled) return this.write(530, 'Authentication required');
+    const address = extractPathAddress(argument, { allowEmpty: !this.authenticated });
+    if (address === null) return this.write(501, 'Invalid MAIL FROM');
     this.mailFrom = address;
+    this.mailFromAccepted = true;
     this.recipients = [];
+    this.inboundMailboxes = [];
+    this.inboundRoutes = [];
     return this.write(250, 'Sender OK');
   }
 
   rcpt(argument) {
-    if (!this.authenticated) return this.write(530, 'Authentication required');
-    if (!this.mailFrom) return this.write(503, 'MAIL FROM required first');
+    if (!this.authenticated && !this.config.inboundEnabled) return this.write(530, 'Authentication required');
+    if (!this.mailFromAccepted) return this.write(503, 'MAIL FROM required first');
     const address = extractPathAddress(argument);
-    if (!address) return this.write(501, 'Invalid RCPT TO');
+    if (address === null || !address) return this.write(501, 'Invalid RCPT TO');
     if (this.recipients.length >= 100) return this.write(452, 'Too many recipients');
+    if (!this.authenticated) {
+      const route = resolveInboundRecipient(address);
+      if (!route) return this.write(550, 'Recipient is not a local MailHub mailbox');
+      if (route.mailbox) this.inboundMailboxes.push(route.mailbox);
+      this.inboundRoutes.push(route);
+      this.recipients.push(address);
+      return this.write(250, 'Recipient OK');
+    }
     this.recipients.push(address);
     return this.write(250, 'Recipient OK');
   }
 
   data() {
-    if (!this.authenticated) return this.write(530, 'Authentication required');
-    if (!this.mailFrom || !this.recipients.length) return this.write(503, 'Need MAIL FROM and RCPT TO first');
+    if (!this.authenticated && !this.config.inboundEnabled) return this.write(530, 'Authentication required');
+    if (!this.mailFromAccepted || !this.recipients.length) return this.write(503, 'Need MAIL FROM and RCPT TO first');
     this.dataMode = true;
     this.dataLines = [];
+    this.dataBytes = 0;
+    this.dataTooLarge = false;
     return this.write(354, 'End data with <CR><LF>.<CR><LF>');
   }
 
   async finishData() {
     this.dataMode = false;
+    if (this.dataTooLarge) {
+      this.resetEnvelope(false);
+      return this.write(552, 'Message size exceeds fixed maximum message size');
+    }
     const rawMessage = `${this.dataLines.join('\r\n')}\r\n`;
+    if (!this.authenticated) return await this.finishInboundData(rawMessage);
     const headerFrom = extractHeader(rawMessage, 'from');
     const subject = decodeHeader(extractHeader(rawMessage, 'subject')) || '(no subject)';
     const sender = extractAddress(headerFrom) || this.mailFrom;
@@ -441,6 +482,30 @@ class SubmissionSession {
         trackingClicks = requestedClicks && result.linkCount > 0;
       }
       preparedMessage = await stripRawMimeHeaders(preparedMessage, ['x-mailhub-track']);
+      const deliverabilitySettings = this.config.getDeliverabilitySettings?.() || {};
+      preparedMessage = addHeadersToRawMessage(preparedMessage, buildDeliverabilityHeaders({
+        from: sender || this.mailFrom,
+        listUnsubscribeMailto: deliverabilitySettings.listUnsubscribeMailto,
+        listUnsubscribeUrl: deliverabilitySettings.listUnsubscribeUrl,
+        listUnsubscribePostEnabled: deliverabilitySettings.listUnsubscribePostEnabled,
+        feedbackId: deliverabilitySettings.feedbackIdEnabled
+          ? createFeedbackId({
+              userId: this.user.id,
+              domainId: domain.id,
+              eventId,
+              secret: deliverabilitySettings.secret
+            })
+          : '',
+        reportAbuseTo: deliverabilitySettings.reportAbuseTo,
+        csaComplaintsTo: deliverabilitySettings.csaComplaintsTo,
+        context: {
+          eventId,
+          userId: this.user.id,
+          domain: domainName,
+          sender: sender || this.mailFrom,
+          recipient: this.recipients.length === 1 ? this.recipients[0] : ''
+        }
+      }));
       const signed = signMessageForDomain(preparedMessage, domain);
       const smtpResult = await sendViaSmtp({
         host: this.config.relayHost,
@@ -449,7 +514,7 @@ class SubmissionSession {
         username: this.config.relayUsername,
         password: this.config.relayPassword,
         helo: this.config.relayHelo,
-        mailFrom: this.mailFrom,
+        mailFrom: resolveEnvelopeSender(deliverabilitySettings, this.mailFrom),
         recipients: this.recipients,
         rawMessage: signed
       });
@@ -473,11 +538,78 @@ class SubmissionSession {
     }
   }
 
+  async finishInboundData(rawMessage) {
+    if (!this.config.inboundEnabled) return this.write(530, 'Authentication required');
+    if (!this.inboundRoutes.length) return this.write(550, 'Recipient is not a local MailHub mailbox');
+    try {
+      const parsedMessage = await parseInboundMessage(rawMessage, this.recipients);
+      let storedCount = 0;
+      let forwardedCount = 0;
+      const forwardErrors = [];
+
+      for (const route of this.inboundRoutes) {
+        if (route.drop) continue;
+        const forwardTo = route.forwardTo || [];
+        const shouldStore = route.mailbox && (route.keepForwarded || !forwardTo.length);
+        if (shouldStore) {
+          createInboundMessage(route.mailbox, {
+            ...parsedMessage,
+            recipients: [route.recipient],
+            sender: parsedMessage.sender || this.mailFrom
+          });
+          storedCount += 1;
+        }
+        if (forwardTo.length) {
+          try {
+            await this.forwardInboundMessage(rawMessage, parsedMessage, route, forwardTo);
+            forwardedCount += forwardTo.length;
+          } catch (error) {
+            forwardErrors.push({ route, error });
+            console.warn(`Inbound forward failed for ${route.recipient}: ${error.message}`);
+          }
+        }
+      }
+
+      const hasForwardOnlyFailure = forwardErrors.some(({ route }) => !route.mailbox || !route.keepForwarded);
+      if (hasForwardOnlyFailure || (!storedCount && !forwardedCount && forwardErrors.length)) {
+        return this.write(451, 'Temporary local delivery error');
+      }
+      this.resetEnvelope(false);
+      return this.write(250, 'Message accepted');
+    } catch (error) {
+      console.error(error);
+      return this.write(451, 'Temporary local delivery error');
+    }
+  }
+
+  async forwardInboundMessage(rawMessage, parsedMessage, route, recipients) {
+    const sender = extractAddress(this.mailFrom) ||
+      extractAddress(parsedMessage.sender) ||
+      route.mailbox?.address ||
+      `postmaster@${route.mailbox?.domain || this.config.hostname}`;
+    await sendViaSmtp({
+      host: this.config.relayHost,
+      port: this.config.relayPort,
+      secure: this.config.relaySecure,
+      username: this.config.relayUsername,
+      password: this.config.relayPassword,
+      helo: this.config.relayHelo,
+      mailFrom: sender,
+      recipients,
+      rawMessage
+    });
+  }
+
   resetEnvelope(reply = true) {
     this.mailFrom = '';
+    this.mailFromAccepted = false;
     this.recipients = [];
+    this.inboundMailboxes = [];
+    this.inboundRoutes = [];
     this.dataMode = false;
     this.dataLines = [];
+    this.dataBytes = 0;
+    this.dataTooLarge = false;
     this.user = this.authenticated ? this.user : null;
     if (reply) this.write(250, 'OK');
   }
@@ -489,12 +621,18 @@ class SubmissionSession {
   canAuthenticate() {
     return this.config.tlsActive || this.config.allowInsecureAuth;
   }
+
+  maxMessageBytes() {
+    const value = Number(this.config.maxMessageBytes || defaultMaxMessageBytes);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : defaultMaxMessageBytes;
+  }
 }
 
-function extractPathAddress(argument) {
-  const match = String(argument || '').match(/FROM:\s*<([^>]+)>|TO:\s*<([^>]+)>/i);
-  const raw = match ? (match[1] || match[2]) : argument;
-  return extractAddress(raw);
+function extractPathAddress(argument, { allowEmpty = false } = {}) {
+  const match = String(argument || '').match(/FROM:\s*<([^>]*)>|TO:\s*<([^>]*)>/i);
+  const raw = match ? (match[1] ?? match[2]) : argument;
+  if (allowEmpty && String(raw || '').trim() === '') return '';
+  return extractAddress(raw) || null;
 }
 
 function extractHeader(rawMessage, name) {

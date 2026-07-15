@@ -431,6 +431,7 @@ function isHostInZone(host, zoneName) {
 }
 
 function effectiveZoneName(credential, domain, record) {
+  if (domain?.domain) return domain.domain;
   if (credential.provider !== 'cloudflare') return credential.zoneName || '';
   const configuredZone = credential.zoneName || '';
   if (configuredZone && isHostInZone(record.host, configuredZone)) return configuredZone;

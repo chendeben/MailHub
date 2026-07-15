@@ -16,6 +16,10 @@ services:
       - "${SUBMISSION_BIND:-0.0.0.0}:465:465"
       - "${SUBMISSION_BIND:-0.0.0.0}:587:587"
       - "${SUBMISSION_BIND:-0.0.0.0}:${SUBMISSION_ALT_PORT:-2525}:2525"
+      - "${IMAP_BIND:-0.0.0.0}:143:143"
+      - "${IMAP_BIND:-0.0.0.0}:993:993"
+      - "${POP3_BIND:-0.0.0.0}:110:110"
+      - "${POP3_BIND:-0.0.0.0}:995:995"
     volumes:
       - ./data:/data
       - ./certs:/certs:ro

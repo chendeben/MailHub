@@ -6,17 +6,18 @@ import path from 'node:path';
 import { fileURLToPath, domainToASCII } from 'node:url';
 import {
   authenticateUser,
+  authenticateApiToken,
   approveUser,
   claimLegacyData,
   createApiToken,
   createAccountToken,
   createDomain,
+  createInboundMailbox,
   createSendEvent,
   createTrackingLink,
   createUserWithAccountToken,
   createWebhook,
   consumeAccountToken,
-  deleteApiToken,
   deleteDnsCredential,
   deleteDomain,
   deleteSmtpCredential,
@@ -27,6 +28,8 @@ import {
   getDnsCredential,
   getDomain,
   getDomainByName,
+  getApiToken,
+  getInboundMessage,
   getSendEvent,
   getSendAnalytics,
   getSettings,
@@ -42,6 +45,8 @@ import {
   listAuditLogs,
   listDnsCredentials,
   listDomains,
+  listInboundMailboxes,
+  listInboundMessages,
   listSendEvents,
   listSmtpCredentials,
   listSmtpRelays,
@@ -50,6 +55,7 @@ import {
   listWebhooks,
   logAudit,
   logSendEvent,
+  markInboundMessageRead,
   markUserEmailVerified,
   previewUserMerge,
   replayWebhookDelivery,
@@ -66,6 +72,8 @@ import {
   transferApiTokens,
   transferDnsCredential,
   transferDomain,
+  updateInboundMailbox,
+  updateApiToken,
   updateDkim,
   updateDomain,
   updateUser,
@@ -75,7 +83,7 @@ import {
   findSendEventByTrackingToken,
   findTrackingLinkByToken,
   recordTrackingEvent,
-  verifyApiToken,
+  revokeApiToken,
   verifyUserCredentials
 } from './db.js';
 import { applyDnsSetup, testDnsCredential } from './dns-providers.js';
@@ -85,13 +93,21 @@ import { assertSafeWebhookUrl, startWebhookWorker } from './webhook-dispatcher.j
 import { buildDnsGuide, buildSystemDnsChecks } from './dns-guide.js';
 import { createDkimKeyPair } from './dkim.js';
 import {
+  buildDeliverabilityHeaders,
   buildMessage,
+  createFeedbackId,
   domainFromAddress,
   extractAddress,
   parseAddressList,
+  resolveEnvelopeSender,
   sendViaSmtp,
   signMessageForDomain
 } from './mailer.js';
+import {
+  parseMailboxAccessListeners,
+  publicMailboxAccessListeners,
+  startMailboxAccessServers
+} from './mail-access.js';
 import {
   parseSubmissionListeners,
   publicSubmissionListeners,
@@ -153,6 +169,14 @@ const envConfig = {
   submissionAllowInsecureAuth: String(process.env.SUBMISSION_ALLOW_INSECURE_AUTH || '').toLowerCase() === 'true',
   submissionTlsCert: process.env.SUBMISSION_TLS_CERT || '',
   submissionTlsKey: process.env.SUBMISSION_TLS_KEY || '',
+  submissionMaxMessageBytes: Number(process.env.SUBMISSION_MAX_MESSAGE_BYTES || 50 * 1024 * 1024),
+  imapEnabled: String(process.env.IMAP_ENABLED || 'true').toLowerCase() !== 'false',
+  imapListeners: parseMailboxAccessListeners(process.env.IMAP_PORTS, '143:imap,993:imaps'),
+  pop3Enabled: String(process.env.POP3_ENABLED || 'true').toLowerCase() !== 'false',
+  pop3Listeners: parseMailboxAccessListeners(process.env.POP3_PORTS, '110:pop3,995:pop3s'),
+  mailboxAccessAllowInsecureAuth:
+    String(process.env.MAIL_ACCESS_ALLOW_INSECURE_AUTH || process.env.SUBMISSION_ALLOW_INSECURE_AUTH || '').toLowerCase() === 'true',
+  inboundEnabled: String(process.env.INBOUND_ENABLED || 'true').toLowerCase() !== 'false',
   sessionSecret: process.env.SESSION_SECRET || fallbackSecret,
   trackingSecret: process.env.TRACKING_SECRET || process.env.SESSION_SECRET || fallbackSecret,
   trustProxy: String(process.env.TRUST_PROXY || '').toLowerCase() === 'true',
@@ -168,7 +192,17 @@ const defaultSettings = {
   dmarcRua: process.env.DMARC_RUA || '',
   sendRequiresVerified: String(process.env.SEND_REQUIRES_VERIFIED || '').toLowerCase() === 'true' ? 'true' : 'false',
   engagementTrackingEnabled:
-    String(process.env.ENGAGEMENT_TRACKING_ENABLED || '').toLowerCase() === 'true' ? 'true' : 'false'
+    String(process.env.ENGAGEMENT_TRACKING_ENABLED || '').toLowerCase() === 'true' ? 'true' : 'false',
+  listUnsubscribeMailto: process.env.LIST_UNSUBSCRIBE_MAILTO || '',
+  listUnsubscribeUrl: process.env.LIST_UNSUBSCRIBE_URL || '',
+  listUnsubscribePostEnabled:
+    String(process.env.LIST_UNSUBSCRIBE_POST_ENABLED || '').toLowerCase() === 'true' ? 'true' : 'false',
+  feedbackIdEnabled: String(process.env.FEEDBACK_ID_ENABLED || 'true').toLowerCase() === 'false' ? 'false' : 'true',
+  reportAbuseTo: process.env.REPORT_ABUSE_TO || '',
+  csaComplaintsTo: process.env.CSA_COMPLAINTS_TO || '',
+  bounceAddress: process.env.BOUNCE_ADDRESS || '',
+  bounceEnvelopeEnabled:
+    String(process.env.BOUNCE_ENVELOPE_ENABLED || '').toLowerCase() === 'true' ? 'true' : 'false'
 };
 
 const emailVerificationPurpose = 'email_verification';
@@ -261,6 +295,8 @@ startSubmissionServer({
   listeners: envConfig.submissionListeners,
   hostname: envConfig.submissionHost,
   allowInsecureAuth: envConfig.submissionAllowInsecureAuth,
+  inboundEnabled: envConfig.inboundEnabled,
+  maxMessageBytes: envConfig.submissionMaxMessageBytes,
   tlsCertPath: envConfig.submissionTlsCert,
   tlsKeyPath: envConfig.submissionTlsKey,
   relayHost: envConfig.smtpHost,
@@ -276,7 +312,24 @@ startSubmissionServer({
       appBaseUrl: settings.appBaseUrl,
       secret: envConfig.trackingSecret
     };
+  },
+  getDeliverabilitySettings() {
+    return {
+      ...runtimeSettings(),
+      secret: envConfig.trackingSecret
+    };
   }
+});
+
+startMailboxAccessServers({
+  hostname: envConfig.submissionHost,
+  imapEnabled: envConfig.imapEnabled,
+  imapListeners: envConfig.imapListeners,
+  pop3Enabled: envConfig.pop3Enabled,
+  pop3Listeners: envConfig.pop3Listeners,
+  allowInsecureAuth: envConfig.mailboxAccessAllowInsecureAuth,
+  tlsCertPath: envConfig.submissionTlsCert,
+  tlsKeyPath: envConfig.submissionTlsKey
 });
 
 async function handleApi(req, res, url, user) {
@@ -331,6 +384,61 @@ async function handleApi(req, res, url, user) {
   }
   if (method === 'GET' && pathname === '/api/events') {
     return sendJson(res, 200, { events: listSendEvents(user.id) });
+  }
+  if (method === 'GET' && pathname === '/api/inbound-mailboxes') {
+    return sendJson(res, 200, { mailboxes: listInboundMailboxes(user.id) });
+  }
+  if (method === 'POST' && pathname === '/api/inbound-mailboxes') {
+    const body = await readJson(req);
+    const password = String(body.password || '');
+    if (password.length < 8) return sendJson(res, 400, { error: '邮箱密码至少需要 8 位。' });
+    try {
+      const mailbox = createInboundMailbox(user.id, inboundMailboxPatch({
+        ...body,
+        password
+      }));
+      return sendJson(res, 201, {
+        mailbox,
+        clientConfig: mailboxClientConfig(mailbox, { password })
+      });
+    } catch (error) {
+      if (isUniqueError(error)) return sendJson(res, 409, { error: '该收信邮箱已存在。' });
+      return sendJson(res, 400, { error: error.message || '收信邮箱创建失败。' });
+    }
+  }
+  const inboundMailboxMatch = pathname.match(/^\/api\/inbound-mailboxes\/(\d+)$/);
+  if (inboundMailboxMatch && (method === 'PATCH' || method === 'PUT')) {
+    const body = await readJson(req);
+    try {
+      const mailbox = updateInboundMailbox(user.id, Number(inboundMailboxMatch[1]), inboundMailboxPatch(body));
+      if (!mailbox) return sendJson(res, 404, { error: '收信邮箱不存在。' });
+      return sendJson(res, 200, {
+        mailbox,
+        clientConfig: body.password ? mailboxClientConfig(mailbox, { password: String(body.password || '') }) : undefined
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message || '收信邮箱更新失败。' });
+    }
+  }
+  if (method === 'GET' && pathname === '/api/inbound-messages') {
+    return sendJson(res, 200, {
+      messages: listInboundMessages(user.id, {
+        mailboxId: Number(url.searchParams.get('mailboxId') || 0) || null
+      })
+    });
+  }
+  const inboundMessageMatch = pathname.match(/^\/api\/inbound-messages\/(\d+)$/);
+  if (inboundMessageMatch) {
+    const id = Number(inboundMessageMatch[1]);
+    if (method === 'GET') {
+      const message = getInboundMessage(user.id, id);
+      return sendJson(res, message ? 200 : 404, { message });
+    }
+    if (method === 'PATCH') {
+      const body = await readJson(req);
+      const message = markInboundMessageRead(user.id, id, body.read !== false);
+      return sendJson(res, message ? 200 : 404, { message });
+    }
   }
   const sendEventMatch = pathname.match(/^\/api\/events\/(\d+)$/);
   if (sendEventMatch && method === 'GET') {
@@ -433,6 +541,7 @@ async function handleApi(req, res, url, user) {
     }
   }
   if (method === 'POST' && pathname === '/api/send') {
+    if (!requireApiTokenScope(req, res, 'send')) return;
     const body = await readJson(req);
     const smtpRelayId = Number(body.smtpRelayId || 0) || null;
     if (smtpRelayId && !getSmtpRelay(smtpRelayId, user.id)) {
@@ -442,17 +551,61 @@ async function handleApi(req, res, url, user) {
     return sendJson(res, 202, result);
   }
 
+  if (method === 'GET' && pathname === '/api/mailboxes') {
+    if (!requireApiTokenScope(req, res, 'mailboxes:read')) return;
+    return sendJson(res, 200, { mailboxes: listInboundMailboxes(user.id) });
+  }
+  if (method === 'POST' && pathname === '/api/mailboxes') {
+    if (!requireApiTokenScope(req, res, 'mailboxes:write')) return;
+    const body = await readJson(req);
+    try {
+      const request = mailboxApiRequest(body);
+      const mailbox = createInboundMailbox(user.id, request.mailbox);
+      return sendJson(res, 201, {
+        mailbox,
+        mode: request.mode,
+        password: request.password,
+        clientConfig: mailboxClientConfig(mailbox, { password: request.password })
+      });
+    } catch (error) {
+      if (isUniqueError(error)) return sendJson(res, 409, { error: '该收信邮箱已存在。' });
+      return sendJson(res, 400, { error: error.message || '邮箱创建失败。' });
+    }
+  }
+
   if (method === 'GET' && pathname === '/api/api-tokens') {
     return sendJson(res, 200, { tokens: listApiTokens(user.id) });
   }
   if (method === 'POST' && pathname === '/api/api-tokens') {
     const body = await readJson(req);
-    return sendJson(res, 201, { token: createApiToken(user.id, body.name) });
+    try {
+      return sendJson(res, 201, {
+        token: createApiToken(user.id, body.name, {
+          scopes: body.scopes,
+          expiresAt: body.expiresAt
+        })
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message || 'API Token 创建失败。' });
+    }
   }
   const tokenMatch = pathname.match(/^\/api\/api-tokens\/(\d+)$/);
+  if (tokenMatch && (method === 'PATCH' || method === 'PUT')) {
+    const body = await readJson(req);
+    try {
+      const token = updateApiToken(Number(tokenMatch[1]), user.id, body);
+      return sendJson(res, token ? 200 : 404, token ? { token } : { error: 'API Token 不存在。' });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message || 'API Token 更新失败。' });
+    }
+  }
   if (tokenMatch && method === 'DELETE') {
-    const deleted = deleteApiToken(Number(tokenMatch[1]), user.id);
-    return sendJson(res, deleted ? 200 : 404, { deleted });
+    const revoked = revokeApiToken(Number(tokenMatch[1]), user.id);
+    return sendJson(res, revoked ? 200 : 404, {
+      revoked,
+      deleted: revoked,
+      token: revoked ? getApiToken(Number(tokenMatch[1]), user.id) : null
+    });
   }
 
   if (method === 'GET' && pathname === '/api/dns-credentials') {
@@ -600,6 +753,10 @@ async function handleApi(req, res, url, user) {
       if (smtpRelayId && !getSmtpRelay(smtpRelayId, user.id)) {
         return sendJson(res, 400, { error: 'SMTP 出口不存在。' });
       }
+      const catchAllAddress = body.catchAllAddress !== undefined ? normalizeCatchAllAddress(body.catchAllAddress) : undefined;
+      if (body.catchAllAddress && !catchAllAddress) {
+        return sendJson(res, 400, { error: '收取未知邮件的邮箱格式不正确。' });
+      }
       const row = updateDomain(id, user.id, {
         selector: body.selector ? normalizeSelector(body.selector) : undefined,
         dnsCredentialId,
@@ -608,7 +765,8 @@ async function handleApi(req, res, url, user) {
         sendingIp: body.sendingIp !== undefined ? String(body.sendingIp).trim() : undefined,
         spfExtra: body.spfExtra !== undefined ? String(body.spfExtra).trim() : undefined,
         dmarcPolicy: body.dmarcPolicy ? normalizeDmarcPolicy(body.dmarcPolicy) : undefined,
-        dmarcRua: body.dmarcRua !== undefined ? String(body.dmarcRua).trim() : undefined
+        dmarcRua: body.dmarcRua !== undefined ? String(body.dmarcRua).trim() : undefined,
+        catchAllAddress
       });
       if (!row) return sendJson(res, 404, { error: '域名不存在。' });
       return sendJson(res, 200, { domain: row });
@@ -663,6 +821,8 @@ async function handleApi(req, res, url, user) {
         to: body.to,
         subject: body.subject || `MailHub test for ${row.domain}`,
         text: body.text || `This is a MailHub test message from ${row.domain}.`,
+        html: body.html,
+        tracking: body.tracking,
         smtpRelayId: body.smtpRelayId
       }, user);
       return sendJson(res, 202, result);
@@ -1058,7 +1218,30 @@ async function sendMailFromBody(body, user) {
       subject,
       text: body.text || '',
       html,
-      baseUrl: settings.appBaseUrl
+      baseUrl: settings.appBaseUrl,
+      headers: buildDeliverabilityHeaders({
+        from,
+        listUnsubscribeMailto: settings.listUnsubscribeMailto,
+        listUnsubscribeUrl: settings.listUnsubscribeUrl,
+        listUnsubscribePostEnabled: settings.listUnsubscribePostEnabled,
+        feedbackId: settings.feedbackIdEnabled
+          ? createFeedbackId({
+              userId: user.id,
+              domainId: domain.id,
+              eventId,
+              secret: envConfig.trackingSecret
+            })
+          : '',
+        reportAbuseTo: settings.reportAbuseTo,
+        csaComplaintsTo: settings.csaComplaintsTo,
+        context: {
+          eventId,
+          userId: user.id,
+          domain: fromDomain,
+          sender: from,
+          recipient: recipients.length === 1 ? recipients[0] : ''
+        }
+      })
     });
     const signed = signMessageForDomain(rawMessage, domain);
     const smtpResult = await sendViaSmtp({
@@ -1068,7 +1251,7 @@ async function sendMailFromBody(body, user) {
       username: smtpTransport.username,
       password: smtpTransport.password,
       helo: smtpTransport.helo,
-      mailFrom: from,
+      mailFrom: resolveEnvelopeSender(settings, from),
       recipients,
       rawMessage: signed
     });
@@ -1393,13 +1576,30 @@ function getRequestUser(req, pathname) {
     const user = authenticateUser(decoded.slice(0, index), decoded.slice(index + 1));
     if (user) return user;
   }
-  if (pathname === '/api/send' && auth.startsWith('Bearer ')) {
+  if (isTokenApiPath(pathname) && auth.startsWith('Bearer ')) {
     const token = auth.slice(7);
-    const user = verifyApiToken(token);
-    if (user) return user;
-    if (envConfig.legacyApiToken && safeEqual(token, envConfig.legacyApiToken)) return getAdminUser();
+    const authenticated = authenticateApiToken(token);
+    if (authenticated) {
+      req.mailhubApiToken = authenticated.token;
+      return authenticated.user;
+    }
+    if (pathname === '/api/send' && envConfig.legacyApiToken && safeEqual(token, envConfig.legacyApiToken)) {
+      req.mailhubApiToken = { scopes: ['send'], tokenPrefix: 'legacy' };
+      return getAdminUser();
+    }
   }
   return null;
+}
+
+function isTokenApiPath(pathname) {
+  return pathname === '/api/send' || pathname === '/api/mailboxes';
+}
+
+function requireApiTokenScope(req, res, scope) {
+  const token = req.mailhubApiToken;
+  if (!token || token.scopes?.includes(scope)) return true;
+  sendJson(res, 403, { error: `当前 API Token 缺少 ${scope} 权限。` });
+  return false;
 }
 
 function getSessionUser(req) {
@@ -1446,8 +1646,26 @@ function publicConfig(user) {
       ports: publicSubmissionListeners(envConfig.submissionListeners),
       username: smtpCredential?.username || '',
       passwordSet: Boolean(smtpCredential?.passwordSet),
+      inboundEnabled: envConfig.inboundEnabled,
       tls: Boolean(envConfig.submissionTlsCert && envConfig.submissionTlsKey),
       requireTlsForAuth: !envConfig.submissionAllowInsecureAuth
+    },
+    mailAccess: {
+      host: envConfig.submissionHost,
+      tls: Boolean(envConfig.submissionTlsCert && envConfig.submissionTlsKey),
+      requireTlsForAuth: !envConfig.mailboxAccessAllowInsecureAuth,
+      imap: {
+        enabled: envConfig.imapEnabled,
+        ports: publicMailboxAccessListeners(envConfig.imapListeners, {
+          tls: Boolean(envConfig.submissionTlsCert && envConfig.submissionTlsKey)
+        })
+      },
+      pop3: {
+        enabled: envConfig.pop3Enabled,
+        ports: publicMailboxAccessListeners(envConfig.pop3Listeners, {
+          tls: Boolean(envConfig.submissionTlsCert && envConfig.submissionTlsKey)
+        })
+      }
     },
     apiTokenSet: Boolean(envConfig.legacyApiToken),
     usingDefaultAdminPassword: user.role === 'admin' && envConfig.adminPassword === 'change-this-admin-password'
@@ -1464,7 +1682,15 @@ function runtimeSettings() {
     dmarcPolicy: normalizeDmarcPolicy(settings.dmarcPolicy),
     dmarcRua: settings.dmarcRua,
     sendRequiresVerified: String(settings.sendRequiresVerified).toLowerCase() === 'true',
-    engagementTrackingEnabled: String(settings.engagementTrackingEnabled).toLowerCase() === 'true'
+    engagementTrackingEnabled: String(settings.engagementTrackingEnabled).toLowerCase() === 'true',
+    listUnsubscribeMailto: settings.listUnsubscribeMailto,
+    listUnsubscribeUrl: settings.listUnsubscribeUrl,
+    listUnsubscribePostEnabled: String(settings.listUnsubscribePostEnabled).toLowerCase() === 'true',
+    feedbackIdEnabled: String(settings.feedbackIdEnabled).toLowerCase() !== 'false',
+    reportAbuseTo: settings.reportAbuseTo,
+    csaComplaintsTo: settings.csaComplaintsTo,
+    bounceAddress: settings.bounceAddress,
+    bounceEnvelopeEnabled: String(settings.bounceEnvelopeEnabled).toLowerCase() === 'true'
   };
 }
 
@@ -1719,6 +1945,130 @@ function smtpRelayPatch(body) {
   return patch;
 }
 
+function mailboxApiRequest(body) {
+  const mode = normalizeMailboxApiMode(body.mode);
+  if (!mode) throw new Error('邮箱类型必须为 permanent 或 temporary。');
+  const address = resolveMailboxApiAddress(body, mode);
+  const password = String(body.password || '') || crypto.randomBytes(18).toString('base64url');
+  if (password.length < 8) throw new Error('邮箱密码至少需要 8 位。');
+  const expiresAt = mode === 'temporary' ? temporaryMailboxExpiresAt(body.expiresInMinutes) : null;
+  return {
+    mode,
+    password,
+    mailbox: {
+      address,
+      password,
+      displayName: body.displayName,
+      aliases: body.aliases,
+      forwardTo: body.forwardTo,
+      keepForwarded: body.keepForwarded,
+      quotaMb: body.quotaMb,
+      expiresAt
+    }
+  };
+}
+
+function normalizeMailboxApiMode(value) {
+  const mode = String(value || 'permanent').trim().toLowerCase();
+  if (['permanent', 'long'].includes(mode)) return 'permanent';
+  if (['temporary', 'temp'].includes(mode)) return 'temporary';
+  return '';
+}
+
+function resolveMailboxApiAddress(body, mode) {
+  const address = String(body.address || '').trim().toLowerCase();
+  if (address) return address;
+  const domain = normalizeDomain(body.domain);
+  if (!domain) throw new Error('请提供已添加域名的 address，或提供有效的 domain。');
+  const specifiedLocalPart = String(body.localPart || '').trim().toLowerCase();
+  const localPart = specifiedLocalPart || (mode === 'temporary' ? `tmp-${crypto.randomBytes(7).toString('hex')}` : '');
+  if (!localPart || !/^[^@\s]+$/.test(localPart)) throw new Error('邮箱 localPart 格式不正确。');
+  return `${localPart}@${domain}`;
+}
+
+function temporaryMailboxExpiresAt(value) {
+  const minutes = Number(value);
+  const maxMinutes = 30 * 24 * 60;
+  if (!Number.isInteger(minutes) || minutes < 5 || minutes > maxMinutes) {
+    throw new Error(`临时邮箱 expiresInMinutes 必须是 5 到 ${maxMinutes} 分钟之间的整数。`);
+  }
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+function inboundMailboxPatch(body) {
+  const patch = {};
+  for (const key of ['address', 'displayName', 'password', 'aliases', 'forwardTo', 'keepForwarded', 'quotaMb', 'status']) {
+    if (Object.hasOwn(body, key)) patch[key] = body[key];
+  }
+  return patch;
+}
+
+function normalizeCatchAllAddress(value) {
+  const clean = String(value || '').trim().toLowerCase();
+  if (!clean) return '';
+  if (clean === '/dev/null') return clean;
+  return extractAddress(clean);
+}
+
+function mailboxClientConfig(mailbox, { password = '' } = {}) {
+  const smtpPort = preferredSubmissionPort(['SMTP + STARTTLS', 'SMTPS']);
+  const imapPort = preferredMailboxAccessPort(envConfig.imapListeners, ['IMAPS', 'IMAP + STARTTLS', 'IMAP']);
+  const pop3Port = preferredMailboxAccessPort(envConfig.pop3Listeners, ['POP3S', 'POP3 + STLS', 'POP3']);
+  return {
+    username: mailbox.address,
+    password,
+    incoming: {
+      protocol: 'IMAP',
+      host: envConfig.submissionHost,
+      port: imapPort?.port || 143,
+      security: imapPort?.protocol || 'IMAP + STARTTLS',
+      authMethod: 'Normal password',
+      username: mailbox.address,
+      password
+    },
+    pop3: {
+      protocol: 'POP3',
+      host: envConfig.submissionHost,
+      port: pop3Port?.port || 110,
+      security: pop3Port?.protocol || 'POP3 + STLS',
+      authMethod: 'Normal password',
+      username: mailbox.address,
+      password
+    },
+    outgoing: {
+      protocol: 'SMTP',
+      host: envConfig.submissionHost,
+      port: smtpPort?.port || 587,
+      security: smtpPort?.protocol || 'SMTP + STARTTLS',
+      authMethod: 'Normal password',
+      username: mailbox.address,
+      password
+    }
+  };
+}
+
+function preferredMailboxAccessPort(listeners, protocols) {
+  const tlsEnabled = Boolean(envConfig.submissionTlsCert && envConfig.submissionTlsKey);
+  const publicListeners = publicMailboxAccessListeners(listeners, { tls: tlsEnabled });
+  for (const protocol of protocols) {
+    const match = publicListeners.find((listener) => listener.protocol === protocol && [993, 995].includes(listener.port)) ||
+      publicListeners.find((listener) => listener.protocol === protocol);
+    if (match) return match;
+  }
+  return publicListeners[0] || null;
+}
+
+function preferredSubmissionPort(protocols) {
+  const listeners = publicSubmissionListeners(envConfig.submissionListeners);
+  for (const protocol of protocols) {
+    const match = listeners.find((listener) => listener.protocol === protocol && listener.port === 587) ||
+      listeners.find((listener) => listener.protocol === protocol && listener.port === 465) ||
+      listeners.find((listener) => listener.protocol === protocol);
+    if (match) return match;
+  }
+  return listeners[0] || null;
+}
+
 function settingsPatchFromBody(body) {
   const patch = {};
   for (const key of [
@@ -1726,7 +2076,12 @@ function settingsPatchFromBody(body) {
     'mailHostname',
     'sendingIp',
     'defaultSpfMechanisms',
-    'dmarcRua'
+    'dmarcRua',
+    'listUnsubscribeMailto',
+    'listUnsubscribeUrl',
+    'reportAbuseTo',
+    'csaComplaintsTo',
+    'bounceAddress'
   ]) {
     if (Object.hasOwn(body, key)) patch[key] = body[key];
   }
@@ -1734,6 +2089,15 @@ function settingsPatchFromBody(body) {
   if (Object.hasOwn(body, 'sendRequiresVerified')) patch.sendRequiresVerified = boolString(body.sendRequiresVerified);
   if (Object.hasOwn(body, 'engagementTrackingEnabled')) {
     patch.engagementTrackingEnabled = boolString(body.engagementTrackingEnabled);
+  }
+  if (Object.hasOwn(body, 'listUnsubscribePostEnabled')) {
+    patch.listUnsubscribePostEnabled = boolString(body.listUnsubscribePostEnabled);
+  }
+  if (Object.hasOwn(body, 'feedbackIdEnabled')) {
+    patch.feedbackIdEnabled = boolString(body.feedbackIdEnabled);
+  }
+  if (Object.hasOwn(body, 'bounceEnvelopeEnabled')) {
+    patch.bounceEnvelopeEnabled = boolString(body.bounceEnvelopeEnabled);
   }
   return patch;
 }

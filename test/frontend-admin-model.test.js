@@ -24,6 +24,8 @@ test('summarizes merge preview counts and confirmation text', () => {
       domains: 3,
       dnsCredentials: 2,
       apiTokens: 1,
+      inboundMailboxes: 4,
+      inboundMessages: 5,
       sendEvents: 9,
       smtpCredential: 0
     }
@@ -34,6 +36,8 @@ test('summarizes merge preview counts and confirmation text', () => {
     { key: 'domains', label: '域名', count: 3 },
     { key: 'dnsCredentials', label: 'DNS 凭据', count: 2 },
     { key: 'apiTokens', label: 'API Token', count: 1 },
+    { key: 'inboundMailboxes', label: '收信邮箱', count: 4 },
+    { key: 'inboundMessages', label: '入站邮件', count: 5 },
     { key: 'sendEvents', label: '发送记录', count: 9 },
     { key: 'smtpCredential', label: 'SMTP 凭据', count: 0 }
   ]);

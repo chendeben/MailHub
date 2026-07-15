@@ -420,6 +420,7 @@ function AdminResources({
     },
     { title: '资源', render: (_, group) => <ResourceCountTags counts={group.user.resourceCounts} /> },
     { title: '发送记录', dataIndex: 'sendEventCount', width: 120 },
+    { title: '入站邮件', dataIndex: 'inboundMessageCount', width: 120 },
     {
       title: 'SMTP',
       width: 120,
@@ -841,6 +842,8 @@ function ResourceCountTags({ counts }: { counts?: AdminUser['resourceCounts'] })
       <Tag>域名 {counts.domains}</Tag>
       <Tag>DNS {counts.dnsCredentials}</Tag>
       <Tag>Token {counts.apiTokens}</Tag>
+      <Tag>收信 {counts.inboundMailboxes}</Tag>
+      <Tag>入站 {counts.inboundMessages}</Tag>
       <Tag>记录 {counts.sendEvents}</Tag>
       <Tag>SMTP {counts.smtpCredential}</Tag>
     </Space>

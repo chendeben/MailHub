@@ -104,11 +104,35 @@ export default function Settings({ me, settings, users, loading, onSave }: Setti
             <Form.Item name="dmarcRua" label="DMARC_RUA">
               <Input />
             </Form.Item>
+            <Form.Item name="listUnsubscribeMailto" label="LIST_UNSUBSCRIBE_MAILTO">
+              <Input placeholder="unsubscribe@example.com" />
+            </Form.Item>
+            <Form.Item name="listUnsubscribeUrl" label="LIST_UNSUBSCRIBE_URL">
+              <Input placeholder="https://example.com/unsubscribe/{eventId}" />
+            </Form.Item>
+            <Form.Item name="reportAbuseTo" label="REPORT_ABUSE_TO">
+              <Input placeholder="abuse@example.com" />
+            </Form.Item>
+            <Form.Item name="csaComplaintsTo" label="CSA_COMPLAINTS_TO">
+              <Input placeholder="csa-complaints@example.com" />
+            </Form.Item>
+            <Form.Item name="bounceAddress" label="BOUNCE_ADDRESS">
+              <Input placeholder="bounce@example.com" />
+            </Form.Item>
           </div>
           <Form.Item name="sendRequiresVerified" label="SEND_REQUIRES_VERIFIED" valuePropName="checked">
             <Switch />
           </Form.Item>
           <Form.Item name="engagementTrackingEnabled" label={t('settings.engagementTracking')} valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="listUnsubscribePostEnabled" label="LIST_UNSUBSCRIBE_POST_ENABLED" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="feedbackIdEnabled" label="FEEDBACK_ID_ENABLED" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="bounceEnvelopeEnabled" label="BOUNCE_ENVELOPE_ENABLED" valuePropName="checked">
             <Switch />
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={loading}>

@@ -9,6 +9,8 @@ const MERGE_SUMMARY_ITEMS = [
   ['domains', '域名'],
   ['dnsCredentials', 'DNS 凭据'],
   ['apiTokens', 'API Token'],
+  ['inboundMailboxes', '收信邮箱'],
+  ['inboundMessages', '入站邮件'],
   ['sendEvents', '发送记录'],
   ['smtpCredential', 'SMTP 凭据']
 ];

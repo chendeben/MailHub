@@ -134,6 +134,8 @@ async function trackingServerFixture() {
       TRACKING_SECRET: 'tracking-secret',
       TRUST_PROXY: 'true',
       SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false',
       WEBHOOK_WORKER_ENABLED: '0',
       DNS_AUTO_CHECK_ENABLED: 'false',
       DELIVERY_TRACKING_ENABLED: 'false'

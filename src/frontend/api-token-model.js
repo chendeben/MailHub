@@ -58,6 +58,49 @@ const result = await response.json();`
   };
 }
 
+export function buildMailboxApiUsageExamples({
+  endpoint = '/api/mailboxes',
+  token = '<USER_API_TOKEN>',
+  domain = 'example.com'
+} = {}) {
+  const permanentBody = {
+    mode: 'permanent',
+    address: `support@${domain}`,
+    password: '<MAILBOX_PASSWORD>',
+    displayName: 'Support'
+  };
+  const temporaryBody = {
+    mode: 'temporary',
+    domain,
+    expiresInMinutes: 60
+  };
+  return {
+    permanent: JSON.stringify(permanentBody, null, 2),
+    temporary: JSON.stringify(temporaryBody, null, 2),
+    permanentCurl: buildBearerCurl(endpoint, token, permanentBody),
+    temporaryCurl: buildBearerCurl(endpoint, token, temporaryBody),
+    successResponse: JSON.stringify({
+      mailbox: {
+        address: `tmp-abc123@${domain}`,
+        temporary: true,
+        expiresAt: '2026-07-14T12:00:00.000Z'
+      },
+      password: '<GENERATED_MAILBOX_PASSWORD>',
+      clientConfig: {
+        incoming: { protocol: 'IMAP', port: 993, security: 'SSL/TLS' },
+        outgoing: { protocol: 'SMTP', port: 465, security: 'SSL/TLS' }
+      }
+    }, null, 2)
+  };
+}
+
+function buildBearerCurl(endpoint, token, body) {
+  return `curl -X POST ${endpoint} \\
+  -H 'Authorization: Bearer ${token}' \\
+  -H 'Content-Type: application/json' \\
+  -d '${JSON.stringify(body, null, 2)}'`;
+}
+
 function domainFromAddress(value) {
   return String(value || '').split('@')[1] || '';
 }

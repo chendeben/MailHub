@@ -3,6 +3,7 @@ export type ViewKey =
   | 'domains'
   | 'dns-api'
   | 'smtp'
+  | 'inbox'
   | 'tokens'
   | 'logs'
   | 'webhooks'
@@ -17,6 +18,8 @@ export interface UserResourceCounts {
   domains: number;
   dnsCredentials: number;
   apiTokens: number;
+  inboundMailboxes: number;
+  inboundMessages: number;
   sendEvents: number;
   smtpCredential: number;
 }
@@ -45,6 +48,14 @@ export interface RuntimeConfig {
   dmarcRua: string;
   sendRequiresVerified: boolean;
   engagementTrackingEnabled: boolean;
+  listUnsubscribeMailto: string;
+  listUnsubscribeUrl: string;
+  listUnsubscribePostEnabled: boolean;
+  feedbackIdEnabled: boolean;
+  reportAbuseTo: string;
+  csaComplaintsTo: string;
+  bounceAddress: string;
+  bounceEnvelopeEnabled: boolean;
   systemChecks?: SystemChecks;
   submission?: {
     enabled: boolean;
@@ -52,8 +63,22 @@ export interface RuntimeConfig {
     ports: Array<{ port: number; protocol: string }>;
     username: string;
     passwordSet: boolean;
+    inboundEnabled: boolean;
     tls: boolean;
     requireTlsForAuth: boolean;
+  };
+  mailAccess?: {
+    host: string;
+    tls: boolean;
+    requireTlsForAuth: boolean;
+    imap: {
+      enabled: boolean;
+      ports: Array<{ port: number; protocol: string }>;
+    };
+    pop3: {
+      enabled: boolean;
+      ports: Array<{ port: number; protocol: string }>;
+    };
   };
   apiTokenSet?: boolean;
   usingDefaultAdminPassword?: boolean;
@@ -111,6 +136,7 @@ export interface Domain {
   spfExtra: string;
   dmarcPolicy: string;
   dmarcRua: string;
+  catchAllAddress: string;
   status: DomainStatus;
   createdAt: string;
   updatedAt: string;
@@ -197,6 +223,8 @@ export interface AdminUserResourceGroup {
   dnsCredentials: DnsCredential[];
   smtpCredential: SmtpCredential | null;
   apiTokens: ApiToken[];
+  inboundMailboxes: InboundMailbox[];
+  inboundMessageCount: number;
   sendEventCount: number;
 }
 
@@ -252,8 +280,90 @@ export interface ApiToken {
   name: string;
   tokenPrefix: string;
   token?: string;
+  scopes: Array<'send' | 'mailboxes:read' | 'mailboxes:write' | string>;
+  expiresAt?: string | null;
+  revokedAt?: string | null;
+  revokedReason?: string;
+  status?: 'active' | 'expired' | 'revoked' | string;
   lastUsedAt?: string;
   createdAt: string;
+}
+
+export interface InboundMailbox {
+  id: number;
+  userId: number;
+  domainId: number;
+  domain: string;
+  address: string;
+  localPart: string;
+  displayName: string;
+  aliases: string[];
+  forwardTo: string[];
+  keepForwarded: boolean;
+  quotaMb: number | null;
+  passwordSet: boolean;
+  passwordRecoverable: boolean;
+  status: string;
+  expiresAt?: string | null;
+  temporary?: boolean;
+  messageCount: number;
+  unreadCount: number;
+  lastMessageAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MailboxClientConfig {
+  username: string;
+  password?: string;
+  incoming: {
+    protocol: string;
+    host: string;
+    port: number;
+    security: string;
+    authMethod: string;
+    username: string;
+    password?: string;
+  };
+  pop3?: {
+    protocol: string;
+    host: string;
+    port: number;
+    security: string;
+    authMethod: string;
+    username: string;
+    password?: string;
+  };
+  outgoing: {
+    protocol: string;
+    host: string;
+    port: number;
+    security: string;
+    authMethod: string;
+    username: string;
+    password?: string;
+  };
+}
+
+export interface InboundMessage {
+  id: number;
+  mailboxId: number;
+  userId: number;
+  domainId: number;
+  domain: string;
+  mailboxAddress: string;
+  sender: string;
+  recipients: string[];
+  subject: string;
+  messageId: string;
+  preview: string;
+  read: boolean;
+  receivedAt: string;
+  createdAt: string;
+  updatedAt: string;
+  rawMessage?: string;
+  textBody?: string;
+  htmlBody?: string;
 }
 
 export interface DeliveryLogEntry {
@@ -471,6 +581,8 @@ export interface AppData {
   smtpCredential: SmtpCredential | null;
   smtpCredentials: SmtpCredential[];
   smtpRelays: SmtpRelay[];
+  inboundMailboxes: InboundMailbox[];
+  inboundMessages: InboundMessage[];
   dnsCredentials: DnsCredential[];
   apiTokens: ApiToken[];
   settings: RuntimeConfig | null;
@@ -498,6 +610,7 @@ export interface DomainPatchPayload {
   spfExtra?: string;
   dmarcPolicy?: string;
   dmarcRua?: string;
+  catchAllAddress?: string;
 }
 
 export type WebhookEvent = 'sent' | 'bounced' | 'failed' | 'opened' | 'clicked';

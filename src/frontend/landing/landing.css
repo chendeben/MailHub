@@ -295,10 +295,33 @@ main {
 }
 
 .feature-grid,
-.integrate-grid {
+.integrate-grid,
+.steps-grid,
+.doc-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
+}
+
+.steps-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.doc-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.step-number {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-bottom: 14px;
+  border-radius: 50%;
+  background: var(--mh-primary-soft);
+  color: var(--mh-primary);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .card {
@@ -337,6 +360,29 @@ main {
 .field-list code {
   color: var(--mh-ink);
   font-weight: 600;
+}
+
+.compact-list {
+  margin-top: 12px;
+}
+
+.doc-code-card {
+  margin-top: 16px;
+}
+
+.reference-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.reference-grid .doc-code-card {
+  margin-top: 16px;
+}
+
+.compact-note {
+  margin-top: 12px;
+  overflow-wrap: anywhere;
 }
 
 .port-grid {
@@ -456,6 +502,9 @@ tr:last-child td {
   .hero,
   .feature-grid,
   .integrate-grid,
+  .steps-grid,
+  .doc-grid,
+  .reference-grid,
   .port-grid {
     grid-template-columns: 1fr;
   }

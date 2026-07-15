@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import {
   authenticateUser,
+  authenticateApiToken,
   claimLegacyData,
   consumeAccountToken,
   createApiToken,
@@ -14,6 +15,8 @@ import {
   createSendEvent,
   createTrackingLink,
   createDomain,
+  createInboundMailbox,
+  createInboundMessage,
   createUser,
   createUserWithAccountToken,
   createWebhook,
@@ -21,6 +24,7 @@ import {
   deleteSmtpRelay,
   getDnsCredential,
   getDomain,
+  getInboundMessage,
   getSendEvent,
   getSendAnalytics,
   getSmtpRelay,
@@ -30,7 +34,10 @@ import {
   getUser,
   initDatabase,
   listAuditLogs,
+  listApiTokens,
   listDomains,
+  listInboundMailboxes,
+  listInboundMessages,
   listSendEvents,
   listSmtpCredentials,
   listSmtpRelays,
@@ -51,6 +58,7 @@ import {
   transferApiTokens,
   transferDnsCredential,
   transferDomain,
+  updateApiToken,
   updateUser,
   updateUserStatus,
   executeUserMerge,
@@ -58,6 +66,7 @@ import {
   findSendEventByTrackingToken,
   findTrackingLinkByToken,
   verifyApiToken,
+  revokeApiToken,
   verifySmtpCredential
 } from '../src/db.js';
 import {
@@ -136,6 +145,41 @@ test('migrates legacy data to the seeded admin user', () => {
   assert.equal(listDomains(admin.id).length, 1);
   assert.equal(listSendEvents(admin.id).length, 1);
   assert.equal(getSmtpCredential(admin.id).username, 'legacy-smtp');
+});
+
+test('migrates legacy inbound messages before creating folder indexes', () => {
+  const dataDir = tempDataDir();
+  const dbPath = path.join(dataDir, 'mailhub.sqlite');
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE inbound_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mailbox_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      domain_id INTEGER NOT NULL,
+      sender TEXT NOT NULL DEFAULT '',
+      recipients_json TEXT NOT NULL DEFAULT '[]',
+      subject TEXT NOT NULL DEFAULT '',
+      message_id TEXT NOT NULL DEFAULT '',
+      raw_message TEXT NOT NULL DEFAULT '',
+      text_body TEXT NOT NULL DEFAULT '',
+      html_body TEXT NOT NULL DEFAULT '',
+      preview TEXT NOT NULL DEFAULT '',
+      read_state TEXT NOT NULL DEFAULT 'false',
+      received_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      deleted_at TEXT
+    );
+  `);
+  legacy.close();
+
+  const database = initDatabase(dataDir, 'test-secret');
+  const columns = database.prepare('PRAGMA table_info(inbound_messages)').all().map((column) => column.name);
+  const indexes = database.prepare('PRAGMA index_list(inbound_messages)').all().map((index) => index.name);
+
+  assert.ok(columns.includes('folder'));
+  assert.ok(indexes.includes('idx_inbound_messages_mailbox_folder_received'));
 });
 
 test('migrates legacy send events with engagement tracking disabled', () => {
@@ -541,6 +585,30 @@ test('isolates domains, smtp credentials, and api tokens by user', () => {
 
   const token = createApiToken(alice.id, 'send');
   assert.equal(verifyApiToken(token.token).id, alice.id);
+});
+
+test('scopes, updates, and revokes API tokens without exposing their secret', () => {
+  initDatabase(tempDataDir(), 'test-secret');
+  const user = seedAdminUser({ username: 'admin', email: 'admin@example.com', password: 'password123' });
+  const token = createApiToken(user.id, 'Mailbox automation', {
+    scopes: ['mailboxes:read', 'mailboxes:write'],
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+  });
+
+  assert.deepEqual(token.scopes, ['mailboxes:read', 'mailboxes:write']);
+  assert.equal(token.status, 'active');
+  assert.equal(token.token.startsWith('mh_'), true);
+  assert.equal(authenticateApiToken(token.token)?.user.id, user.id);
+  assert.deepEqual(authenticateApiToken(token.token)?.token.scopes, ['mailboxes:read', 'mailboxes:write']);
+
+  const updated = updateApiToken(token.id, user.id, { name: 'Mailbox worker', scopes: ['send'] });
+  assert.equal(updated.name, 'Mailbox worker');
+  assert.deepEqual(updated.scopes, ['send']);
+
+  assert.equal(revokeApiToken(token.id, user.id, 'worker retired'), true);
+  assert.equal(authenticateApiToken(token.token), null);
+  assert.equal(listApiTokens(user.id)[0].status, 'revoked');
+  assert.equal(listApiTokens(user.id)[0].revokedReason, 'worker retired');
 });
 
 test('stores multiple smtp login credentials per user', () => {
@@ -1004,6 +1072,13 @@ test('lists users with owned resource counts', () => {
   const aliceDomain = createDomain(alice.id, domainFixture('alice.example'));
   createDomain(alice.id, domainFixture('news.alice.example'));
   const bobDomain = createDomain(bob.id, domainFixture('bob.example'));
+  const aliceMailbox = createInboundMailbox(alice.id, { address: 'support@alice.example' });
+  createInboundMessage(aliceMailbox, {
+    sender: 'sender@example.net',
+    recipients: ['support@alice.example'],
+    subject: 'Inbound',
+    rawMessage: 'Subject: Inbound\r\n\r\nHello'
+  });
 
   saveDnsCredential(alice.id, {
     name: 'Alice Cloudflare',
@@ -1057,6 +1132,8 @@ test('lists users with owned resource counts', () => {
     domains: 2,
     dnsCredentials: 2,
     apiTokens: 2,
+    inboundMailboxes: 1,
+    inboundMessages: 1,
     sendEvents: 2,
     smtpCredential: 2
   });
@@ -1064,6 +1141,8 @@ test('lists users with owned resource counts', () => {
     domains: 1,
     dnsCredentials: 0,
     apiTokens: 1,
+    inboundMailboxes: 0,
+    inboundMessages: 0,
     sendEvents: 1,
     smtpCredential: 0
   });
@@ -1087,6 +1166,13 @@ test('builds admin resource inventory grouped by user with ownership warnings', 
     ...domainFixture('alice.example'),
     dnsCredentialId: bobCredential.id
   });
+  const aliceMailbox = createInboundMailbox(alice.id, { address: 'support@alice.example' });
+  createInboundMessage(aliceMailbox, {
+    sender: 'sender@example.net',
+    recipients: ['support@alice.example'],
+    subject: 'Inbound inventory',
+    rawMessage: 'Subject: Inbound inventory\r\n\r\nHello'
+  });
   createDomain(bob.id, domainFixture('bob.example'));
   createApiToken(alice.id, 'primary');
   saveSmtpCredential(alice.id, { username: 'smtp-alice', password: 'smtp-secret-123' });
@@ -1107,6 +1193,8 @@ test('builds admin resource inventory grouped by user with ownership warnings', 
   assert.equal(aliceResources.domains[0].domain, 'alice.example');
   assert.equal(aliceResources.dnsCredentials.length, 0);
   assert.equal(aliceResources.apiTokens.length, 1);
+  assert.equal(aliceResources.inboundMailboxes.length, 1);
+  assert.equal(aliceResources.inboundMessageCount, 1);
   assert.equal(aliceResources.smtpCredential.username, 'smtp-alice');
   assert.equal(aliceResources.smtpCredential.passwordSet, true);
   assert.equal(aliceResources.sendEventCount, 1);
@@ -1157,6 +1245,13 @@ test('transfers individual resources with audit logs', () => {
   const domainOnly = createDomain(alice.id, { ...domainFixture('domain-only.example'), dnsCredentialId: domainOnlyCredential.id });
   const clearDomain = createDomain(alice.id, { ...domainFixture('clear.example'), dnsCredentialId: clearCredential.id });
   const withDomain = createDomain(alice.id, { ...domainFixture('with.example'), dnsCredentialId: withCredential.id });
+  const domainOnlyMailbox = createInboundMailbox(alice.id, { address: 'support@domain-only.example' });
+  const inboundMessage = createInboundMessage(domainOnlyMailbox, {
+    sender: 'sender@example.net',
+    recipients: ['support@domain-only.example'],
+    subject: 'Transfer inbound',
+    rawMessage: 'Subject: Transfer inbound\r\n\r\nHello'
+  });
   const apiToken = createApiToken(alice.id, 'primary');
 
   assert.equal(transferDomain({
@@ -1166,6 +1261,10 @@ test('transfers individual resources with audit logs', () => {
     dnsCredentialMode: 'domain_only'
   }).userId, bob.id);
   assert.equal(getDomain(domainOnly.id).dnsCredentialId, domainOnlyCredential.id);
+  assert.equal(listInboundMailboxes(alice.id).length, 0);
+  assert.equal(listInboundMailboxes(bob.id)[0].address, 'support@domain-only.example');
+  assert.equal(getInboundMessage(bob.id, inboundMessage.id).subject, 'Transfer inbound');
+  assert.equal(getInboundMessage(alice.id, inboundMessage.id), null);
   assert.equal(getDnsCredential(domainOnlyCredential.id, alice.id).id, domainOnlyCredential.id);
   assert.throws(
     () => transferDomain({
@@ -1237,6 +1336,13 @@ test('previews and executes user merge with resource counts and multiple smtp cr
     credentials: { apiToken: 'source-secret' }
   });
   const domain = createDomain(source.id, { ...domainFixture('source.example'), dnsCredentialId: credential.id });
+  const inboundMailbox = createInboundMailbox(source.id, { address: 'support@source.example' });
+  createInboundMessage(inboundMailbox, {
+    sender: 'sender@example.net',
+    recipients: ['support@source.example'],
+    subject: 'Merge inbound',
+    rawMessage: 'Subject: Merge inbound\r\n\r\nHello'
+  });
   const apiToken = createApiToken(source.id, 'primary');
   saveSmtpCredential(source.id, { username: 'smtp-source', password: 'source-secret-123' });
   saveSmtpCredential(source.id, { username: 'smtp-source-app', password: 'source-secret-456' });
@@ -1256,18 +1362,24 @@ test('previews and executes user merge with resource counts and multiple smtp cr
     domains: 1,
     dnsCredentials: 1,
     apiTokens: 1,
+    inboundMailboxes: 1,
+    inboundMessages: 1,
     sendEvents: 1,
     smtpCredential: 2
   });
   assert.equal(preview.resources.source.domains[0].domain, 'source.example');
   assert.equal(preview.resources.source.dnsCredentials[0].name, 'Source DNS');
   assert.equal(preview.resources.source.apiTokens[0].name, 'primary');
+  assert.equal(preview.resources.source.inboundMailboxes[0].address, 'support@source.example');
+  assert.equal(preview.resources.source.inboundMessageCount, 1);
   assert.equal(preview.resources.source.sendEventCount, 1);
   assert.equal(preview.resources.target.domains.length, 0);
   assert.deepEqual(preview.selectedCounts, {
     domains: 1,
     dnsCredentials: 1,
     apiTokens: 1,
+    inboundMailboxes: 1,
+    inboundMessages: 1,
     sendEvents: 1,
     smtpCredential: 2
   });
@@ -1296,10 +1408,15 @@ test('previews and executes user merge with resource counts and multiple smtp cr
     domains: 1,
     dnsCredentials: 1,
     apiTokens: 1,
+    inboundMailboxes: 1,
+    inboundMessages: 1,
     sendEvents: 1,
     smtpCredential: 2
   });
   assert.equal(getDomain(domain.id).userId, target.id);
+  assert.equal(listInboundMailboxes(target.id)[0].address, 'support@source.example');
+  assert.equal(listInboundMessages(target.id)[0].subject, 'Merge inbound');
+  assert.deepEqual(listInboundMailboxes(source.id), []);
   assert.equal(getDnsCredential(credential.id, target.id).id, credential.id);
   assert.equal(verifyApiToken(apiToken.token).id, target.id);
   assert.equal(listSendEvents(target.id).length, 1);

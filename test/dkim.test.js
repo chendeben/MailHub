@@ -24,6 +24,42 @@ test('signs messages with a verifiable DKIM relaxed body hash', () => {
   assert.equal(verification.signatureValid, true);
 });
 
+test('signs deliverability headers and includes DKIM identity metadata', () => {
+  const keys = createDkimKeyPair();
+  const raw = buildMessage({
+    from: 'noreply@example.com',
+    to: 'user@example.net',
+    subject: 'Deliverability headers',
+    text: 'Hello',
+    baseUrl: 'https://mailhub.test',
+    headers: [
+      ['List-Unsubscribe', '<mailto:unsubscribe@example.com>, <https://example.com/unsubscribe/123>'],
+      ['List-Unsubscribe-Post', 'List-Unsubscribe=One-Click'],
+      ['Feedback-Id', 'mh.u123.d456.e789:MailHub'],
+      ['X-Report-Abuse-To', 'abuse@example.com']
+    ]
+  });
+  const signed = signMessageForDomain(raw, {
+    domain: 'example.com',
+    selector: 'mh202607',
+    dkimPrivate: keys.privateKey
+  });
+
+  const verification = verifyDkimSignature(signed, keys.publicKey);
+  const tags = verification.tags;
+  const signedHeaders = tags.h.split(':');
+
+  assert.equal(verification.bodyHashValid, true);
+  assert.equal(verification.signatureValid, true);
+  assert.equal(tags.i, '@example.com');
+  assert.equal(tags.q, 'dns/txt');
+  assert.match(tags.t, /^\d+$/);
+  assert.ok(signedHeaders.includes('list-unsubscribe'));
+  assert.ok(signedHeaders.includes('list-unsubscribe-post'));
+  assert.ok(signedHeaders.includes('feedback-id'));
+  assert.ok(signedHeaders.includes('x-report-abuse-to'));
+});
+
 function verifyDkimSignature(rawMessage, publicKey) {
   const separator = rawMessage.indexOf('\r\n\r\n');
   const headers = parseHeaders(rawMessage.slice(0, separator));
@@ -47,7 +83,8 @@ function verifyDkimSignature(rawMessage, publicKey) {
     .verify(dkimPublicPem(publicKey), tags.b, 'base64');
   return {
     bodyHashValid: bodyHash === tags.bh,
-    signatureValid
+    signatureValid,
+    tags
   };
 }
 

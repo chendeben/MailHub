@@ -16,6 +16,10 @@ EXPOSE 25
 EXPOSE 465
 EXPOSE 587
 EXPOSE 2525
+EXPOSE 110
+EXPOSE 143
+EXPOSE 993
+EXPOSE 995
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

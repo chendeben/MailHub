@@ -25,6 +25,8 @@ test('instruments tracked API HTML before DKIM and supports per-send opt-out', a
       SMTP_HELO: 'mail.track-send.example',
       SEND_REQUIRES_VERIFIED: 'false',
       SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false',
       WEBHOOK_WORKER_ENABLED: '0',
       DNS_AUTO_CHECK_ENABLED: 'false',
       DELIVERY_TRACKING_ENABLED: 'false'
@@ -99,6 +101,105 @@ test('instruments tracked API HTML before DKIM and supports per-send opt-out', a
   }
 });
 
+test('API sends configured deliverability headers without changing the default envelope sender', async () => {
+  const relay = await startFakeSmtpServer();
+  const port = await freePort();
+  const dataDir = mkdtempSync(path.join(tmpdir(), 'mailhub-send-headers-'));
+  const child = spawn(process.execPath, ['src/server.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATA_DIR: dataDir,
+      APP_BASE_URL: `http://127.0.0.1:${port}`,
+      ADMIN_PASSWORD: 'password123',
+      SESSION_SECRET: 'session-secret',
+      TRACKING_SECRET: 'tracking-secret',
+      SMTP_HOST: '127.0.0.1',
+      SMTP_PORT: String(relay.port),
+      SMTP_HELO: 'mail.headers.example',
+      SEND_REQUIRES_VERIFIED: 'false',
+      SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false',
+      WEBHOOK_WORKER_ENABLED: '0',
+      DNS_AUTO_CHECK_ENABLED: 'false',
+      DELIVERY_TRACKING_ENABLED: 'false'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  try {
+    await waitForOutput(child, 'MailHub listening');
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const cookie = await login(baseUrl);
+    const domainResponse = await fetch(`${baseUrl}/api/domains`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ domain: 'headers.example' })
+    });
+    assert.equal(domainResponse.status, 201);
+
+    const settings = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({
+        listUnsubscribeMailto: 'unsubscribe@headers.example',
+        listUnsubscribeUrl: 'https://headers.example/unsubscribe/{eventId}/{recipient}',
+        listUnsubscribePostEnabled: true,
+        feedbackIdEnabled: true,
+        reportAbuseTo: 'abuse@headers.example',
+        csaComplaintsTo: 'csa@headers.example',
+        bounceAddress: 'bounce@headers.example',
+        bounceEnvelopeEnabled: false
+      })
+    });
+    assert.equal(settings.status, 200);
+    const settingsPayload = await settings.json();
+    assert.equal(settingsPayload.settings.listUnsubscribePostEnabled, true);
+    assert.equal(settingsPayload.settings.bounceEnvelopeEnabled, false);
+
+    await sendHtml(baseUrl, cookie, {
+      from: 'noreply@headers.example',
+      to: 'reader@example.net',
+      subject: 'Headers',
+      html: '<p>Hello</p>'
+    });
+
+    await waitFor(() => relay.messages.length === 1);
+    const rawMessage = relay.messages[0];
+    assert.match(rawMessage, /^List-Unsubscribe: <mailto:unsubscribe@headers\.example>,\n <https:\/\/headers\.example\/unsubscribe\/\d+\/reader%40example\.net>$/m);
+    assert.match(rawMessage, /^List-Unsubscribe-Post: List-Unsubscribe=One-Click$/m);
+    assert.match(rawMessage, /^Feedback-Id: mh\.[a-f0-9]{12}\.[a-f0-9]{12}\.[a-f0-9]{12}:MailHub$/m);
+    assert.match(rawMessage, /^X-Report-Abuse-To: abuse@headers\.example$/m);
+    assert.match(rawMessage, /^X-CSA-Complaints: csa@headers\.example$/m);
+    assert.match(rawMessage, /^X-Sender: noreply@headers\.example$/m);
+    assert.ok(relay.commands.some((command) => command === 'MAIL FROM:<noreply@headers.example>'));
+    assert.ok(!relay.commands.some((command) => command === 'MAIL FROM:<bounce@headers.example>'));
+
+    const bounceSettings = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ bounceEnvelopeEnabled: true })
+    });
+    assert.equal(bounceSettings.status, 200);
+
+    await sendHtml(baseUrl, cookie, {
+      from: 'noreply@headers.example',
+      to: 'reader@example.net',
+      subject: 'Bounce envelope',
+      html: '<p>Hello again</p>'
+    });
+
+    await waitFor(() => relay.messages.length === 2);
+    assert.ok(relay.commands.some((command) => command === 'MAIL FROM:<bounce@headers.example>'));
+  } finally {
+    child.kill('SIGTERM');
+    await waitForExit(child, 1000);
+    await relay.close();
+  }
+});
+
 async function sendHtml(baseUrl, cookie, data) {
   const response = await fetch(`${baseUrl}/api/send`, {
     method: 'POST',
@@ -131,6 +232,7 @@ function decodeHtmlPart(rawMessage) {
 }
 
 function startFakeSmtpServer() {
+  const commands = [];
   const messages = [];
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
@@ -155,6 +257,7 @@ function startFakeSmtpServer() {
           }
           continue;
         }
+        commands.push(line);
         if (line.startsWith('EHLO')) socket.write('250 relay.test\r\n');
         else if (line.startsWith('MAIL FROM') || line.startsWith('RCPT TO')) socket.write('250 ok\r\n');
         else if (line === 'DATA') {
@@ -171,6 +274,7 @@ function startFakeSmtpServer() {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => resolve({
       port: server.address().port,
+      commands,
       messages,
       close: () => new Promise((closeResolve) => server.close(closeResolve))
     }));

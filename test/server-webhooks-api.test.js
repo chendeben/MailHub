@@ -412,6 +412,8 @@ async function startTestServer() {
       SESSION_SECRET: sessionSecret,
       DNS_AUTO_CHECK_ENABLED: 'false',
       SUBMISSION_ENABLED: 'false',
+      IMAP_ENABLED: 'false',
+      POP3_ENABLED: 'false',
       WEBHOOK_WORKER_ENABLED: '0',
       WEBHOOK_ALLOW_HTTP_LOCAL: '1',
       DELIVERY_TRACKING_ENABLED: 'false'

@@ -8,6 +8,9 @@ import type {
   DnsCredential,
   Domain,
   DomainPatchPayload,
+  InboundMailbox,
+  InboundMessage,
+  MailboxClientConfig,
   RuntimeConfig,
   SendEvent,
   SmtpCredential,
@@ -95,6 +98,35 @@ export const api = {
   domains: () => request<{ domains: Domain[] }>('/api/domains'),
   events: () => request<{ events: SendEvent[] }>('/api/events'),
   event: (id: number) => request<{ event: SendEvent | null }>(`/api/events/${id}`),
+  inboundMailboxes: () => request<{ mailboxes: InboundMailbox[] }>('/api/inbound-mailboxes'),
+  createInboundMailbox: (data: {
+    address: string;
+    displayName?: string;
+    password: string;
+    aliases?: string | string[];
+    forwardTo?: string | string[];
+    keepForwarded?: boolean;
+    quotaMb?: number | string | null;
+  }) => request<{ mailbox: InboundMailbox; clientConfig?: MailboxClientConfig }>('/api/inbound-mailboxes', { method: 'POST', data }),
+  updateInboundMailbox: (id: number, data: Partial<{
+    displayName: string;
+    password: string;
+    aliases: string | string[];
+    forwardTo: string | string[];
+    keepForwarded: boolean;
+    quotaMb: number | string | null;
+    status: string;
+  }>) => request<{ mailbox: InboundMailbox; clientConfig?: MailboxClientConfig }>(`/api/inbound-mailboxes/${id}`, {
+    method: 'PATCH',
+    data
+  }),
+  inboundMessages: (mailboxId?: number | null) => {
+    const query = mailboxId ? `?mailboxId=${mailboxId}` : '';
+    return request<{ messages: InboundMessage[] }>(`/api/inbound-messages${query}`);
+  },
+  inboundMessage: (id: number) => request<{ message: InboundMessage | null }>(`/api/inbound-messages/${id}`),
+  markInboundMessageRead: (id: number, read = true) =>
+    request<{ message: InboundMessage | null }>(`/api/inbound-messages/${id}`, { method: 'PATCH', data: { read } }),
   analytics: (days = 7) => request<{ analytics: Analytics }>(`/api/analytics?days=${days}`),
   smtpCredential: () => request<{ credential: SmtpCredential | null }>('/api/smtp-credential'),
   saveSmtpCredential: (data: { username: string; password?: string }) =>
@@ -130,9 +162,11 @@ export const api = {
   deleteDnsCredential: (id: number) =>
     request<{ deleted: boolean }>(`/api/dns-credentials/${id}`, { method: 'DELETE' }),
   apiTokens: () => request<{ tokens: ApiToken[] }>('/api/api-tokens'),
-  createApiToken: (name: string) =>
-    request<{ token: ApiToken }>('/api/api-tokens', { method: 'POST', data: { name } }),
-  deleteApiToken: (id: number) => request<{ deleted: boolean }>(`/api/api-tokens/${id}`, { method: 'DELETE' }),
+  createApiToken: (data: { name: string; scopes?: string[]; expiresAt?: string | null }) =>
+    request<{ token: ApiToken }>('/api/api-tokens', { method: 'POST', data }),
+  updateApiToken: (id: number, data: { name?: string; scopes?: string[]; expiresAt?: string | null }) =>
+    request<{ token: ApiToken }>(`/api/api-tokens/${id}`, { method: 'PATCH', data }),
+  deleteApiToken: (id: number) => request<{ deleted: boolean; revoked: boolean; token?: ApiToken | null }>(`/api/api-tokens/${id}`, { method: 'DELETE' }),
   createDomain: (data: AddDomainPayload) => request<{ domain: Domain }>('/api/domains', { method: 'POST', data }),
   patchDomain: (id: number, data: DomainPatchPayload) =>
     request<{ domain: Domain }>(`/api/domains/${id}`, { method: 'PATCH', data }),
@@ -141,7 +175,18 @@ export const api = {
     request<{ domain: Domain; apply?: Domain['status']['apply'] }>(`/api/domains/${id}/apply-dns`, { method: 'POST' }),
   rotateDkim: (id: number, selector?: string) =>
     request<{ domain: Domain }>(`/api/domains/${id}/rotate-dkim`, { method: 'POST', data: { selector } }),
-  sendTest: (id: number, data: { from?: string; to: string; subject?: string; text?: string; smtpRelayId?: number | string | null }) =>
+  sendTest: (
+    id: number,
+    data: {
+      from?: string;
+      to: string;
+      subject?: string;
+      text?: string;
+      html?: string;
+      tracking?: boolean | { opens?: boolean; clicks?: boolean };
+      smtpRelayId?: number | string | null;
+    }
+  ) =>
     request<{ queued: boolean }>(`/api/domains/${id}/test-send`, { method: 'POST', data }),
   deleteDomain: (id: number) => request<{ deleted: boolean }>(`/api/domains/${id}`, { method: 'DELETE' }),
   adminSettings: () => request<{ settings: RuntimeConfig }>('/api/admin/settings'),

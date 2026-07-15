@@ -54,13 +54,13 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
     },
     {
       title: t('logs.opens'),
-      width: 90,
-      render: (_, event) => event.tracking?.summary?.totalOpens ?? 0
+      width: 110,
+      render: (_, event) => trackingMetric(event, 'opens')
     },
     {
       title: t('logs.clicks'),
-      width: 90,
-      render: (_, event) => event.tracking?.summary?.totalClicks ?? 0
+      width: 110,
+      render: (_, event) => trackingMetric(event, 'clicks')
     },
     { title: 'Message ID', dataIndex: 'id', render: (value) => <span>mh-{value}</span>, width: 140 },
     { title: t('logs.errorReason'), dataIndex: 'detail', ellipsis: true },
@@ -154,6 +154,13 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
     }
   }
 
+  function trackingMetric(event: SendEvent, type: 'opens' | 'clicks') {
+    if (!event.tracking?.enabled) return <Tag>{t('logs.trackingDisabledShort')}</Tag>;
+    return type === 'opens'
+      ? event.tracking.summary?.totalOpens ?? 0
+      : event.tracking.summary?.totalClicks ?? 0;
+  }
+
   function DeliveryLogDrawer({
     event,
     loading,
@@ -243,7 +250,11 @@ export default function SendingLogs({ events, domains, onCopy, onLoadEvent }: Se
                   ) : null}
                   {event.tracking.links?.length ? <TrackingLinksTable links={event.tracking.links} /> : null}
                 </SectionCard>
-              ) : null}
+              ) : (
+                <SectionCard title={t('logs.engagement')} className="delivery-log-card">
+                  <Alert type="info" showIcon message={t('logs.trackingDisabled')} />
+                </SectionCard>
+              )}
               <SectionCard title={t('logs.trackingTimeline')} className="delivery-log-card">
                 {event.tracking?.eventsTruncated ? (
                   <Alert type="warning" showIcon message={t('logs.trackingTimelineTruncated')} />
